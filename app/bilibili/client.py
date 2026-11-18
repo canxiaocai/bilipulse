@@ -36,6 +36,21 @@ def _safe_nonneg_int(raw: Any) -> int:
         return 0
 
 
+def _extract_cids_from_pages(pages: Any) -> list[dict[str, Any]]:
+    """Extract normalized (cid, page, part) dicts from a Bilibili pages list."""
+    if not isinstance(pages, list):
+        return []
+    return [
+        {
+            "cid": int(p["cid"]),
+            "page": int(p.get("page", idx + 1)),
+            "part": str(p.get("part", "")),
+        }
+        for idx, p in enumerate(pages)
+        if isinstance(p, dict) and p.get("cid")
+    ]
+
+
 def parse_online_count(raw: Any) -> int:
     """Parse Bilibili online viewer text like '11', '100+', '1.2万+' into an integer."""
     if raw is None:
@@ -429,15 +444,19 @@ class BilibiliClient:
             return None
         return str(owner_mid).strip()
 
-    async def get_video_stat(self, bvid: str) -> dict[str, int]:
-        """Fetch play, like, and coin counts for a video via /x/web-interface/view."""
+    async def get_video_stat(self, bvid: str) -> dict[str, Any]:
+        """Fetch play, like, and coin counts (plus CIDs if present) via /x/web-interface/view."""
         payload = await self._fetch_video_view_data(bvid)
         stat = payload.get("stat") or {}
-        return {
+        result: dict[str, Any] = {
             "play_count": _safe_nonneg_int(stat.get("view")),
             "like_count": _safe_nonneg_int(stat.get("like")),
             "coin_count": _safe_nonneg_int(stat.get("coin")),
         }
+        cids = _extract_cids_from_pages(payload.get("pages"))
+        if cids:
+            result["cids"] = cids
+        return result
 
     async def _get_videos_page_series_raw(
         self, uid: str, pn: int = 1, ps: int = 100
@@ -561,8 +580,10 @@ class BilibiliClient:
         videos, _, total = await self._get_videos_page_wbi_raw(uid, pn=pn, ps=ps)
         return videos, total
 
-    async def get_all_videos(self, uid: str) -> list[dict[str, Any]]:
-        """Fetch all published UP-owned videos for the given UID across pages."""
+    async def get_all_videos(
+        self, uid: str, max_pages: Optional[int] = None
+    ) -> list[dict[str, Any]]:
+        """Fetch published UP-owned videos for the given UID (all pages, or up to max_pages)."""
         all_videos: dict[str, dict[str, Any]] = {}
         pn = 1
         ps = 100
@@ -593,6 +614,8 @@ class BilibiliClient:
             for item in page_items:
                 all_videos[item["bvid"]] = item
 
+            if max_pages is not None and max_pages > 0 and pn >= max_pages:
+                break
             if (total > 0 and pn * ps >= total) or (total <= 0 and raw_count < ps):
                 break
             pn += 1
@@ -612,16 +635,7 @@ class BilibiliClient:
                 f"pagelist error {data.get('code')} for {bvid}: {data.get('message')}",
                 code=data.get("code"),
             )
-        pages = data.get("data") or []
-        return [
-            {
-                "cid": int(p["cid"]),
-                "page": int(p.get("page", idx + 1)),
-                "part": str(p.get("part", "")),
-            }
-            for idx, p in enumerate(pages)
-            if p.get("cid")
-        ]
+        return _extract_cids_from_pages(data.get("data"))
 
     async def get_video_online_total(self, bvid: str, cid: int) -> tuple[int, str]:
         """Get current concurrent viewer count for a single (bvid, cid)."""

@@ -1,6 +1,7 @@
 import asyncio
 import time
 from pathlib import Path
+from typing import Optional
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -3095,3 +3096,263 @@ def test_video_engagement_stats_client_db_collector_and_api(tmp_path: Path):
         vids_resp = client.get(f"/api/videos?uid={uid}").json()
         assert vids_resp["videos"][0]["like_count"] == 816
         assert vids_resp["videos"][0]["coin_count"] == 204
+
+
+def test_tiered_hot_cold_polling_stats_quota_and_cid_reuse(tmp_path: Path):
+    from app.bilibili.collectors import COLD_POLL_BATCH_SIZE, STATS_REFRESH_QUOTA
+
+    uid = "888000111"
+    db = Database(db_path=tmp_path / "tiered.db")
+    now_epoch = int(time.time())
+    db.update_settings(
+        {
+            "uid": uid,
+            "request_delay_ms": "50",
+            f"last_video_sync_ts_{uid}": str(now_epoch),
+            f"last_full_video_sync_ts_{uid}": str(now_epoch),
+            f"video_sync_rule_{uid}": VIDEO_SYNC_RULE,
+            f"last_archive_count_{uid}": "150",
+        }
+    )
+
+    # Seed 150 videos (> 80 threshold); BV_000..BV_004 are old low-play long-tail videos with online > 0
+    seeded = []
+    for idx in range(150):
+        bvid = f"BV_{idx:03d}"
+        seeded.append(
+            {
+                "bvid": bvid,
+                "aid": 10000 + idx,
+                "title": f"Video {idx}",
+                "pubdate": 1000 + idx,
+                "play_count": (idx + 1) * 100,
+                # Leave BV_149 without CIDs so we can verify get_video_stat CID reuse
+                "cids": [] if idx == 149 else [{"cid": 50000 + idx, "page": 1, "part": "P1"}],
+            }
+        )
+    db.upsert_videos(uid, seeded)
+
+    # Mark 5 oldest low-play videos (BV_000..BV_004) as currently having active online viewers
+    db.insert_snapshot(
+        uid=uid,
+        follower_count=5000,
+        following_count=10,
+        online_viewers_total=25,
+        video_count=150,
+        videos_succeeded=5,
+        extra_metrics={},
+        status="success",
+        error_message=None,
+        duration_ms=100,
+        video_online_items=[
+            {"bvid": f"BV_{idx:03d}", "online_count": 5, "online_raw": "6"}
+            for idx in range(5)
+        ],
+    )
+
+    fake_client = AsyncMock()
+    fake_client.__aenter__.return_value = fake_client
+    fake_client.__aexit__.return_value = None
+    fake_client.get_relation_stat.return_value = {"follower": 5010, "following": 10}
+    fake_client.get_account_card.return_value = {
+        "name": "LargeCreator",
+        "face": "",
+        "follower": 5010,
+        "archive_count": 150,
+    }
+
+    stat_called_bvids: list[str] = []
+    online_polled_bvids: list[str] = []
+
+    async def fake_stat(bvid: str):
+        stat_called_bvids.append(bvid)
+        idx = int(bvid.split("_")[1])
+        res = {
+            "play_count": (idx + 1) * 100 + 10,
+            "like_count": idx + 10,
+            "coin_count": idx + 2,
+        }
+        if bvid == "BV_149":
+            res["cids"] = [{"cid": 50149, "page": 1, "part": "P1"}]
+        return res
+
+    async def fake_online(bvid: str, cid: int):
+        online_polled_bvids.append(bvid)
+        idx = int(bvid.split("_")[1])
+        # Keep BV_000..BV_004 at 5 viewers (raw 6), plus cold discovery on BV_005 -> 4 viewers (raw 5)
+        if idx < 5:
+            return (6, "6")
+        if idx == 5:
+            return (5, "5")
+        return (1, "1")  # adjusted -> 0
+
+    fake_client.get_video_stat.side_effect = fake_stat
+    fake_client.get_video_online_total.side_effect = fake_online
+    fake_client.get_video_cids.side_effect = AssertionError(
+        "Expected CIDs for BV_149 to be populated from get_video_stat pages"
+    )
+
+    svc = CrawlService(db)
+    with patch("app.bilibili.collectors.BilibiliClient", return_value=fake_client):
+        with patch("app.bilibili.collectors.asyncio.sleep", new=AsyncMock()):
+            res1 = asyncio.run(svc.run_crawl(force_sync_videos=False))
+
+            assert res1["status"] == "success"
+            assert res1["video_count"] == 150
+            # Hot pool: BV_000..BV_004 (5 active) + BV_110..BV_149 (top 40 plays, contains newest 25) = 45
+            # Cold batch: 30 (BV_005..BV_034 never checked first, highest play among never checked: BV_109..BV_080)
+            assert res1["videos_succeeded"] == 45 + COLD_POLL_BATCH_SIZE
+            # All 5 long-tail active videos were kept in Hot Pool
+            for idx in range(5):
+                assert f"BV_{idx:03d}" in online_polled_bvids
+            # Stats refresh strictly capped at STATS_REFRESH_QUOTA (30) and prioritized showcase/active
+            assert len(stat_called_bvids) == STATS_REFRESH_QUOTA
+            assert "BV_149" in stat_called_bvids
+            assert "BV_000" in stat_called_bvids
+
+            # Crawl 2: cold round-robin advances to next unchecked batch & stats backfills next 30 videos
+            stat_called_round1 = set(stat_called_bvids)
+            polled_round1 = set(online_polled_bvids)
+            stat_called_bvids.clear()
+            online_polled_bvids.clear()
+
+            res2 = asyncio.run(svc.run_crawl(force_sync_videos=False))
+            assert res2["status"] == "success"
+            assert len(stat_called_bvids) == STATS_REFRESH_QUOTA
+            # Disjoint unsynced batch of 30 videos refreshed in round 2
+            assert stat_called_round1.isdisjoint(set(stat_called_bvids))
+            # Cold pool rotated to previously unchecked videos
+            newly_polled_cold = set(online_polled_bvids) - polled_round1
+            assert len(newly_polled_cold) == COLD_POLL_BATCH_SIZE
+
+
+def test_incremental_first_page_sync_vs_full_pagination_on_delete(tmp_path: Path):
+    # 1) BilibiliClient.get_all_videos(max_pages=1) stops after page 1
+    async def check_max_pages():
+        uid = "900100200"
+        async with BilibiliClient() as client:
+            client._session_bootstrapped = True
+            requested_pages: list[int] = []
+
+            async def fake_req(url, params=None, referer=None, retries=2):
+                requested_pages.append(params["pn"])
+                return {
+                    "code": 0,
+                    "data": {
+                        "page": {"total": 250},
+                        "archives": [
+                            {
+                                "bvid": f"BV_p{params['pn']}",
+                                "aid": params["pn"],
+                                "title": f"Page {params['pn']}",
+                                "upMid": int(uid),
+                                "stat": {"view": 100},
+                            }
+                        ],
+                    },
+                }
+
+            with patch.object(client, "_request_json", side_effect=fake_req):
+                vids = await client.get_all_videos(uid, max_pages=1)
+                assert requested_pages == [1]
+                assert [v["bvid"] for v in vids] == ["BV_p1"]
+
+    asyncio.run(check_max_pages())
+
+    # 2) Collector uses incremental page-1 sync on routine growth, and full sync on archive deletion
+    uid = "900100200"
+    db = Database(db_path=tmp_path / "inc_sync.db")
+    now_epoch = int(time.time())
+    db.update_settings(
+        {
+            "uid": uid,
+            "request_delay_ms": "50",
+            # Expired routine sync, but fresh full sync
+            f"last_video_sync_ts_{uid}": str(now_epoch - 3600),
+            f"last_full_video_sync_ts_{uid}": str(now_epoch - 600),
+            f"video_sync_rule_{uid}": VIDEO_SYNC_RULE,
+            f"last_archive_count_{uid}": "100",
+        }
+    )
+    db.upsert_videos(
+        uid,
+        [
+            {
+                "bvid": f"BV_old_{i:03d}",
+                "aid": i + 1,
+                "title": f"Old {i}",
+                "pubdate": 100 + i,
+                "play_count": 50,
+                "like_count": 5,
+                "coin_count": 1,
+                "cids": [{"cid": 7000 + i, "page": 1, "part": "P1"}],
+            }
+            for i in range(100)
+        ],
+    )
+
+    calls: list[Optional[int]] = []
+    fake_client = AsyncMock()
+    fake_client.__aenter__.return_value = fake_client
+    fake_client.__aexit__.return_value = None
+    fake_client.get_relation_stat.return_value = {"follower": 1000, "following": 5}
+    fake_client.get_account_card.return_value = {
+        "name": "IncUP",
+        "face": "",
+        "follower": 1000,
+        "archive_count": 101,
+    }
+
+    async def fake_get_all_videos(target_uid: str, max_pages: Optional[int] = None):
+        calls.append(max_pages)
+        if max_pages == 1:
+            return [
+                {
+                    "bvid": "BV_new_100",
+                    "aid": 999,
+                    "title": "Brand New",
+                    "pubdate": 9999,
+                    "play_count": 200,
+                    "up_mid": uid,
+                    "cids": [{"cid": 8999, "page": 1, "part": "P1"}],
+                }
+            ]
+        # Full sync returns only 99 videos (BV_old_000 deleted)
+        return [
+            {
+                "bvid": f"BV_old_{i:03d}",
+                "aid": i + 1,
+                "title": f"Old {i}",
+                "pubdate": 100 + i,
+                "play_count": 50,
+                "up_mid": uid,
+            }
+            for i in range(1, 100)
+        ]
+
+    fake_client.get_all_videos.side_effect = fake_get_all_videos
+    fake_client.get_video_stat.return_value = {
+        "play_count": 210,
+        "like_count": 20,
+        "coin_count": 5,
+        "cids": [{"cid": 8999, "page": 1, "part": "P1"}],
+    }
+    fake_client.get_video_online_total.return_value = (1, "1")
+
+    svc = CrawlService(db)
+    with patch("app.bilibili.collectors.BilibiliClient", return_value=fake_client):
+        with patch("app.bilibili.collectors.asyncio.sleep", new=AsyncMock()):
+            # Routine growth (100 -> 101): incremental 1-page sync, preserves all 100 older cached videos
+            res_inc = asyncio.run(svc.run_crawl(force_sync_videos=False))
+            assert res_inc["status"] == "success"
+            assert calls == [1]
+            assert len(db.get_videos(uid)) == 101
+
+            # Archive deletion (101 -> 99): triggers full pagination and purges deleted videos
+            fake_client.get_account_card.return_value["archive_count"] = 99
+            res_full = asyncio.run(svc.run_crawl(force_sync_videos=False))
+            assert res_full["status"] == "success"
+            assert calls == [1, None]
+            remaining_bvids = {v["bvid"] for v in db.get_videos(uid)}
+            assert len(remaining_bvids) == 99
+            assert "BV_old_000" not in remaining_bvids

@@ -12,6 +12,7 @@ from app.bilibili.client import parse_online_count
 from app.config import DB_PATH, DEFAULT_SETTINGS, get_default_admin_password
 
 ONLINE_COUNT_RULE = "minus_1_per_cid_v1"
+HOT_STICKY_SECONDS = 900
 BJT_TZ = timezone(timedelta(hours=8))
 _SQLITE_CHUNK_SIZE = 500
 
@@ -115,6 +116,7 @@ class Database:
                     last_online_count INTEGER NOT NULL DEFAULT 0,
                     last_online_raw TEXT NOT NULL DEFAULT '',
                     last_checked_at TEXT,
+                    hot_until_ts INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
                 );
 
@@ -159,6 +161,8 @@ class Database:
                 conn.execute("ALTER TABLE videos ADD COLUMN coin_count INTEGER NOT NULL DEFAULT 0")
             if "stats_synced_at" not in video_cols:
                 conn.execute("ALTER TABLE videos ADD COLUMN stats_synced_at TEXT")
+            if "hot_until_ts" not in video_cols:
+                conn.execute("ALTER TABLE videos ADD COLUMN hot_until_ts INTEGER NOT NULL DEFAULT 0")
             video_snap_cols = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(video_online_snapshots)").fetchall()
@@ -837,9 +841,10 @@ class Database:
                     self._delete_video_snapshots_by_bvids(conn, bvids)
                 conn.execute("DELETE FROM videos WHERE uid = ?", (clean_uid,))
                 conn.execute(
-                    "DELETE FROM settings WHERE key IN (?, ?, ?)",
+                    "DELETE FROM settings WHERE key IN (?, ?, ?, ?)",
                     (
                         f"last_video_sync_ts_{clean_uid}",
+                        f"last_full_video_sync_ts_{clean_uid}",
                         f"video_sync_rule_{clean_uid}",
                         f"last_archive_count_{clean_uid}",
                     ),
@@ -993,7 +998,8 @@ class Database:
                 """
                 SELECT bvid, uid, aid, title, pic, pubdate, duration, play_count,
                        like_count, coin_count, stats_synced_at,
-                       cids_json, last_online_count, last_online_raw, last_checked_at, updated_at
+                       cids_json, last_online_count, last_online_raw, last_checked_at,
+                       hot_until_ts, updated_at
                 FROM videos
                 WHERE uid = ?
                 ORDER BY last_online_count DESC, pubdate DESC
@@ -1021,6 +1027,7 @@ class Database:
                     "last_online_count": r["last_online_count"],
                     "last_online_raw": r["last_online_raw"],
                     "last_checked_at": r["last_checked_at"],
+                    "hot_until_ts": int(r["hot_until_ts"] or 0),
                     "updated_at": r["updated_at"],
                 }
             )
@@ -1100,7 +1107,8 @@ class Database:
                             fallback_plays[v_row["bvid"]] = int(v_row["play_count"])
 
                 snapshot_rows: list[tuple[int, str, int, str, Optional[int]]] = []
-                video_updates: list[tuple[int, str, str, str]] = []
+                video_updates: list[tuple[int, str, str, int, int, str]] = []
+                sticky_until_ts = collected_ts + HOT_STICKY_SECONDS
                 for item in video_online_items:
                     bvid = item["bvid"]
                     online_count = int(item["online_count"])
@@ -1114,7 +1122,16 @@ class Database:
                     snapshot_rows.append(
                         (snapshot_id, bvid, online_count, online_raw, play_count_val)
                     )
-                    video_updates.append((online_count, online_raw, collected_iso, bvid))
+                    video_updates.append(
+                        (
+                            online_count,
+                            online_raw,
+                            collected_iso,
+                            online_count,
+                            sticky_until_ts,
+                            bvid,
+                        )
+                    )
 
                 conn.executemany(
                     """
@@ -1127,7 +1144,10 @@ class Database:
                 conn.executemany(
                     """
                     UPDATE videos
-                    SET last_online_count = ?, last_online_raw = ?, last_checked_at = ?
+                    SET last_online_count = ?,
+                        last_online_raw = ?,
+                        last_checked_at = ?,
+                        hot_until_ts = CASE WHEN ? > 0 THEN ? ELSE hot_until_ts END
                     WHERE bvid = ?
                     """,
                     video_updates,
