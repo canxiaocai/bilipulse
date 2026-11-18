@@ -7,14 +7,14 @@
 import {
   renderTelemetryChart,
   clearChartsInGroup,
-} from "./charts.js?v=20261118z";
+} from "./charts.js?v=20261119a";
 import {
   animateNumber,
   runViewTransition,
   staggerEnter,
   positionSlidingIndicator,
   prefersReducedMotion,
-} from "./motion.js?v=20261118z";
+} from "./motion.js?v=20261119a";
 import {
   createDemoDataset,
   tickDemoDataset,
@@ -25,7 +25,7 @@ import {
   reorderDemoAccounts,
   buildFallbackCoverSvg,
   buildDemoAvatarSvg,
-} from "./demo-data.js?v=20261118z";
+} from "./demo-data.js?v=20261119a";
 
 const THEME_STORAGE_KEY = "bilipulse_theme";
 const DEMO_PULSE_INTERVAL_MS = 3500;
@@ -2495,18 +2495,10 @@ function renderDashboard(data, { animateCharts = true, isLiveTick = false } = {}
 
 /* ---------- Native <dialog id="videoModal"> Centered Multi-Channel Modal ---------- */
 
-const STANDARD_BUCKET_SECONDS = [
-  300,
-  600,
-  900,
-  1800,
-  3600,
-  7200,
-  14400,
-  21600,
-  43200,
-  86400,
-];
+const MODAL_DELTA_BUCKET_SEC = 3600;
+const MODAL_DELTA_BUCKET_MS = MODAL_DELTA_BUCKET_SEC * 1000;
+const MODAL_DELTA_JITTER_MS = 5 * 60 * 1000;
+const MODAL_HISTORY_MAX_POINTS = 2400;
 
 function parseModalPointMs(rawTs, rawEpochSec) {
   if (rawEpochSec !== null && rawEpochSec !== undefined && Number.isFinite(Number(rawEpochSec))) {
@@ -2532,19 +2524,6 @@ function fmtSignedDelta(val) {
   return fmtNumber(num);
 }
 
-function formatBucketDurationLabel(bucketSec) {
-  const sec = Math.max(60, Math.round(Number(bucketSec || 300)));
-  if (sec < 3600) {
-    return `${Math.max(1, Math.round(sec / 60))}分钟`;
-  }
-  if (sec < 86400) {
-    const hrs = sec / 3600;
-    return Number.isInteger(hrs) ? `${hrs}小时` : `${hrs.toFixed(1)}小时`;
-  }
-  const days = sec / 86400;
-  return Number.isInteger(days) ? `${days}天` : `${days.toFixed(1)}天`;
-}
-
 function formatBucketRangeHud(startMs, endMs, bucketLabel) {
   const d0 = new Date(startMs);
   const d1 = new Date(endMs);
@@ -2559,33 +2538,6 @@ function formatBucketRangeHud(startMs, endMs, bucketLabel) {
   const rangeStr =
     md0 === md1 ? `${md0} ${hm0} → ${hm1}` : `${md0} ${hm0} → ${md1} ${hm1}`;
   return bucketLabel ? `${rangeStr} · ${bucketLabel}` : rangeStr;
-}
-
-function medianOfNumbers(values) {
-  if (!Array.isArray(values) || values.length === 0) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = sorted.length >> 1;
-  return sorted.length % 2 === 1
-    ? sorted[mid]
-    : (sorted[mid - 1] + sorted[mid]) / 2;
-}
-
-function chooseBaseBucketSec(spanSec, requestedHours) {
-  const h = Number(requestedHours || 0);
-  const effectiveSec = h > 0 ? Math.min(spanSec, h * 3600 * 1.05) : spanSec;
-  if (effectiveSec <= 2.5 * 3600) return 300;
-  if (effectiveSec <= 8 * 3600) return 900;
-  if (effectiveSec <= 30 * 3600) return 1800;
-  if (effectiveSec <= 8 * 86400) return 4 * 3600;
-  if (effectiveSec <= 45 * 86400) return 86400;
-  return Math.max(2, Math.ceil(effectiveSec / (40 * 86400))) * 86400;
-}
-
-function snapBucketSecAtLeast(targetSec) {
-  for (const std of STANDARD_BUCKET_SECONDS) {
-    if (std >= targetSec) return std;
-  }
-  return Math.max(2, Math.ceil(targetSec / 86400)) * 86400;
 }
 
 function interpolateCumulativeAt(pts, targetTsMs) {
@@ -2612,9 +2564,16 @@ function interpolateCumulativeAt(pts, targetTsMs) {
   return pts[lo].value + (pts[hi].value - pts[lo].value) * ratio;
 }
 
-function buildIntervalDeltaSeries(rawCumPoints, requestedHours = 24) {
+function buildHourlyDeltaSeries(rawCumPoints) {
   if (!Array.isArray(rawCumPoints) || rawCumPoints.length < 2) {
-    return { points: [], bucketSec: 0, bucketLabel: "", totalDelta: null };
+    return {
+      points: [],
+      bucketSec: MODAL_DELTA_BUCKET_SEC,
+      bucketLabel: "小时",
+      isPartialHour: false,
+      partialMinutes: 0,
+      totalDelta: null,
+    };
   }
 
   const sorted = [];
@@ -2625,7 +2584,14 @@ function buildIntervalDeltaSeries(rawCumPoints, requestedHours = 24) {
     sorted.push({ tsMs, value: val });
   }
   if (sorted.length < 2) {
-    return { points: [], bucketSec: 0, bucketLabel: "", totalDelta: null };
+    return {
+      points: [],
+      bucketSec: MODAL_DELTA_BUCKET_SEC,
+      bucketLabel: "小时",
+      isPartialHour: false,
+      partialMinutes: 0,
+      totalDelta: null,
+    };
   }
   sorted.sort((a, b) => a.tsMs - b.tsMs);
 
@@ -2639,98 +2605,59 @@ function buildIntervalDeltaSeries(rawCumPoints, requestedHours = 24) {
     }
   }
   if (pts.length < 2) {
-    return { points: [], bucketSec: 0, bucketLabel: "", totalDelta: null };
+    return {
+      points: [],
+      bucketSec: MODAL_DELTA_BUCKET_SEC,
+      bucketLabel: "小时",
+      isPartialHour: false,
+      partialMinutes: 0,
+      totalDelta: null,
+    };
   }
 
   const tStart = pts[0].tsMs;
   const tEnd = pts[pts.length - 1].tsMs;
   const spanMs = tEnd - tStart;
-  const spanSec = spanMs / 1000;
   const totalDelta = Math.round(pts[pts.length - 1].value - pts[0].value);
-  if (spanSec <= 0) {
-    return { points: [], bucketSec: 0, bucketLabel: "", totalDelta };
+  if (spanMs <= 0) {
+    return {
+      points: [],
+      bucketSec: MODAL_DELTA_BUCKET_SEC,
+      bucketLabel: "小时",
+      isPartialHour: false,
+      partialMinutes: 0,
+      totalDelta,
+    };
   }
 
-  let bucketSec = chooseBaseBucketSec(spanSec, requestedHours);
-
-  // Respect natural sample spacing (ignoring sub-minute demo live micro-ticks)
-  const sampleGapsSec = [];
-  for (let i = 1; i < pts.length; i += 1) {
-    const gapSec = (pts[i].tsMs - pts[i - 1].tsMs) / 1000;
-    if (gapSec >= 30) {
-      sampleGapsSec.push(gapSec);
-    }
-  }
-  if (sampleGapsSec.length > 0) {
-    const medGap = medianOfNumbers(sampleGapsSec);
-    if (medGap > bucketSec * 1.15) {
-      const snappedGap = snapBucketSecAtLeast(medGap * 0.9);
-      bucketSec = Math.max(bucketSec, Math.min(snappedGap, Math.max(bucketSec, spanSec)));
-    }
-  }
-
-  // Adapt upward when cumulative series was batch-synced on a coarser cadence (e.g. 30m/60m steps)
-  const changeGapsSec = [];
-  const absJumps = [];
-  let zeroSteps = 0;
-  let lastChangeTs = pts[0].tsMs;
-  let lastChangeVal = pts[0].value;
-  for (let i = 1; i < pts.length; i += 1) {
-    const gapFromPrev = (pts[i].tsMs - pts[i - 1].tsMs) / 1000;
-    if (gapFromPrev < 30) continue;
-    const diff = pts[i].value - lastChangeVal;
-    if (diff === 0) {
-      zeroSteps += 1;
-    } else {
-      const cGap = (pts[i].tsMs - lastChangeTs) / 1000;
-      if (cGap >= 30) {
-        changeGapsSec.push(cGap);
-        absJumps.push(Math.abs(diff));
-      }
-      lastChangeTs = pts[i].tsMs;
-      lastChangeVal = pts[i].value;
-    }
-  }
-
-  if (
-    changeGapsSec.length >= 2 &&
-    zeroSteps >= changeGapsSec.length &&
-    medianOfNumbers(absJumps) >= 5
-  ) {
-    const medChangeGap = medianOfNumbers(changeGapsSec);
-    if (medChangeGap > bucketSec * 1.6) {
-      const candidate = snapBucketSecAtLeast(medChangeGap * 0.85);
-      if (candidate <= spanSec / 1.8) {
-        bucketSec = Math.max(bucketSec, candidate);
-      }
-    }
-  }
-
-  const bucketMs = bucketSec * 1000;
-  const bucketLabel = formatBucketDurationLabel(bucketSec);
-
-  if (spanMs <= bucketMs * 1.15) {
-    const actualLabel = formatBucketDurationLabel(Math.max(60, Math.round(spanSec)));
+  // When total collected span is shorter than 1 hour (~55m), emit the single accumulated point
+  if (spanMs + MODAL_DELTA_JITTER_MS < MODAL_DELTA_BUCKET_MS) {
+    const partialMinutes = Math.max(1, Math.round(spanMs / 60000));
     return {
       points: [
         {
           ts: new Date(tEnd).toISOString(),
           tsMs: tEnd,
           value: totalDelta,
-          hudTime: formatBucketRangeHud(tStart, tEnd, actualLabel),
+          hudTime: formatBucketRangeHud(tStart, tEnd, `近${partialMinutes}分钟（不足1小时）`),
         },
       ],
-      bucketSec: Math.max(60, Math.round(spanSec)),
-      bucketLabel: actualLabel,
+      bucketSec: MODAL_DELTA_BUCKET_SEC,
+      bucketLabel: "小时",
+      isPartialHour: true,
+      partialMinutes,
       totalDelta,
     };
   }
 
-  const bucketCount = Math.max(2, Math.floor((spanMs + bucketMs * 0.15) / bucketMs));
+  const bucketCount = Math.max(
+    1,
+    Math.floor((spanMs + MODAL_DELTA_JITTER_MS) / MODAL_DELTA_BUCKET_MS)
+  );
   const points = [];
   for (let k = bucketCount; k >= 1; k -= 1) {
-    const b0 = Math.max(tStart, tEnd - k * bucketMs);
-    const b1 = tEnd - (k - 1) * bucketMs;
+    const b0 = Math.max(tStart, tEnd - k * MODAL_DELTA_BUCKET_MS);
+    const b1 = tEnd - (k - 1) * MODAL_DELTA_BUCKET_MS;
     const v0 = Math.round(interpolateCumulativeAt(pts, b0));
     const v1 = Math.round(interpolateCumulativeAt(pts, b1));
     const delta = v1 - v0;
@@ -2738,14 +2665,21 @@ function buildIntervalDeltaSeries(rawCumPoints, requestedHours = 24) {
       ts: new Date(b1).toISOString(),
       tsMs: b1,
       value: delta,
-      hudTime: formatBucketRangeHud(b0, b1, bucketLabel),
+      hudTime: formatBucketRangeHud(b0, b1, "1小时"),
     });
   }
 
-  return { points, bucketSec, bucketLabel, totalDelta };
+  return {
+    points,
+    bucketSec: MODAL_DELTA_BUCKET_SEC,
+    bucketLabel: "小时",
+    isPartialHour: false,
+    partialMinutes: 0,
+    totalDelta,
+  };
 }
 
-function buildModalSeriesFromHistory(history, hours = state.modalHours) {
+function buildModalSeriesFromHistory(history) {
   const onlinePoints = [];
   const playPoints = [];
   const likePoints = [];
@@ -2776,17 +2710,19 @@ function buildModalSeriesFromHistory(history, hours = state.modalHours) {
     }
   }
 
-  const playDeltaSeries = buildIntervalDeltaSeries(playPoints, hours);
-  const likeDeltaSeries = buildIntervalDeltaSeries(likePoints, hours);
+  const playDeltaSeries = buildHourlyDeltaSeries(playPoints);
+  const likeDeltaSeries = buildHourlyDeltaSeries(likePoints);
 
   return {
     onlinePoints,
     playPoints,
     likePoints,
     playDeltaPoints: playDeltaSeries.points,
-    playDeltaBucketLabel: playDeltaSeries.bucketLabel,
+    playDeltaIsPartial: playDeltaSeries.isPartialHour,
+    playDeltaPartialMinutes: playDeltaSeries.partialMinutes,
     likeDeltaPoints: likeDeltaSeries.points,
-    likeDeltaBucketLabel: likeDeltaSeries.bucketLabel,
+    likeDeltaIsPartial: likeDeltaSeries.isPartialHour,
+    likeDeltaPartialMinutes: likeDeltaSeries.partialMinutes,
   };
 }
 
@@ -2829,15 +2765,15 @@ function renderModalCharts(series, animate = true) {
     renderTelemetryChart(playDeltaEl, playDeltaPoints, {
       channelColor: "var(--sig-emerald)",
       fillId: "modal-video-play-delta",
-      label: series?.playDeltaBucketLabel
-        ? `播放增量 (${series.playDeltaBucketLabel})`
-        : "播放增量",
+      label: series?.playDeltaIsPartial
+        ? `播放增量 (近${series.playDeltaPartialMinutes}分钟)`
+        : "每小时播放增量",
       formatValue: (v) => fmtSignedDelta(v),
       animate,
       syncGroup: "video-modal",
       emptyText:
         playPoints.length === 1
-          ? "需至少 2 个采样点以计算播放区间增量"
+          ? "需至少 2 个采样点以计算每小时播放增量"
           : "该时间窗口暂无播放增量数据",
     });
   }
@@ -2846,16 +2782,16 @@ function renderModalCharts(series, animate = true) {
     renderTelemetryChart(likeDeltaEl, likeDeltaPoints, {
       channelColor: "var(--sig-violet)",
       fillId: "modal-video-like-delta",
-      label: series?.likeDeltaBucketLabel
-        ? `点赞增量 (${series.likeDeltaBucketLabel})`
-        : "点赞增量",
+      label: series?.likeDeltaIsPartial
+        ? `点赞增量 (近${series.likeDeltaPartialMinutes}分钟)`
+        : "每小时点赞增量",
       formatValue: (v) => fmtSignedDelta(v),
       animate,
       syncGroup: "video-modal",
       emptyText:
         likePoints.length === 1
           ? "已记录首笔基准，下次采样后生成点赞增量曲线"
-          : "等待至少 2 次点赞采样后生成增量曲线",
+          : "等待至少 2 次点赞采样后生成每小时增量曲线",
     });
   }
 }
@@ -2950,35 +2886,29 @@ function updateModalStatsFromVideoAndPoints(bvid, series) {
     playChipEl.textContent = Number.isFinite(latestPlayVal) ? fmtNumber(latestPlayVal) : "--";
   }
 
-  const playBucketLabel = series?.playDeltaBucketLabel || "";
   if (playDeltaKickerEl) {
-    playDeltaKickerEl.textContent = playBucketLabel
-      ? `分时增量 · 每 ${playBucketLabel}`
-      : "分时增量";
+    playDeltaKickerEl.textContent = "每小时增量";
   }
   if (playDeltaChipEl) {
     if (playDeltaPoints.length > 0) {
       const latestBucketPlay = playDeltaPoints[playDeltaPoints.length - 1].value;
-      playDeltaChipEl.textContent = playBucketLabel
-        ? `${fmtSignedDelta(latestBucketPlay)} / ${playBucketLabel}`
-        : fmtSignedDelta(latestBucketPlay);
+      playDeltaChipEl.textContent = series?.playDeltaIsPartial
+        ? `${fmtSignedDelta(latestBucketPlay)} / 近${series.playDeltaPartialMinutes}分钟`
+        : `${fmtSignedDelta(latestBucketPlay)} / 小时`;
     } else {
       playDeltaChipEl.textContent = "--";
     }
   }
 
-  const likeBucketLabel = series?.likeDeltaBucketLabel || "";
   if (likeDeltaKickerEl) {
-    likeDeltaKickerEl.textContent = likeBucketLabel
-      ? `分时增量 · 每 ${likeBucketLabel}`
-      : "分时增量";
+    likeDeltaKickerEl.textContent = "每小时增量";
   }
   if (likeDeltaChipEl) {
     if (likeDeltaPoints.length > 0) {
       const latestBucketLike = likeDeltaPoints[likeDeltaPoints.length - 1].value;
-      likeDeltaChipEl.textContent = likeBucketLabel
-        ? `${fmtSignedDelta(latestBucketLike)} / ${likeBucketLabel}`
-        : fmtSignedDelta(latestBucketLike);
+      likeDeltaChipEl.textContent = series?.likeDeltaIsPartial
+        ? `${fmtSignedDelta(latestBucketLike)} / 近${series.likeDeltaPartialMinutes}分钟`
+        : `${fmtSignedDelta(latestBucketLike)} / 小时`;
     } else {
       likeDeltaChipEl.textContent = "--";
     }
@@ -3000,8 +2930,11 @@ function setModalChartsPlaceholder(message) {
 }
 
 function refreshOpenDemoModal(bvid) {
-  const history = getDemoVideoHistory(state, bvid, { hours: state.modalHours });
-  const series = buildModalSeriesFromHistory(history, state.modalHours);
+  const history = getDemoVideoHistory(state, bvid, {
+    hours: state.modalHours,
+    maxPoints: MODAL_HISTORY_MAX_POINTS,
+  });
+  const series = buildModalSeriesFromHistory(history);
   state.modalPoints = series;
   updateModalStatsFromVideoAndPoints(bvid, series);
   renderModalCharts(series, false);
@@ -3016,9 +2949,12 @@ async function loadVideoModalSeries(bvid, hours, { animate = true } = {}) {
   const targetHours = Number(hours ?? 24);
 
   if (state.demoMode) {
-    const history = getDemoVideoHistory(state, bvid, { hours: targetHours });
+    const history = getDemoVideoHistory(state, bvid, {
+      hours: targetHours,
+      maxPoints: MODAL_HISTORY_MAX_POINTS,
+    });
     if (state.modalBvid !== bvid || reqId !== state.modalReqSeq) return;
-    const series = buildModalSeriesFromHistory(history, targetHours);
+    const series = buildModalSeriesFromHistory(history);
     state.modalPoints = series;
     updateModalStatsFromVideoAndPoints(bvid, series);
     requestAnimationFrame(() => {
@@ -3031,14 +2967,14 @@ async function loadVideoModalSeries(bvid, hours, { animate = true } = {}) {
 
   clearChartsInGroup("video-modal");
   updateModalStatsFromVideoAndPoints(bvid, null);
-  setModalChartsPlaceholder("正在拉取视频趋势与区间增量采样序列...");
+  setModalChartsPlaceholder("正在拉取视频趋势与每小时增量采样序列...");
 
   try {
     const res = await apiFetch(
-      `/api/videos/${encodeURIComponent(bvid)}/history?hours=${encodeURIComponent(targetHours)}`
+      `/api/videos/${encodeURIComponent(bvid)}/history?hours=${encodeURIComponent(targetHours)}&max_points=${MODAL_HISTORY_MAX_POINTS}`
     );
     if (state.modalBvid !== bvid || reqId !== state.modalReqSeq) return;
-    const series = buildModalSeriesFromHistory(res.history || [], targetHours);
+    const series = buildModalSeriesFromHistory(res.history || []);
     state.modalPoints = series;
     updateModalStatsFromVideoAndPoints(bvid, series);
     requestAnimationFrame(() => {

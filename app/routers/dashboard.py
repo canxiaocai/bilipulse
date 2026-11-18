@@ -116,13 +116,18 @@ async def get_video_history(
         default=None, ge=0, le=8760, description="Time window in hours; 0 for all"
     ),
     limit: Optional[int] = Query(default=None, ge=1, le=20000),
+    max_points: Optional[int] = Query(default=None, ge=8, le=5000),
 ) -> dict[str, Any]:
     db = request.app.state.db
 
     def _load() -> list[dict[str, Any]]:
         if hours is not None:
             effective_limit = limit if limit is not None else 20000
-            effective_max_points = 320 if limit is None else None
+            effective_max_points = (
+                max_points
+                if max_points is not None
+                else (320 if limit is None else None)
+            )
             return db.get_video_history(
                 bvid,
                 limit=effective_limit,
@@ -130,7 +135,9 @@ async def get_video_history(
                 max_points=effective_max_points,
             )
         effective_limit = limit if limit is not None else 100
-        return db.get_video_history(bvid, limit=effective_limit)
+        return db.get_video_history(
+            bvid, limit=effective_limit, max_points=max_points
+        )
 
     history = await asyncio.to_thread(_load)
     return {"bvid": bvid, "hours": hours, "history": history}

@@ -3511,7 +3511,7 @@ def test_video_history_like_count_snapshots_active_ttl_and_modal_markup(tmp_path
     # 3) API & HTML markup expose like_count and dual interval-delta modal charts
     app = create_app(database=db, enable_scheduler=False)
     with TestClient(app) as client:
-        api_hist = client.get("/api/videos/BV_hist/history?hours=24").json()["history"]
+        api_hist = client.get("/api/videos/BV_hist/history?hours=24&max_points=2400").json()["history"]
         assert len(api_hist) == 2
         assert [pt["like_count"] for pt in api_hist] == [48, 65]
 
@@ -3520,3 +3520,5 @@ def test_video_history_like_count_snapshots_active_ttl_and_modal_markup(tmp_path
         assert 'id="modalVideoLikeDeltaChart"' in html
         assert 'id="modalLikeCount"' in html
         assert 'id="modalLikeDelta"' in html
+        assert "每小时播放增量" in html
+        assert "每小时点赞增量" in html
