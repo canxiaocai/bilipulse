@@ -73,6 +73,9 @@ class VideoOut(BaseModel):
     pubdate: int = 0
     duration: int = 0
     play_count: int = 0
+    like_count: int = 0
+    coin_count: int = 0
+    stats_synced_at: Optional[str] = None
     cid_count: int = 1
     last_online_count: int = 0
     last_online_raw: str = ""

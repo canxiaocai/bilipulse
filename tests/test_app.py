@@ -2958,3 +2958,140 @@ def test_bilibili_client_partial_session_token_healing_and_cookie_isolation():
             assert cb._client.cookies.get("bili_ticket") == "ticket_B"
 
     asyncio.run(scenario())
+
+
+def test_video_engagement_stats_client_db_collector_and_api(tmp_path: Path):
+    # 1) BilibiliClient.get_video_stat parses view/like/coin safely
+    async def check_client():
+        async with BilibiliClient() as client:
+            async def fake_request(url, params=None, referer=None, retries=2):
+                assert "web-interface/view" in url
+                assert params == {"bvid": "BV1stat"}
+                return {
+                    "code": 0,
+                    "data": {
+                        "owner": {"mid": 12345},
+                        "stat": {"view": 20000, "like": 1520, "coin": 340},
+                    },
+                }
+
+            with patch.object(client, "_request_json", side_effect=fake_request):
+                stat = await client.get_video_stat("BV1stat")
+                owner = await client.get_video_owner_mid("BV1stat")
+                assert stat == {"play_count": 20000, "like_count": 1520, "coin_count": 340}
+                assert owner == "12345"
+
+    asyncio.run(check_client())
+
+    # 2) Legacy DB schema migration adds like_count, coin_count, stats_synced_at and preserves existing stats
+    import sqlite3
+
+    legacy_db_path = tmp_path / "legacy_videos.db"
+    conn = sqlite3.connect(str(legacy_db_path))
+    conn.executescript(
+        """
+        CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE videos (
+            bvid TEXT PRIMARY KEY,
+            uid TEXT NOT NULL,
+            aid INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            pic TEXT NOT NULL DEFAULT '',
+            pubdate INTEGER NOT NULL DEFAULT 0,
+            duration INTEGER NOT NULL DEFAULT 0,
+            play_count INTEGER NOT NULL DEFAULT 0,
+            cids_json TEXT NOT NULL DEFAULT '[]',
+            last_online_count INTEGER NOT NULL DEFAULT 0,
+            last_online_raw TEXT NOT NULL DEFAULT '',
+            last_checked_at TEXT,
+            updated_at TEXT NOT NULL
+        );
+        INSERT INTO videos (bvid, uid, aid, title, play_count, updated_at)
+        VALUES ('BV1legacy', '555666', 1, 'Legacy Video', 1000, '2026-01-01T00:00:00+08:00');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(db_path=legacy_db_path)
+    legacy_vids = db.get_videos("555666")
+    assert len(legacy_vids) == 1
+    assert legacy_vids[0]["like_count"] == 0
+    assert legacy_vids[0]["coin_count"] == 0
+    assert legacy_vids[0]["stats_synced_at"] is None
+
+    db.update_video_stats_batch(
+        [{"bvid": "BV1legacy", "play_count": 1200, "like_count": 96, "coin_count": 24}]
+    )
+    # Upsert from list API (without like/coin) must preserve synced stats
+    db.upsert_videos(
+        "555666",
+        [{"bvid": "BV1legacy", "aid": 1, "title": "Legacy Video Updated", "play_count": 1250}],
+    )
+    preserved = db.get_videos("555666")[0]
+    assert preserved["title"] == "Legacy Video Updated"
+    assert preserved["play_count"] == 1250
+    assert preserved["like_count"] == 96
+    assert preserved["coin_count"] == 24
+    assert preserved["stats_synced_at"] is not None
+
+    # 3) Collector refreshes stats during sync crawl and skips during non-sync crawl
+    uid = "777888"
+    db2 = Database(db_path=tmp_path / "stats_crawl.db")
+    db2.update_settings({"uid": uid, "request_delay_ms": "50"})
+
+    fake_client = AsyncMock()
+    fake_client.__aenter__.return_value = fake_client
+    fake_client.__aexit__.return_value = None
+    fake_client.get_relation_stat.return_value = {"follower": 9000, "following": 10}
+    fake_client.get_account_card.return_value = {
+        "name": "StatsUP",
+        "face": "",
+        "follower": 9000,
+        "archive_count": 1,
+    }
+    fake_client.get_all_videos.return_value = [
+        {
+            "bvid": "BV1S",
+            "aid": 11,
+            "title": "Stat Video",
+            "pic": "",
+            "pubdate": 1000,
+            "duration": 120,
+            "play_count": 10000,
+        }
+    ]
+    fake_client.get_video_stat.return_value = {
+        "play_count": 10200,
+        "like_count": 816,
+        "coin_count": 204,
+    }
+    fake_client.get_video_cids.return_value = [{"cid": 901, "page": 1, "part": "P1"}]
+    fake_client.get_video_online_total.return_value = (15, "15")
+
+    svc = CrawlService(db2)
+    with patch("app.bilibili.collectors.BilibiliClient", return_value=fake_client):
+        res1 = asyncio.run(svc.run_crawl(force_sync_videos=False))
+        assert res1["status"] == "success"
+        assert fake_client.get_video_stat.await_count == 1
+        snap1 = db2.get_latest_two_snapshots(uid)[0]
+        assert snap1["extra_metrics"]["total_video_plays"] == 10200
+
+        # Non-sync crawl should NOT re-fetch get_video_stat
+        res2 = asyncio.run(svc.run_crawl(force_sync_videos=False))
+        assert res2["status"] == "success"
+        assert fake_client.get_video_stat.await_count == 1
+
+    app = create_app(database=db2, enable_scheduler=False)
+    with TestClient(app) as client:
+        dash = client.get("/api/dashboard?hours=24").json()
+        assert len(dash["top_videos"]) == 1
+        top_v = dash["top_videos"][0]
+        assert top_v["play_count"] == 10200
+        assert top_v["like_count"] == 816
+        assert top_v["coin_count"] == 204
+        assert top_v["stats_synced_at"] is not None
+
+        vids_resp = client.get(f"/api/videos?uid={uid}").json()
+        assert vids_resp["videos"][0]["like_count"] == 816
+        assert vids_resp["videos"][0]["coin_count"] == 204

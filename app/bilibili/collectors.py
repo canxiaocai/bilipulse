@@ -10,8 +10,22 @@ from app.database import Database
 
 logger = logging.getLogger(__name__)
 
-VIDEO_SYNC_RULE = "owner_only_v1"
+VIDEO_SYNC_RULE = "owner_only_v2"
 ONLINE_COUNT_RULE = "minus_1_per_cid_v1"
+
+
+def _is_valid_stat_payload(stat: Any) -> bool:
+    """Return True if stat is a dict with numeric like_count and coin_count fields."""
+    if not isinstance(stat, dict):
+        return False
+    like_val = stat.get("like_count")
+    coin_val = stat.get("coin_count")
+    return (
+        isinstance(like_val, (int, float))
+        and not isinstance(like_val, bool)
+        and isinstance(coin_val, (int, float))
+        and not isinstance(coin_val, bool)
+    )
 
 
 def adjust_online_count(raw_count: int) -> int:
@@ -145,6 +159,7 @@ class AllVideosOnlineCollector(BaseCollector):
 
         semaphore = asyncio.Semaphore(4)
         abort_412 = asyncio.Event()
+        stat_updates: list[dict[str, Any]] = []
 
         async def fetch_single_video(video: dict[str, Any]) -> Optional[dict[str, Any]]:
             if abort_412.is_set():
@@ -153,6 +168,34 @@ class AllVideosOnlineCollector(BaseCollector):
                 if abort_412.is_set():
                     return None
                 bvid = video["bvid"]
+
+                if needs_sync:
+                    try:
+                        stat = await ctx.client.get_video_stat(bvid)
+                        if _is_valid_stat_payload(stat):
+                            play_val = max(0, int(stat.get("play_count", video.get("play_count", 0))))
+                            like_val = max(0, int(stat["like_count"]))
+                            coin_val = max(0, int(stat["coin_count"]))
+                            video["play_count"] = play_val
+                            video["like_count"] = like_val
+                            video["coin_count"] = coin_val
+                            stat_updates.append(
+                                {
+                                    "bvid": bvid,
+                                    "play_count": play_val,
+                                    "like_count": like_val,
+                                    "coin_count": coin_val,
+                                }
+                            )
+                            await asyncio.sleep(delay_sec)
+                    except BilibiliAPIError as exc:
+                        ctx.errors.append(f"{bvid} 获取点赞投币失败: {exc}")
+                        if exc.code == 412:
+                            abort_412.set()
+                            return None
+                    except Exception as exc:
+                        ctx.errors.append(f"{bvid} 获取点赞投币失败: {exc}")
+
                 cids = video.get("cids") or []
                 if not cids:
                     try:
@@ -206,6 +249,11 @@ class AllVideosOnlineCollector(BaseCollector):
                 }
 
         results = await asyncio.gather(*(fetch_single_video(v) for v in cached_videos))
+        if stat_updates:
+            await asyncio.to_thread(ctx.db.update_video_stats_batch, stat_updates)
+            ctx.extra_metrics["total_video_plays"] = sum(
+                int(v.get("play_count", 0)) for v in cached_videos
+            )
         succeeded_items = [item for item in results if item is not None]
         ctx.video_online_items = succeeded_items
         ctx.videos_succeeded = len(succeeded_items)

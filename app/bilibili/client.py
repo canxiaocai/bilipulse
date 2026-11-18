@@ -26,6 +26,16 @@ DEFAULT_UA = (
 )
 
 
+def _safe_nonneg_int(raw: Any) -> int:
+    """Parse non-negative integer counts safely, returning 0 for invalid values."""
+    if raw is None or isinstance(raw, bool):
+        return 0
+    try:
+        return max(0, int(raw))
+    except (ValueError, TypeError):
+        return 0
+
+
 def parse_online_count(raw: Any) -> int:
     """Parse Bilibili online viewer text like '11', '100+', '1.2万+' into an integer."""
     if raw is None:
@@ -396,8 +406,8 @@ class BilibiliClient:
             "archive_count": int(payload.get("archive_count", 0)),
         }
 
-    async def get_video_owner_mid(self, bvid: str) -> Optional[str]:
-        """Fetch the primary UP主 mid for a video via /x/web-interface/view."""
+    async def _fetch_video_view_data(self, bvid: str) -> dict[str, Any]:
+        """Fetch raw data payload from /x/web-interface/view for a video."""
         data = await self._request_json(
             "https://api.bilibili.com/x/web-interface/view",
             params={"bvid": bvid},
@@ -408,11 +418,26 @@ class BilibiliClient:
                 f"web-interface/view error {data.get('code')} for {bvid}: {data.get('message')}",
                 code=data.get("code"),
             )
-        owner = (data.get("data") or {}).get("owner") or {}
+        return data.get("data") or {}
+
+    async def get_video_owner_mid(self, bvid: str) -> Optional[str]:
+        """Fetch the primary UP主 mid for a video via /x/web-interface/view."""
+        payload = await self._fetch_video_view_data(bvid)
+        owner = payload.get("owner") or {}
         owner_mid = owner.get("mid")
         if owner_mid is None or str(owner_mid).strip() == "":
             return None
         return str(owner_mid).strip()
+
+    async def get_video_stat(self, bvid: str) -> dict[str, int]:
+        """Fetch play, like, and coin counts for a video via /x/web-interface/view."""
+        payload = await self._fetch_video_view_data(bvid)
+        stat = payload.get("stat") or {}
+        return {
+            "play_count": _safe_nonneg_int(stat.get("view")),
+            "like_count": _safe_nonneg_int(stat.get("like")),
+            "coin_count": _safe_nonneg_int(stat.get("coin")),
+        }
 
     async def _get_videos_page_series_raw(
         self, uid: str, pn: int = 1, ps: int = 100

@@ -25,7 +25,7 @@ import {
   reorderDemoAccounts,
   buildFallbackCoverSvg,
   buildDemoAvatarSvg,
-} from "./demo-data.js?v=20261118v";
+} from "./demo-data.js?v=20261118y";
 
 const THEME_STORAGE_KEY = "bilipulse_theme";
 const DEMO_PULSE_INTERVAL_MS = 3500;
@@ -1754,6 +1754,16 @@ const LEADERBOARD_SPECS = [
   },
 ];
 
+function formatEngagementRate(count, playCount, hasStats) {
+  const plays = Number(playCount || 0);
+  const val = Number(count || 0);
+  if (!Number.isFinite(plays) || plays <= 0 || (!hasStats && val === 0)) {
+    return { text: "--", empty: true };
+  }
+  const pct = (Math.max(0, val) / plays) * 100;
+  return { text: `${pct.toFixed(2)}%`, empty: false };
+}
+
 function createOrUpdateRankRow(video, rank, maxMetric, spec) {
   const bvid = String(video.bvid || "");
   const cache = state[spec.cacheKey];
@@ -1780,11 +1790,25 @@ function createOrUpdateRankRow(video, rank, maxMetric, spec) {
         <img src="${escapeHtml(coverSrc)}" referrerpolicy="no-referrer" loading="lazy" alt="${titleEsc}" />
       </div>
       <div class="rank-info">
-        <div class="rank-title"></div>
-        <div class="rank-meta mono">
-          <a class="bvid-link bvid-pill mono" href="https://www.bilibili.com/video/${encodeURIComponent(bvid)}" target="_blank" rel="noopener noreferrer">${bvidEsc}</a>
-          <span class="rank-sub-metric"></span>
-          <span class="rank-dur muted"></span>
+        <div class="rank-info-top">
+          <div class="rank-info-main">
+            <div class="rank-title"></div>
+            <div class="rank-meta mono">
+              <a class="bvid-link bvid-pill mono" href="https://www.bilibili.com/video/${encodeURIComponent(bvid)}" target="_blank" rel="noopener noreferrer">${bvidEsc}</a>
+              <span class="rank-sub-metric"></span>
+              <span class="rank-dur muted"></span>
+            </div>
+          </div>
+          <div class="rank-rates mono" aria-label="互动率">
+            <span class="rank-rate-item rank-rate-coin">
+              <span class="rank-rate-label">投币率</span>
+              <span class="rank-rate-val"></span>
+            </span>
+            <span class="rank-rate-item rank-rate-like">
+              <span class="rank-rate-label">点赞率</span>
+              <span class="rank-rate-val"></span>
+            </span>
+          </div>
         </div>
         <div class="rank-heat-track" aria-hidden="true">
           <div class="rank-heat-fill"></div>
@@ -1826,6 +1850,38 @@ function createOrUpdateRankRow(video, rank, maxMetric, spec) {
 
   const durEl = row.querySelector(".rank-dur");
   if (durEl) durEl.textContent = `${Number(video.cid_count || 1)}集 · ${fmtDuration(video.duration)}`;
+
+  const playCountVal = Math.max(0, Number(video.play_count || 0));
+  const coinCountVal = Math.max(0, Number(video.coin_count || 0));
+  const likeCountVal = Math.max(0, Number(video.like_count || 0));
+  const hasStats =
+    Boolean(video.stats_synced_at) || coinCountVal > 0 || likeCountVal > 0;
+  const coinRate = formatEngagementRate(coinCountVal, playCountVal, hasStats);
+  const likeRate = formatEngagementRate(likeCountVal, playCountVal, hasStats);
+
+  const coinRateEl = row.querySelector(".rank-rate-coin .rank-rate-val");
+  if (coinRateEl) {
+    coinRateEl.textContent = coinRate.text;
+    coinRateEl.classList.toggle("is-empty", coinRate.empty);
+  }
+  const coinItemEl = row.querySelector(".rank-rate-coin");
+  if (coinItemEl) {
+    coinItemEl.title = coinRate.empty
+      ? "投币率：暂无统计数据"
+      : `投币率 ${coinRate.text}（投币 ${fmtNumber(coinCountVal)} / 播放 ${fmtNumber(playCountVal)}）`;
+  }
+
+  const likeRateEl = row.querySelector(".rank-rate-like .rank-rate-val");
+  if (likeRateEl) {
+    likeRateEl.textContent = likeRate.text;
+    likeRateEl.classList.toggle("is-empty", likeRate.empty);
+  }
+  const likeItemEl = row.querySelector(".rank-rate-like");
+  if (likeItemEl) {
+    likeItemEl.title = likeRate.empty
+      ? "点赞率：暂无统计数据"
+      : `点赞率 ${likeRate.text}（点赞 ${fmtNumber(likeCountVal)} / 播放 ${fmtNumber(playCountVal)}）`;
+  }
 
   const heatFill = row.querySelector(".rank-heat-fill");
   if (heatFill) {

@@ -108,6 +108,9 @@ class Database:
                     pubdate INTEGER NOT NULL DEFAULT 0,
                     duration INTEGER NOT NULL DEFAULT 0,
                     play_count INTEGER NOT NULL DEFAULT 0,
+                    like_count INTEGER NOT NULL DEFAULT 0,
+                    coin_count INTEGER NOT NULL DEFAULT 0,
+                    stats_synced_at TEXT,
                     cids_json TEXT NOT NULL DEFAULT '[]',
                     last_online_count INTEGER NOT NULL DEFAULT 0,
                     last_online_raw TEXT NOT NULL DEFAULT '',
@@ -146,6 +149,16 @@ class Database:
                 );
                 """
             )
+            video_cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(videos)").fetchall()
+            }
+            if "like_count" not in video_cols:
+                conn.execute("ALTER TABLE videos ADD COLUMN like_count INTEGER NOT NULL DEFAULT 0")
+            if "coin_count" not in video_cols:
+                conn.execute("ALTER TABLE videos ADD COLUMN coin_count INTEGER NOT NULL DEFAULT 0")
+            if "stats_synced_at" not in video_cols:
+                conn.execute("ALTER TABLE videos ADD COLUMN stats_synced_at TEXT")
             video_snap_cols = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(video_online_snapshots)").fetchall()
@@ -860,27 +873,39 @@ class Database:
         if not videos:
             return
         now = datetime.now(timezone.utc).astimezone().isoformat()
-        params = [
-            (
-                v["bvid"],
-                uid,
-                int(v["aid"]),
-                v["title"],
-                v.get("pic", ""),
-                int(v.get("pubdate", 0)),
-                int(v.get("duration", 0)),
-                int(v.get("play_count", 0)),
-                json.dumps(v.get("cids", []), ensure_ascii=False),
-                now,
+        params = []
+        for v in videos:
+            has_stats = (
+                ("like_count" in v and v["like_count"] is not None)
+                or ("coin_count" in v and v["coin_count"] is not None)
             )
-            for v in videos
-        ]
+            like_val = max(0, int(v.get("like_count") or 0)) if has_stats else 0
+            coin_val = max(0, int(v.get("coin_count") or 0)) if has_stats else 0
+            synced_val = v.get("stats_synced_at") or (now if has_stats else None)
+            params.append(
+                (
+                    v["bvid"],
+                    uid,
+                    int(v["aid"]),
+                    v["title"],
+                    v.get("pic", ""),
+                    int(v.get("pubdate", 0)),
+                    int(v.get("duration", 0)),
+                    int(v.get("play_count", 0)),
+                    like_val,
+                    coin_val,
+                    synced_val,
+                    json.dumps(v.get("cids", []), ensure_ascii=False),
+                    now,
+                )
+            )
         with self.connection() as conn:
             conn.executemany(
                 """
                 INSERT INTO videos (
-                    bvid, uid, aid, title, pic, pubdate, duration, play_count, cids_json, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    bvid, uid, aid, title, pic, pubdate, duration, play_count,
+                    like_count, coin_count, stats_synced_at, cids_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(bvid) DO UPDATE SET
                     uid=excluded.uid,
                     aid=excluded.aid,
@@ -892,11 +917,50 @@ class Database:
                         ELSE videos.duration
                     END,
                     play_count=excluded.play_count,
+                    like_count=CASE
+                        WHEN excluded.stats_synced_at IS NOT NULL THEN excluded.like_count
+                        ELSE videos.like_count
+                    END,
+                    coin_count=CASE
+                        WHEN excluded.stats_synced_at IS NOT NULL THEN excluded.coin_count
+                        ELSE videos.coin_count
+                    END,
+                    stats_synced_at=COALESCE(excluded.stats_synced_at, videos.stats_synced_at),
                     cids_json=CASE
                         WHEN excluded.cids_json != '[]' THEN excluded.cids_json
                         ELSE videos.cids_json
                     END,
                     updated_at=excluded.updated_at
+                """,
+                params,
+            )
+
+    def update_video_stats_batch(self, items: list[dict[str, Any]]) -> None:
+        """Persist refreshed play, like, and coin counts for a batch of videos."""
+        if not items:
+            return
+        now = datetime.now(timezone.utc).astimezone().isoformat()
+        params = [
+            (
+                max(0, int(item["play_count"])),
+                max(0, int(item["like_count"])),
+                max(0, int(item["coin_count"])),
+                now,
+                now,
+                item["bvid"],
+            )
+            for item in items
+        ]
+        with self.connection() as conn:
+            conn.executemany(
+                """
+                UPDATE videos
+                SET play_count = ?,
+                    like_count = ?,
+                    coin_count = ?,
+                    stats_synced_at = ?,
+                    updated_at = ?
+                WHERE bvid = ?
                 """,
                 params,
             )
@@ -928,6 +992,7 @@ class Database:
             rows = conn.execute(
                 """
                 SELECT bvid, uid, aid, title, pic, pubdate, duration, play_count,
+                       like_count, coin_count, stats_synced_at,
                        cids_json, last_online_count, last_online_raw, last_checked_at, updated_at
                 FROM videos
                 WHERE uid = ?
@@ -948,6 +1013,9 @@ class Database:
                     "pubdate": r["pubdate"],
                     "duration": r["duration"],
                     "play_count": r["play_count"],
+                    "like_count": r["like_count"],
+                    "coin_count": r["coin_count"],
+                    "stats_synced_at": r["stats_synced_at"],
                     "cids": cids,
                     "cid_count": max(1, len(cids)),
                     "last_online_count": r["last_online_count"],

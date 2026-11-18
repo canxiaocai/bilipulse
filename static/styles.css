@@ -1599,6 +1599,66 @@ img.rank-thumb {
   transition: transform 0.24s var(--ease-out-expo);
 }
 
+.rank-info-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 6px 12px;
+  min-inline-size: 0;
+}
+
+.rank-info-main {
+  flex: 1 1 auto;
+  min-inline-size: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.rank-rates {
+  margin-inline-start: auto;
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.rank-rate-item {
+  display: inline-flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: 5px;
+  font-size: 11px;
+  line-height: 1.25;
+  white-space: nowrap;
+}
+
+.rank-rate-label {
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.rank-rate-val {
+  font-weight: 600;
+}
+
+.rank-rate-coin .rank-rate-val {
+  color: var(--sig-amber);
+}
+
+.rank-rate-like .rank-rate-val {
+  color: var(--sig-pink);
+}
+
+.rank-rate-val.is-empty {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
 .rank-title,
 .video-title-link {
   font-size: 13.5px;
@@ -1694,6 +1754,20 @@ img.rank-thumb {
 
   .rank-thumb {
     width: 84px;
+  }
+
+  .rank-info-top {
+    flex-wrap: wrap;
+  }
+
+  .rank-info-main {
+    flex: 1 1 180px;
+  }
+
+  .rank-rates {
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
   }
 
   .rank-online {

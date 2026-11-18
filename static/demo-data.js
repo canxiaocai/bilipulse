@@ -596,6 +596,11 @@ function createSingleDemoAccountDataset(profile, now, timeline) {
     const bvidKey = profile.uid === DEMO_UID ? spec.bvid : `${spec.bvid}_${profile.uid.slice(-3)}`;
     videoHistories[bvidKey] = history;
 
+    const likeRatio = 0.052 + ((idx * 17 + Math.round(phaseShift * 10)) % 75) / 1000;
+    const coinRatio = 0.008 + ((idx * 13 + Math.round(phaseShift * 7)) % 34) / 1000;
+    const likeCount = Math.round(scaledPlayCount * likeRatio);
+    const coinCount = Math.round(scaledPlayCount * coinRatio);
+
     return {
       bvid: bvidKey,
       uid: profile.uid,
@@ -613,6 +618,9 @@ function createSingleDemoAccountDataset(profile, now, timeline) {
       pubdate: Math.floor((now - spec.pub_days * dayMs) / 1000),
       duration: spec.duration,
       play_count: scaledPlayCount,
+      like_count: likeCount,
+      coin_count: coinCount,
+      stats_synced_at: latest.collected_at,
       cid_count: spec.cid_count,
       last_online_count: online,
       last_online_raw: `${online}人正在看`,
