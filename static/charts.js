@@ -138,6 +138,8 @@ function normalizePoints(points) {
       hasValidTime: Number.isFinite(tsMs),
       value,
       raw: rawPoint.raw !== undefined ? String(rawPoint.raw) : undefined,
+      hudTime:
+        rawPoint.hudTime !== undefined ? String(rawPoint.hudTime) : undefined,
     };
   });
 
@@ -530,10 +532,10 @@ export function renderTelemetryChart(container, points, options = {}) {
     let yMax = rawMax;
     if (rawMax === rawMin) {
       const pad =
-        rawMin === 0 ? 10 : Math.max(2, Math.ceil(Math.abs(rawMin) * 0.02));
+        rawMin === 0 ? 9 : Math.max(3, Math.ceil(Math.abs(rawMin) * 0.02));
       yMin = rawMin >= 0 ? Math.max(0, rawMin - pad) : rawMin - pad;
       yMax = rawMax + pad;
-      if (yMax <= yMin) yMax = yMin + 10;
+      if (yMax <= yMin) yMax = yMin + 9;
     } else {
       const span = rawMax - rawMin;
       const pad = span * 0.12;
@@ -542,6 +544,10 @@ export function renderTelemetryChart(container, points, options = {}) {
           ? 0
           : rawMin - pad;
       yMax = rawMax + pad;
+    }
+    if (yMax - yMin < 3) {
+      yMin = rawMin >= 0 ? Math.max(0, Math.floor(yMin)) : Math.floor(yMin);
+      yMax = Math.max(Math.ceil(yMax), yMin + 3);
     }
 
     const yTicks = [];
@@ -674,7 +680,11 @@ export function renderTelemetryChart(container, points, options = {}) {
       }
     }
 
-    // Plot boundary hairlines (left & bottom strong axes)
+    // Plot boundary hairlines (left & bottom strong axes, plus 0-reference when spanning negative/positive)
+    if (yMin < 0 && yMax > 0) {
+      const zeroY = valueToY(0);
+      gridSvg += `<line x1="${f2(plotX0)}" y1="${f2(zeroY)}" x2="${f2(plotX1)}" y2="${f2(zeroY)}" stroke="var(--line-strong)" stroke-width="1" stroke-dasharray="4 3" opacity="0.8" />`;
+    }
     gridSvg += `<line x1="${f2(plotX0)}" y1="${f2(plotY0)}" x2="${f2(plotX0)}" y2="${f2(plotY1)}" stroke="var(--line-strong)" stroke-width="1" />`;
     gridSvg += `<line x1="${f2(plotX0)}" y1="${f2(plotY1)}" x2="${f2(plotX1)}" y2="${f2(plotY1)}" stroke="var(--line-strong)" stroke-width="1" />`;
 
@@ -855,7 +865,8 @@ export function renderTelemetryChart(container, points, options = {}) {
 
       if (hudEl && hudTimeEl && hudLabelEl && hudValueEl) {
         const formattedVal = formatValue(pt.value);
-        hudTimeEl.textContent = formatHudTimestamp(pt.tsMs, pt.ts);
+        hudTimeEl.textContent =
+          pt.hudTime || formatHudTimestamp(pt.tsMs, pt.ts);
         hudLabelEl.textContent = `${label}：`;
         hudValueEl.textContent =
           pt.raw && pt.raw !== formattedVal

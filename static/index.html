@@ -14,8 +14,8 @@
   </script>
   <title>B站账号实时监控</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 28 28' fill='none'%3E%3Crect width='28' height='28' fill='%2307090E'/%3E%3Crect x='2.5' y='4.5' width='23' height='19' stroke='%2300E5FF' stroke-width='2'/%3E%3Cpolyline points='5.5,16 9,16 11.2,10.5 14,20 16.8,13 19,16 22.5,16' stroke='%23FF2A7A' stroke-width='2.2' stroke-linecap='square' stroke-linejoin='miter'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/static/tokens-layout.css?v=20261118y" />
-  <link rel="stylesheet" href="/static/styles.css?v=20261118y" />
+  <link rel="stylesheet" href="/static/tokens-layout.css?v=20261118z" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261118z" />
 </head>
 <body>
   <!-- Top 3px Scheduled Crawl Laser Strip -->
@@ -367,7 +367,7 @@
     </div>
   </div>
 
-  <!-- Native Centered Dual-Channel Video Telemetry Modal -->
+  <!-- Native Centered Multi-Channel Video Telemetry Modal -->
   <dialog class="telemetry-modal" id="videoModal" closedby="any" aria-labelledby="modalVideoTitle">
     <div class="modal-shell">
       <header class="modal-header">
@@ -376,8 +376,8 @@
             <img id="modalVideoCover" referrerpolicy="no-referrer" alt="" />
           </div>
           <div class="modal-title-group">
-            <span class="section-kicker mono">视频双通道趋势</span>
-            <h2 class="modal-title" id="modalVideoTitle">视频实时双通道波形</h2>
+            <span class="section-kicker mono">视频四通道趋势</span>
+            <h2 class="modal-title" id="modalVideoTitle">视频实时与增量波形</h2>
             <span class="muted mono" id="modalVideoMeta">--</span>
           </div>
         </div>
@@ -389,7 +389,7 @@
             role="toolbar"
             focusgroup="toolbar wrap"
             aria-label="视频统计时间窗口"
-            aria-controls="modalStats modalVideoChart modalVideoPlayChart"
+            aria-controls="modalStats modalVideoChart modalVideoPlayChart modalVideoPlayDeltaChart modalVideoLikeDeltaChart"
           >
             <span class="range-active-bar" id="modalRangeActiveBar" aria-hidden="true"></span>
             <div class="modal-range-options" role="group" aria-label="时间范围">
@@ -403,7 +403,7 @@
           </div>
           <div class="modal-action-btns">
             <a class="btn btn-chamfer btn-secondary mono" id="modalBiliLink" href="https://www.bilibili.com" target="_blank" rel="noopener noreferrer">B站打开 ↗</a>
-            <button type="button" class="btn btn-ghost mono" id="btnCloseModal" aria-label="关闭视频双通道波形弹窗" autofocus>关闭</button>
+            <button type="button" class="btn btn-ghost mono" id="btnCloseModal" aria-label="关闭视频趋势波形弹窗" autofocus>关闭</button>
           </div>
         </div>
       </header>
@@ -424,6 +424,14 @@
         <div class="modal-stat-cell">
           <span class="muted mono">区间播放增量</span>
           <strong class="mono" id="modalPlayDelta">--</strong>
+        </div>
+        <div class="modal-stat-cell stat-violet">
+          <span class="muted mono">累计点赞</span>
+          <strong class="mono" id="modalLikeCount">--</strong>
+        </div>
+        <div class="modal-stat-cell">
+          <span class="muted mono">区间点赞增量</span>
+          <strong class="mono" id="modalLikeDelta">--</strong>
         </div>
       </div>
 
@@ -448,6 +456,28 @@
             <span class="status-chip mono" id="modalPlayChip">--</span>
           </header>
           <div class="scope-plot modal-plot" id="modalVideoPlayChart"></div>
+        </section>
+
+        <section class="modal-chart-pane pane-emerald" aria-label="播放区间增量曲线图">
+          <header class="modal-chart-head">
+            <div class="modal-chart-title-wrap">
+              <span class="scope-kicker mono" id="modalPlayDeltaKicker">分时增量</span>
+              <h3 class="modal-chart-heading">播放区间增量</h3>
+            </div>
+            <span class="status-chip mono" id="modalPlayDeltaChip">--</span>
+          </header>
+          <div class="scope-plot modal-plot" id="modalVideoPlayDeltaChart"></div>
+        </section>
+
+        <section class="modal-chart-pane pane-violet" aria-label="点赞区间增量曲线图">
+          <header class="modal-chart-head">
+            <div class="modal-chart-title-wrap">
+              <span class="scope-kicker mono" id="modalLikeDeltaKicker">分时增量</span>
+              <h3 class="modal-chart-heading">点赞区间增量</h3>
+            </div>
+            <span class="status-chip mono" id="modalLikeDeltaChip">--</span>
+          </header>
+          <div class="scope-plot modal-plot" id="modalVideoLikeDeltaChart"></div>
         </section>
       </div>
     </div>
@@ -700,6 +730,6 @@
   <!-- HUD Toast Notifications Stack -->
   <div class="toast-stack" id="toastStack" aria-live="polite"></div>
 
-  <script type="module" src="/static/app.js?v=20261118y"></script>
+  <script type="module" src="/static/app.js?v=20261118z"></script>
 </body>
 </html>

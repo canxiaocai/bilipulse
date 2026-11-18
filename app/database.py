@@ -131,7 +131,8 @@ class Database:
                     bvid TEXT NOT NULL,
                     online_count INTEGER NOT NULL,
                     online_raw TEXT NOT NULL DEFAULT '',
-                    play_count INTEGER
+                    play_count INTEGER,
+                    like_count INTEGER
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_video_snapshots_snapshot
@@ -169,6 +170,8 @@ class Database:
             }
             if "play_count" not in video_snap_cols:
                 conn.execute("ALTER TABLE video_online_snapshots ADD COLUMN play_count INTEGER")
+            if "like_count" not in video_snap_cols:
+                conn.execute("ALTER TABLE video_online_snapshots ADD COLUMN like_count INTEGER")
             now = datetime.now(timezone.utc).astimezone().isoformat()
             conn.executemany(
                 "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
@@ -1091,22 +1094,33 @@ class Database:
                     dict.fromkeys(
                         item["bvid"]
                         for item in video_online_items
-                        if item.get("play_count") is None
+                        if item.get("play_count") is None or "like_count" not in item
                     )
                 )
                 fallback_plays: dict[str, int] = {}
+                fallback_likes: dict[str, Optional[int]] = {}
                 for i in range(0, len(missing_bvids), _SQLITE_CHUNK_SIZE):
                     chunk = missing_bvids[i : i + _SQLITE_CHUNK_SIZE]
                     placeholders = ",".join("?" for _ in chunk)
                     v_rows = conn.execute(
-                        f"SELECT bvid, play_count FROM videos WHERE bvid IN ({placeholders})",
+                        f"SELECT bvid, play_count, like_count, stats_synced_at FROM videos WHERE bvid IN ({placeholders})",
                         chunk,
                     ).fetchall()
                     for v_row in v_rows:
+                        bvid_key = v_row["bvid"]
                         if v_row["play_count"] is not None:
-                            fallback_plays[v_row["bvid"]] = int(v_row["play_count"])
+                            fallback_plays[bvid_key] = int(v_row["play_count"])
+                        raw_like = v_row["like_count"]
+                        has_like_stat = bool(v_row["stats_synced_at"]) or (
+                            raw_like is not None and int(raw_like) > 0
+                        )
+                        fallback_likes[bvid_key] = (
+                            int(raw_like) if (has_like_stat and raw_like is not None) else None
+                        )
 
-                snapshot_rows: list[tuple[int, str, int, str, Optional[int]]] = []
+                snapshot_rows: list[
+                    tuple[int, str, int, str, Optional[int], Optional[int]]
+                ] = []
                 video_updates: list[tuple[int, str, str, int, int, str]] = []
                 sticky_until_ts = collected_ts + HOT_STICKY_SECONDS
                 for item in video_online_items:
@@ -1119,8 +1133,22 @@ class Database:
                         if raw_play_count is None
                         else int(raw_play_count)
                     )
+                    if "like_count" in item:
+                        raw_like_count = item["like_count"]
+                        like_count_val = (
+                            None if raw_like_count is None else int(raw_like_count)
+                        )
+                    else:
+                        like_count_val = fallback_likes.get(bvid)
                     snapshot_rows.append(
-                        (snapshot_id, bvid, online_count, online_raw, play_count_val)
+                        (
+                            snapshot_id,
+                            bvid,
+                            online_count,
+                            online_raw,
+                            play_count_val,
+                            like_count_val,
+                        )
                     )
                     video_updates.append(
                         (
@@ -1136,8 +1164,8 @@ class Database:
                 conn.executemany(
                     """
                     INSERT INTO video_online_snapshots (
-                        snapshot_id, bvid, online_count, online_raw, play_count
-                    ) VALUES (?, ?, ?, ?, ?)
+                        snapshot_id, bvid, online_count, online_raw, play_count, like_count
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     snapshot_rows,
                 )
@@ -1312,7 +1340,7 @@ class Database:
 
         tail_keep = min(32, total // 4)
         head_count = total - tail_keep
-        target_head = max(16, max_points - tail_keep)
+        target_head = max(16, max_points - tail_keep - 8)
         stride = head_count / target_head
 
         must_keep: set[int] = {0, total - 1}
@@ -1326,6 +1354,12 @@ class Database:
         max_play_idx: Optional[int] = None
         min_play = float("inf")
         max_play = float("-inf")
+        first_like_idx: Optional[int] = None
+        last_like_idx: Optional[int] = None
+        min_like_idx: Optional[int] = None
+        max_like_idx: Optional[int] = None
+        min_like = float("inf")
+        max_like = float("-inf")
 
         for i, row in enumerate(rows):
             online = row.get("online_count")
@@ -1351,9 +1385,31 @@ class Database:
                     max_play = p_val
                     max_play_idx = i
 
+            like = row.get("like_count")
+            if like is not None:
+                l_val = int(like)
+                if first_like_idx is None:
+                    first_like_idx = i
+                last_like_idx = i
+                if l_val < min_like:
+                    min_like = l_val
+                    min_like_idx = i
+                if l_val > max_like:
+                    max_like = l_val
+                    max_like_idx = i
+
         must_keep.add(min_online_idx)
         must_keep.add(max_online_idx)
-        for idx in (first_play_idx, last_play_idx, min_play_idx, max_play_idx):
+        for idx in (
+            first_play_idx,
+            last_play_idx,
+            min_play_idx,
+            max_play_idx,
+            first_like_idx,
+            last_like_idx,
+            min_like_idx,
+            max_like_idx,
+        ):
             if idx is not None:
                 must_keep.add(idx)
 
@@ -1379,7 +1435,8 @@ class Database:
             params.append(cutoff)
 
         sql = f"""
-            SELECT s.collected_at, s.collected_at_ts, v.online_count, v.online_raw, v.play_count
+            SELECT s.collected_at, s.collected_at_ts, v.online_count, v.online_raw,
+                   v.play_count, v.like_count
             FROM video_online_snapshots v
             JOIN account_snapshots s ON s.id = v.snapshot_id
             {where}

@@ -565,6 +565,11 @@ function createSingleDemoAccountDataset(profile, now, timeline) {
     });
 
     const scaledPlayCount = Math.round(spec.play_count * (0.55 + scale * 0.45));
+    const likeRatio = 0.052 + ((idx * 17 + Math.round(phaseShift * 10)) % 75) / 1000;
+    const coinRatio = 0.008 + ((idx * 13 + Math.round(phaseShift * 7)) % 34) / 1000;
+    const likeCount = Math.round(scaledPlayCount * likeRatio);
+    const coinCount = Math.round(scaledPlayCount * coinRatio);
+
     const rawIncrements = onlineCounts.map((cnt, hIdx) => {
       if (hIdx === 0) return 0;
       const dtHours = Math.max(
@@ -582,24 +587,38 @@ function createSingleDemoAccountDataset(profile, now, timeline) {
     const totalWindowPlayGain = playIncrements.reduce((acc, n) => acc + n, 0);
     let runningPlays = Math.max(0, scaledPlayCount - totalWindowPlayGain);
 
+    const rawLikeIncrements = playIncrements.map((pInc, hIdx) => {
+      if (hIdx === 0) return 0;
+      const engagementWave = 0.78 + Math.sin(hIdx * 0.51 + idx * 1.43 + phaseShift) * 0.28;
+      return Math.max(0, Math.round(pInc * likeRatio * engagementWave));
+    });
+    const rawLikeGainSum = rawLikeIncrements.reduce((acc, n) => acc + n, 0);
+    const maxAllowedLikeGain = Math.round(likeCount * 0.72);
+    const likeGainScale =
+      rawLikeGainSum > maxAllowedLikeGain && rawLikeGainSum > 0
+        ? maxAllowedLikeGain / rawLikeGainSum
+        : 1;
+    const likeIncrements = rawLikeIncrements.map((lInc, hIdx) =>
+      hIdx === 0 ? 0 : Math.max(0, Math.round(lInc * likeGainScale))
+    );
+    const totalWindowLikeGain = likeIncrements.reduce((acc, n) => acc + n, 0);
+    let runningLikes = Math.max(0, likeCount - totalWindowLikeGain);
+
     const history = snapshots.map((snap, hIdx) => {
       const count = onlineCounts[hIdx];
       runningPlays += playIncrements[hIdx];
+      runningLikes += likeIncrements[hIdx];
       return {
         collected_at: snap.collected_at,
         collected_at_ts: snap.collected_at_ts,
         online_count: count,
         online_raw: `${count}人正在看`,
         play_count: runningPlays,
+        like_count: runningLikes,
       };
     });
     const bvidKey = profile.uid === DEMO_UID ? spec.bvid : `${spec.bvid}_${profile.uid.slice(-3)}`;
     videoHistories[bvidKey] = history;
-
-    const likeRatio = 0.052 + ((idx * 17 + Math.round(phaseShift * 10)) % 75) / 1000;
-    const coinRatio = 0.008 + ((idx * 13 + Math.round(phaseShift * 7)) % 34) / 1000;
-    const likeCount = Math.round(scaledPlayCount * likeRatio);
-    const coinCount = Math.round(scaledPlayCount * coinRatio);
 
     return {
       bvid: bvidKey,
@@ -626,6 +645,8 @@ function createSingleDemoAccountDataset(profile, now, timeline) {
       last_online_raw: `${online}人正在看`,
       last_checked_at: latest.collected_at,
       _weight: normWeight,
+      _likeRatio: likeRatio,
+      _likeCarry: 0,
       _phase: idx * 0.91 + phaseShift,
     };
   });
@@ -734,6 +755,11 @@ function tickSingleDemoAccount(ds) {
 
     const playStep = Math.max(0, Math.round((nextOnline / 45) + ((ds.tickCounter + i) % 3 === 0 ? 2 : 0)));
     v.play_count += playStep;
+    const likeRatio = Number(v._likeRatio || 0.068);
+    const likeAccum = Number(v._likeCarry || 0) + playStep * likeRatio;
+    const likeStep = Math.floor(likeAccum);
+    v._likeCarry = likeAccum - likeStep;
+    v.like_count = Math.max(0, Number(v.like_count || 0) + likeStep);
     totalPlaysSum += v.play_count;
     newOnlineTotal += nextOnline;
 
@@ -744,6 +770,7 @@ function tickSingleDemoAccount(ds) {
       online_count: nextOnline,
       online_raw: `${nextOnline}人正在看`,
       play_count: v.play_count,
+      like_count: v.like_count,
     });
     if (hist.length > 1100) {
       hist.splice(760, 1);
@@ -1006,6 +1033,10 @@ function downsampleVideoHistory(history, maxPoints = 280) {
   let maxPlay = -Infinity;
   let minPlayIdx = -1;
   let maxPlayIdx = -1;
+  let minLike = Infinity;
+  let maxLike = -Infinity;
+  let minLikeIdx = -1;
+  let maxLikeIdx = -1;
 
   for (let i = 0; i < total; i++) {
     const pt = history[i];
@@ -1033,12 +1064,27 @@ function downsampleVideoHistory(history, maxPoints = 280) {
         }
       }
     }
+    if (pt.like_count !== null && pt.like_count !== undefined) {
+      const likes = Number(pt.like_count);
+      if (Number.isFinite(likes)) {
+        if (likes < minLike) {
+          minLike = likes;
+          minLikeIdx = i;
+        }
+        if (likes > maxLike) {
+          maxLike = likes;
+          maxLikeIdx = i;
+        }
+      }
+    }
   }
 
   mustKeep.add(minOnlineIdx);
   mustKeep.add(maxOnlineIdx);
   if (minPlayIdx >= 0) mustKeep.add(minPlayIdx);
   if (maxPlayIdx >= 0) mustKeep.add(maxPlayIdx);
+  if (minLikeIdx >= 0) mustKeep.add(minLikeIdx);
+  if (maxLikeIdx >= 0) mustKeep.add(maxLikeIdx);
 
   for (let k = 0; k < targetHead; k++) {
     mustKeep.add(Math.min(headCount - 1, Math.round(k * stride)));
@@ -1068,6 +1114,8 @@ export function getDemoVideoHistory(stateOrDataset, bvid, options = 120) {
     const allSnaps = ds.allSnapshots || [];
     const endPlays = Number(vid?.play_count || 10000);
     const startPlays = Math.max(0, endPlays - allSnaps.length * 12);
+    const endLikes = Number(vid?.like_count || Math.round(endPlays * 0.07));
+    const startLikes = Math.max(0, endLikes - Math.round((endPlays - startPlays) * 0.07));
     source = allSnaps.map((s, idx) => {
       const wave = Math.sin(idx * 0.45) * 3;
       const count = Math.max(1, Math.round(s.online_viewers_total * weight + wave));
@@ -1078,6 +1126,7 @@ export function getDemoVideoHistory(stateOrDataset, bvid, options = 120) {
         online_count: count,
         online_raw: `${count}人正在看`,
         play_count: Math.round(startPlays + (endPlays - startPlays) * ratio),
+        like_count: Math.round(startLikes + (endLikes - startLikes) * ratio),
       };
     });
   }

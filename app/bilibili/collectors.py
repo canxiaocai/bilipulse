@@ -20,6 +20,8 @@ HOT_TOP_PLAYS_LIMIT = 40
 COLD_POLL_BATCH_SIZE = 30
 SHOWCASE_TOP_LIMIT = 50
 STATS_REFRESH_QUOTA = 30
+STATS_ACTIVE_TTL_SEC = 240
+STATS_RECENT_PUB_WINDOW_SEC = 3 * 86400
 STATS_HOT_TTL_SEC = 3600
 STATS_COLD_TTL_SEC = 86400
 FULL_VIDEO_SYNC_INTERVAL_SEC = 12 * 3600
@@ -140,21 +142,33 @@ def select_stats_refresh_bvids(
 
     unsynced_showcase: list[dict[str, Any]] = []
     unsynced_cold: list[dict[str, Any]] = []
+    stale_active: list[tuple[int, int, int, float, dict[str, Any]]] = []
     stale_showcase: list[tuple[float, dict[str, Any]]] = []
     stale_cold: list[tuple[float, dict[str, Any]]] = []
 
     for v in videos:
         bvid = v["bvid"]
         in_showcase = bvid in showcase_bvids
+        online_val = int(v.get("last_online_count") or 0)
+        pubdate_val = int(v.get("pubdate") or 0)
+        is_live_active = (
+            online_val > 0
+            or int(v.get("hot_until_ts") or 0) > now_ts
+            or (pubdate_val > 0 and (now_ts - pubdate_val) <= STATS_RECENT_PUB_WINDOW_SEC)
+        )
         synced_ts = _parse_iso_ts(v.get("stats_synced_at"))
         if synced_ts is None:
-            if in_showcase:
+            if in_showcase or is_live_active:
                 unsynced_showcase.append(v)
             else:
                 unsynced_cold.append(v)
         else:
             age = now_ts - synced_ts
-            if in_showcase and age >= STATS_HOT_TTL_SEC:
+            if is_live_active and age >= STATS_ACTIVE_TTL_SEC:
+                stale_active.append(
+                    (1 if online_val > 0 else 0, online_val, pubdate_val, -synced_ts, v)
+                )
+            elif in_showcase and age >= STATS_HOT_TTL_SEC:
                 stale_showcase.append((synced_ts, v))
             elif not in_showcase and age >= STATS_COLD_TTL_SEC:
                 stale_cold.append((synced_ts, v))
@@ -172,12 +186,17 @@ def select_stats_refresh_bvids(
         key=lambda x: (int(x.get("play_count") or 0), int(x.get("pubdate") or 0)),
         reverse=True,
     )
+    stale_active.sort(
+        key=lambda item: (item[0], item[1], item[2], item[3]),
+        reverse=True,
+    )
     stale_showcase.sort(key=lambda pair: pair[0])
     stale_cold.sort(key=lambda pair: pair[0])
 
     ordered = (
         [v["bvid"] for v in unsynced_showcase]
         + [v["bvid"] for v in unsynced_cold]
+        + [v["bvid"] for *_, v in stale_active]
         + [v["bvid"] for _, v in stale_showcase]
         + [v["bvid"] for _, v in stale_cold]
     )
@@ -388,6 +407,7 @@ class AllVideosOnlineCollector(BaseCollector):
                             video["play_count"] = play_val
                             video["like_count"] = like_val
                             video["coin_count"] = coin_val
+                            video["stats_synced_at"] = "synced"
                             stat_updates.append(
                                 {
                                     "bvid": bvid,
@@ -457,11 +477,16 @@ class AllVideosOnlineCollector(BaseCollector):
                     return None
 
                 online_raw = raw_parts[0] if len(raw_parts) == 1 else "+".join(raw_parts)
+                raw_like = video.get("like_count")
+                has_like_stat = bool(video.get("stats_synced_at")) or (
+                    raw_like is not None and int(raw_like) > 0
+                )
                 return {
                     "bvid": bvid,
                     "online_count": video_online,
                     "online_raw": online_raw,
                     "play_count": int(video.get("play_count", 0)),
+                    "like_count": int(raw_like or 0) if has_like_stat else None,
                 }
 
         results = await asyncio.gather(*(fetch_single_video(v) for v in work_videos))

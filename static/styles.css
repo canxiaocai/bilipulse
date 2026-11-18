@@ -1272,10 +1272,15 @@ samp {
   touch-action: pan-y;
 }
 
-.scope-plot.drawer-plot,
-.scope-plot.modal-plot {
+.scope-plot.drawer-plot {
   height: 320px;
   min-height: 290px;
+  padding: 0;
+}
+
+.scope-plot.modal-plot {
+  height: clamp(220px, 26dvh, 272px);
+  min-height: 216px;
   padding: 0;
 }
 
@@ -1312,6 +1317,14 @@ samp {
 
 .pane-pink .modal-plot .scope-curve {
   filter: drop-shadow(0 0 6px var(--sig-pink-dim));
+}
+
+.pane-emerald .modal-plot .scope-curve {
+  filter: drop-shadow(0 0 6px var(--sig-emerald-dim));
+}
+
+.pane-violet .modal-plot .scope-curve {
+  filter: drop-shadow(0 0 6px var(--sig-violet-dim));
 }
 
 .scope-area {
@@ -1382,8 +1395,17 @@ samp {
   transition: opacity 0.12s ease;
 }
 
-.scope-pink .scope-hud {
+.scope-pink .scope-hud,
+.pane-pink .scope-hud {
   border-left-color: var(--sig-pink);
+}
+
+.pane-emerald .scope-hud {
+  border-left-color: var(--sig-emerald);
+}
+
+.pane-violet .scope-hud {
+  border-left-color: var(--sig-violet);
 }
 
 .scope-hud-time {
@@ -2400,12 +2422,29 @@ dialog.telemetry-drawer[open][data-closing]::backdrop {
   text-shadow: 0 0 18px var(--sig-pink-dim);
 }
 
+#modalLikeCount {
+  color: var(--sig-violet);
+  text-shadow: 0 0 18px var(--sig-violet-dim);
+}
+
 .modal-stat-cell strong.is-up {
   color: var(--sig-emerald);
 }
 
+.modal-stat-cell strong.is-down {
+  color: var(--sig-pink);
+}
+
 .pane-pink .scope-kicker {
   color: var(--sig-pink);
+}
+
+.pane-emerald .scope-kicker {
+  color: var(--sig-emerald);
+}
+
+.pane-violet .scope-kicker {
+  color: var(--sig-violet);
 }
 
 .modal-chart-pane.pane-cyan {
@@ -2414,6 +2453,14 @@ dialog.telemetry-drawer[open][data-closing]::backdrop {
 
 .modal-chart-pane.pane-pink {
   border-top: 2px solid var(--sig-pink);
+}
+
+.modal-chart-pane.pane-emerald {
+  border-top: 2px solid var(--sig-emerald);
+}
+
+.modal-chart-pane.pane-violet {
+  border-top: 2px solid var(--sig-violet);
 }
 
 /* --------------------------------------------------------------------------

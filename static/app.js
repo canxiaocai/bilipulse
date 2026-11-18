@@ -7,14 +7,14 @@
 import {
   renderTelemetryChart,
   clearChartsInGroup,
-} from "./charts.js?v=20261118h";
+} from "./charts.js?v=20261118z";
 import {
   animateNumber,
   runViewTransition,
   staggerEnter,
   positionSlidingIndicator,
   prefersReducedMotion,
-} from "./motion.js?v=20261118h";
+} from "./motion.js?v=20261118z";
 import {
   createDemoDataset,
   tickDemoDataset,
@@ -25,7 +25,7 @@ import {
   reorderDemoAccounts,
   buildFallbackCoverSvg,
   buildDemoAvatarSvg,
-} from "./demo-data.js?v=20261118y";
+} from "./demo-data.js?v=20261118z";
 
 const THEME_STORAGE_KEY = "bilipulse_theme";
 const DEMO_PULSE_INTERVAL_MS = 3500;
@@ -2493,14 +2493,267 @@ function renderDashboard(data, { animateCharts = true, isLiveTick = false } = {}
   renderCompareBoard();
 }
 
-/* ---------- Native <dialog id="videoModal"> Centered Dual-Channel Modal ---------- */
+/* ---------- Native <dialog id="videoModal"> Centered Multi-Channel Modal ---------- */
 
-function buildModalSeriesFromHistory(history) {
+const STANDARD_BUCKET_SECONDS = [
+  300,
+  600,
+  900,
+  1800,
+  3600,
+  7200,
+  14400,
+  21600,
+  43200,
+  86400,
+];
+
+function parseModalPointMs(rawTs, rawEpochSec) {
+  if (rawEpochSec !== null && rawEpochSec !== undefined && Number.isFinite(Number(rawEpochSec))) {
+    const sec = Number(rawEpochSec);
+    if (sec > 0) return sec * 1000;
+  }
+  if (!rawTs) return Number.NaN;
+  const str = String(rawTs).trim();
+  if (!str) return Number.NaN;
+  let ms = Date.parse(str);
+  if (Number.isNaN(ms) && str.includes(" ")) {
+    ms = Date.parse(str.replace(" ", "T"));
+  }
+  return ms;
+}
+
+function fmtSignedDelta(val) {
+  if (val === null || val === undefined || val === "" || Number.isNaN(Number(val))) {
+    return "--";
+  }
+  const num = Math.round(Number(val));
+  if (num > 0) return `+${fmtNumber(num)}`;
+  return fmtNumber(num);
+}
+
+function formatBucketDurationLabel(bucketSec) {
+  const sec = Math.max(60, Math.round(Number(bucketSec || 300)));
+  if (sec < 3600) {
+    return `${Math.max(1, Math.round(sec / 60))}分钟`;
+  }
+  if (sec < 86400) {
+    const hrs = sec / 3600;
+    return Number.isInteger(hrs) ? `${hrs}小时` : `${hrs.toFixed(1)}小时`;
+  }
+  const days = sec / 86400;
+  return Number.isInteger(days) ? `${days}天` : `${days.toFixed(1)}天`;
+}
+
+function formatBucketRangeHud(startMs, endMs, bucketLabel) {
+  const d0 = new Date(startMs);
+  const d1 = new Date(endMs);
+  if (Number.isNaN(d0.getTime()) || Number.isNaN(d1.getTime())) {
+    return bucketLabel ? `区间 (${bucketLabel})` : "--:--";
+  }
+  const pad2 = (n) => String(n).padStart(2, "0");
+  const md0 = `${pad2(d0.getMonth() + 1)}-${pad2(d0.getDate())}`;
+  const md1 = `${pad2(d1.getMonth() + 1)}-${pad2(d1.getDate())}`;
+  const hm0 = `${pad2(d0.getHours())}:${pad2(d0.getMinutes())}`;
+  const hm1 = `${pad2(d1.getHours())}:${pad2(d1.getMinutes())}`;
+  const rangeStr =
+    md0 === md1 ? `${md0} ${hm0} → ${hm1}` : `${md0} ${hm0} → ${md1} ${hm1}`;
+  return bucketLabel ? `${rangeStr} · ${bucketLabel}` : rangeStr;
+}
+
+function medianOfNumbers(values) {
+  if (!Array.isArray(values) || values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  return sorted.length % 2 === 1
+    ? sorted[mid]
+    : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function chooseBaseBucketSec(spanSec, requestedHours) {
+  const h = Number(requestedHours || 0);
+  const effectiveSec = h > 0 ? Math.min(spanSec, h * 3600 * 1.05) : spanSec;
+  if (effectiveSec <= 2.5 * 3600) return 300;
+  if (effectiveSec <= 8 * 3600) return 900;
+  if (effectiveSec <= 30 * 3600) return 1800;
+  if (effectiveSec <= 8 * 86400) return 4 * 3600;
+  if (effectiveSec <= 45 * 86400) return 86400;
+  return Math.max(2, Math.ceil(effectiveSec / (40 * 86400))) * 86400;
+}
+
+function snapBucketSecAtLeast(targetSec) {
+  for (const std of STANDARD_BUCKET_SECONDS) {
+    if (std >= targetSec) return std;
+  }
+  return Math.max(2, Math.ceil(targetSec / 86400)) * 86400;
+}
+
+function interpolateCumulativeAt(pts, targetTsMs) {
+  const n = pts.length;
+  if (n === 0) return 0;
+  if (n === 1 || targetTsMs <= pts[0].tsMs) return pts[0].value;
+  if (targetTsMs >= pts[n - 1].tsMs) return pts[n - 1].value;
+
+  let lo = 0;
+  let hi = n - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (pts[mid].tsMs <= targetTsMs) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  const t0 = pts[lo].tsMs;
+  const t1 = pts[hi].tsMs;
+  if (t1 <= t0 || targetTsMs === t0) return pts[lo].value;
+  if (targetTsMs === t1) return pts[hi].value;
+  const ratio = (targetTsMs - t0) / (t1 - t0);
+  return pts[lo].value + (pts[hi].value - pts[lo].value) * ratio;
+}
+
+function buildIntervalDeltaSeries(rawCumPoints, requestedHours = 24) {
+  if (!Array.isArray(rawCumPoints) || rawCumPoints.length < 2) {
+    return { points: [], bucketSec: 0, bucketLabel: "", totalDelta: null };
+  }
+
+  const sorted = [];
+  for (const p of rawCumPoints) {
+    const tsMs = Number(p.tsMs);
+    const val = Number(p.value);
+    if (!Number.isFinite(tsMs) || !Number.isFinite(val)) continue;
+    sorted.push({ tsMs, value: val });
+  }
+  if (sorted.length < 2) {
+    return { points: [], bucketSec: 0, bucketLabel: "", totalDelta: null };
+  }
+  sorted.sort((a, b) => a.tsMs - b.tsMs);
+
+  // Deduplicate identical timestamps, keeping latest reading
+  const pts = [];
+  for (const item of sorted) {
+    if (pts.length > 0 && pts[pts.length - 1].tsMs === item.tsMs) {
+      pts[pts.length - 1] = item;
+    } else {
+      pts.push(item);
+    }
+  }
+  if (pts.length < 2) {
+    return { points: [], bucketSec: 0, bucketLabel: "", totalDelta: null };
+  }
+
+  const tStart = pts[0].tsMs;
+  const tEnd = pts[pts.length - 1].tsMs;
+  const spanMs = tEnd - tStart;
+  const spanSec = spanMs / 1000;
+  const totalDelta = Math.round(pts[pts.length - 1].value - pts[0].value);
+  if (spanSec <= 0) {
+    return { points: [], bucketSec: 0, bucketLabel: "", totalDelta };
+  }
+
+  let bucketSec = chooseBaseBucketSec(spanSec, requestedHours);
+
+  // Respect natural sample spacing (ignoring sub-minute demo live micro-ticks)
+  const sampleGapsSec = [];
+  for (let i = 1; i < pts.length; i += 1) {
+    const gapSec = (pts[i].tsMs - pts[i - 1].tsMs) / 1000;
+    if (gapSec >= 30) {
+      sampleGapsSec.push(gapSec);
+    }
+  }
+  if (sampleGapsSec.length > 0) {
+    const medGap = medianOfNumbers(sampleGapsSec);
+    if (medGap > bucketSec * 1.15) {
+      const snappedGap = snapBucketSecAtLeast(medGap * 0.9);
+      bucketSec = Math.max(bucketSec, Math.min(snappedGap, Math.max(bucketSec, spanSec)));
+    }
+  }
+
+  // Adapt upward when cumulative series was batch-synced on a coarser cadence (e.g. 30m/60m steps)
+  const changeGapsSec = [];
+  const absJumps = [];
+  let zeroSteps = 0;
+  let lastChangeTs = pts[0].tsMs;
+  let lastChangeVal = pts[0].value;
+  for (let i = 1; i < pts.length; i += 1) {
+    const gapFromPrev = (pts[i].tsMs - pts[i - 1].tsMs) / 1000;
+    if (gapFromPrev < 30) continue;
+    const diff = pts[i].value - lastChangeVal;
+    if (diff === 0) {
+      zeroSteps += 1;
+    } else {
+      const cGap = (pts[i].tsMs - lastChangeTs) / 1000;
+      if (cGap >= 30) {
+        changeGapsSec.push(cGap);
+        absJumps.push(Math.abs(diff));
+      }
+      lastChangeTs = pts[i].tsMs;
+      lastChangeVal = pts[i].value;
+    }
+  }
+
+  if (
+    changeGapsSec.length >= 2 &&
+    zeroSteps >= changeGapsSec.length &&
+    medianOfNumbers(absJumps) >= 5
+  ) {
+    const medChangeGap = medianOfNumbers(changeGapsSec);
+    if (medChangeGap > bucketSec * 1.6) {
+      const candidate = snapBucketSecAtLeast(medChangeGap * 0.85);
+      if (candidate <= spanSec / 1.8) {
+        bucketSec = Math.max(bucketSec, candidate);
+      }
+    }
+  }
+
+  const bucketMs = bucketSec * 1000;
+  const bucketLabel = formatBucketDurationLabel(bucketSec);
+
+  if (spanMs <= bucketMs * 1.15) {
+    const actualLabel = formatBucketDurationLabel(Math.max(60, Math.round(spanSec)));
+    return {
+      points: [
+        {
+          ts: new Date(tEnd).toISOString(),
+          tsMs: tEnd,
+          value: totalDelta,
+          hudTime: formatBucketRangeHud(tStart, tEnd, actualLabel),
+        },
+      ],
+      bucketSec: Math.max(60, Math.round(spanSec)),
+      bucketLabel: actualLabel,
+      totalDelta,
+    };
+  }
+
+  const bucketCount = Math.max(2, Math.floor((spanMs + bucketMs * 0.15) / bucketMs));
+  const points = [];
+  for (let k = bucketCount; k >= 1; k -= 1) {
+    const b0 = Math.max(tStart, tEnd - k * bucketMs);
+    const b1 = tEnd - (k - 1) * bucketMs;
+    const v0 = Math.round(interpolateCumulativeAt(pts, b0));
+    const v1 = Math.round(interpolateCumulativeAt(pts, b1));
+    const delta = v1 - v0;
+    points.push({
+      ts: new Date(b1).toISOString(),
+      tsMs: b1,
+      value: delta,
+      hudTime: formatBucketRangeHud(b0, b1, bucketLabel),
+    });
+  }
+
+  return { points, bucketSec, bucketLabel, totalDelta };
+}
+
+function buildModalSeriesFromHistory(history, hours = state.modalHours) {
   const onlinePoints = [];
   const playPoints = [];
+  const likePoints = [];
   for (const h of history || []) {
+    const tsMs = parseModalPointMs(h.collected_at, h.collected_at_ts);
     onlinePoints.push({
       ts: h.collected_at,
+      tsMs,
       time: h.collected_at,
       value: Number(h.online_count || 0),
       raw: h.online_raw,
@@ -2508,19 +2761,45 @@ function buildModalSeriesFromHistory(history) {
     if (h.play_count !== null && h.play_count !== undefined && Number.isFinite(Number(h.play_count))) {
       playPoints.push({
         ts: h.collected_at,
+        tsMs,
         time: h.collected_at,
         value: Number(h.play_count),
       });
     }
+    if (h.like_count !== null && h.like_count !== undefined && Number.isFinite(Number(h.like_count))) {
+      likePoints.push({
+        ts: h.collected_at,
+        tsMs,
+        time: h.collected_at,
+        value: Number(h.like_count),
+      });
+    }
   }
-  return { onlinePoints, playPoints };
+
+  const playDeltaSeries = buildIntervalDeltaSeries(playPoints, hours);
+  const likeDeltaSeries = buildIntervalDeltaSeries(likePoints, hours);
+
+  return {
+    onlinePoints,
+    playPoints,
+    likePoints,
+    playDeltaPoints: playDeltaSeries.points,
+    playDeltaBucketLabel: playDeltaSeries.bucketLabel,
+    likeDeltaPoints: likeDeltaSeries.points,
+    likeDeltaBucketLabel: likeDeltaSeries.bucketLabel,
+  };
 }
 
 function renderModalCharts(series, animate = true) {
   const onlineEl = document.getElementById("modalVideoChart");
   const playEl = document.getElementById("modalVideoPlayChart");
+  const playDeltaEl = document.getElementById("modalVideoPlayDeltaChart");
+  const likeDeltaEl = document.getElementById("modalVideoLikeDeltaChart");
   const onlinePoints = series?.onlinePoints || [];
   const playPoints = series?.playPoints || [];
+  const likePoints = series?.likePoints || [];
+  const playDeltaPoints = series?.playDeltaPoints || [];
+  const likeDeltaPoints = series?.likeDeltaPoints || [];
 
   if (onlineEl) {
     renderTelemetryChart(onlineEl, onlinePoints, {
@@ -2545,6 +2824,53 @@ function renderModalCharts(series, animate = true) {
       emptyText: "该时间窗口暂无播放量采样点",
     });
   }
+
+  if (playDeltaEl) {
+    renderTelemetryChart(playDeltaEl, playDeltaPoints, {
+      channelColor: "var(--sig-emerald)",
+      fillId: "modal-video-play-delta",
+      label: series?.playDeltaBucketLabel
+        ? `播放增量 (${series.playDeltaBucketLabel})`
+        : "播放增量",
+      formatValue: (v) => fmtSignedDelta(v),
+      animate,
+      syncGroup: "video-modal",
+      emptyText:
+        playPoints.length === 1
+          ? "需至少 2 个采样点以计算播放区间增量"
+          : "该时间窗口暂无播放增量数据",
+    });
+  }
+
+  if (likeDeltaEl) {
+    renderTelemetryChart(likeDeltaEl, likeDeltaPoints, {
+      channelColor: "var(--sig-violet)",
+      fillId: "modal-video-like-delta",
+      label: series?.likeDeltaBucketLabel
+        ? `点赞增量 (${series.likeDeltaBucketLabel})`
+        : "点赞增量",
+      formatValue: (v) => fmtSignedDelta(v),
+      animate,
+      syncGroup: "video-modal",
+      emptyText:
+        likePoints.length === 1
+          ? "已记录首笔基准，下次采样后生成点赞增量曲线"
+          : "等待至少 2 次点赞采样后生成增量曲线",
+    });
+  }
+}
+
+function applySignedModalDeltaReadout(el, deltaVal) {
+  if (!el) return;
+  if (Number.isFinite(deltaVal)) {
+    const rounded = Math.round(deltaVal);
+    el.textContent = fmtSignedDelta(rounded);
+    el.classList.toggle("is-up", rounded > 0);
+    el.classList.toggle("is-down", rounded < 0);
+  } else {
+    el.textContent = "--";
+    el.classList.remove("is-up", "is-down");
+  }
 }
 
 function updateModalStatsFromVideoAndPoints(bvid, series) {
@@ -2553,11 +2879,20 @@ function updateModalStatsFromVideoAndPoints(bvid, series) {
   const peakEl = document.getElementById("modalPeakOnline");
   const playEl = document.getElementById("modalPlayCount");
   const playDeltaEl = document.getElementById("modalPlayDelta");
+  const likeEl = document.getElementById("modalLikeCount");
+  const likeDeltaEl = document.getElementById("modalLikeDelta");
   const onlineChipEl = document.getElementById("modalOnlineChip");
   const playChipEl = document.getElementById("modalPlayChip");
+  const playDeltaChipEl = document.getElementById("modalPlayDeltaChip");
+  const likeDeltaChipEl = document.getElementById("modalLikeDeltaChip");
+  const playDeltaKickerEl = document.getElementById("modalPlayDeltaKicker");
+  const likeDeltaKickerEl = document.getElementById("modalLikeDeltaKicker");
 
   const onlinePoints = series?.onlinePoints || [];
   const playPoints = series?.playPoints || [];
+  const likePoints = series?.likePoints || [];
+  const playDeltaPoints = series?.playDeltaPoints || [];
+  const likeDeltaPoints = series?.likeDeltaPoints || [];
 
   const vals = onlinePoints.map((p) => Number(p.value)).filter((n) => Number.isFinite(n));
   const latestPtVal = vals.length > 0 ? vals[vals.length - 1] : null;
@@ -2579,6 +2914,19 @@ function updateModalStatsFromVideoAndPoints(bvid, series) {
       ? Number(playPoints[playPoints.length - 1].value) - Number(playPoints[0].value)
       : null;
 
+  const hasVideoLikeStat =
+    Boolean(video?.stats_synced_at) || Number(video?.like_count || 0) > 0;
+  const latestLikeVal = hasVideoLikeStat
+    ? Number(video.like_count)
+    : likePoints.length > 0
+      ? Number(likePoints[likePoints.length - 1].value)
+      : null;
+
+  const likeDelta =
+    likePoints.length >= 2
+      ? Number(likePoints[likePoints.length - 1].value) - Number(likePoints[0].value)
+      : null;
+
   if (currentEl) {
     currentEl.textContent = Number.isFinite(currentOnline) ? `${fmtNumber(currentOnline)} 人` : "--";
   }
@@ -2588,26 +2936,72 @@ function updateModalStatsFromVideoAndPoints(bvid, series) {
   if (playEl) {
     playEl.textContent = Number.isFinite(latestPlayVal) ? fmtNumber(latestPlayVal) : "--";
   }
-  if (playDeltaEl) {
-    if (Number.isFinite(playDelta)) {
-      playDeltaEl.textContent = `${playDelta >= 0 ? "+" : ""}${fmtNumber(playDelta)}`;
-      playDeltaEl.classList.toggle("is-up", playDelta > 0);
-    } else {
-      playDeltaEl.textContent = "--";
-      playDeltaEl.classList.remove("is-up");
-    }
+  applySignedModalDeltaReadout(playDeltaEl, playDelta);
+
+  if (likeEl) {
+    likeEl.textContent = Number.isFinite(latestLikeVal) ? fmtNumber(latestLikeVal) : "--";
   }
+  applySignedModalDeltaReadout(likeDeltaEl, likeDelta);
+
   if (onlineChipEl) {
     onlineChipEl.textContent = Number.isFinite(currentOnline) ? `${fmtNumber(currentOnline)} 人` : "--";
   }
   if (playChipEl) {
     playChipEl.textContent = Number.isFinite(latestPlayVal) ? fmtNumber(latestPlayVal) : "--";
   }
+
+  const playBucketLabel = series?.playDeltaBucketLabel || "";
+  if (playDeltaKickerEl) {
+    playDeltaKickerEl.textContent = playBucketLabel
+      ? `分时增量 · 每 ${playBucketLabel}`
+      : "分时增量";
+  }
+  if (playDeltaChipEl) {
+    if (playDeltaPoints.length > 0) {
+      const latestBucketPlay = playDeltaPoints[playDeltaPoints.length - 1].value;
+      playDeltaChipEl.textContent = playBucketLabel
+        ? `${fmtSignedDelta(latestBucketPlay)} / ${playBucketLabel}`
+        : fmtSignedDelta(latestBucketPlay);
+    } else {
+      playDeltaChipEl.textContent = "--";
+    }
+  }
+
+  const likeBucketLabel = series?.likeDeltaBucketLabel || "";
+  if (likeDeltaKickerEl) {
+    likeDeltaKickerEl.textContent = likeBucketLabel
+      ? `分时增量 · 每 ${likeBucketLabel}`
+      : "分时增量";
+  }
+  if (likeDeltaChipEl) {
+    if (likeDeltaPoints.length > 0) {
+      const latestBucketLike = likeDeltaPoints[likeDeltaPoints.length - 1].value;
+      likeDeltaChipEl.textContent = likeBucketLabel
+        ? `${fmtSignedDelta(latestBucketLike)} / ${likeBucketLabel}`
+        : fmtSignedDelta(latestBucketLike);
+    } else {
+      likeDeltaChipEl.textContent = "--";
+    }
+  }
+}
+
+function setModalChartsPlaceholder(message) {
+  for (const id of [
+    "modalVideoChart",
+    "modalVideoPlayChart",
+    "modalVideoPlayDeltaChart",
+    "modalVideoLikeDeltaChart",
+  ]) {
+    const el = document.getElementById(id);
+    if (el) {
+      el.innerHTML = `<div class="chart-empty mono">${escapeHtml(message)}</div>`;
+    }
+  }
 }
 
 function refreshOpenDemoModal(bvid) {
   const history = getDemoVideoHistory(state, bvid, { hours: state.modalHours });
-  const series = buildModalSeriesFromHistory(history);
+  const series = buildModalSeriesFromHistory(history, state.modalHours);
   state.modalPoints = series;
   updateModalStatsFromVideoAndPoints(bvid, series);
   renderModalCharts(series, false);
@@ -2624,7 +3018,7 @@ async function loadVideoModalSeries(bvid, hours, { animate = true } = {}) {
   if (state.demoMode) {
     const history = getDemoVideoHistory(state, bvid, { hours: targetHours });
     if (state.modalBvid !== bvid || reqId !== state.modalReqSeq) return;
-    const series = buildModalSeriesFromHistory(history);
+    const series = buildModalSeriesFromHistory(history, targetHours);
     state.modalPoints = series;
     updateModalStatsFromVideoAndPoints(bvid, series);
     requestAnimationFrame(() => {
@@ -2637,15 +3031,14 @@ async function loadVideoModalSeries(bvid, hours, { animate = true } = {}) {
 
   clearChartsInGroup("video-modal");
   updateModalStatsFromVideoAndPoints(bvid, null);
-  chartEl.innerHTML = `<div class="chart-empty mono">正在拉取在线人数采样序列...</div>`;
-  playChartEl.innerHTML = `<div class="chart-empty mono">正在拉取播放量采样序列...</div>`;
+  setModalChartsPlaceholder("正在拉取视频趋势与区间增量采样序列...");
 
   try {
     const res = await apiFetch(
       `/api/videos/${encodeURIComponent(bvid)}/history?hours=${encodeURIComponent(targetHours)}`
     );
     if (state.modalBvid !== bvid || reqId !== state.modalReqSeq) return;
-    const series = buildModalSeriesFromHistory(res.history || []);
+    const series = buildModalSeriesFromHistory(res.history || [], targetHours);
     state.modalPoints = series;
     updateModalStatsFromVideoAndPoints(bvid, series);
     requestAnimationFrame(() => {
@@ -2655,8 +3048,7 @@ async function loadVideoModalSeries(bvid, hours, { animate = true } = {}) {
     });
   } catch (err) {
     if (state.modalBvid !== bvid || reqId !== state.modalReqSeq) return;
-    chartEl.innerHTML = `<div class="chart-empty mono">波形拉取失败: ${escapeHtml(err.message)}</div>`;
-    playChartEl.innerHTML = `<div class="chart-empty mono">波形拉取失败: ${escapeHtml(err.message)}</div>`;
+    setModalChartsPlaceholder(`波形拉取失败: ${err.message}`);
   }
 }
 
@@ -2696,8 +3088,7 @@ async function openVideoModal(bvid, fallbackTitle = "") {
 
   clearChartsInGroup("video-modal");
   updateModalStatsFromVideoAndPoints(bvid, null);
-  chartEl.innerHTML = `<div class="chart-empty mono">正在拉取在线人数采样序列...</div>`;
-  playChartEl.innerHTML = `<div class="chart-empty mono">正在拉取播放量采样序列...</div>`;
+  setModalChartsPlaceholder("正在拉取视频趋势与区间增量采样序列...");
 
   if (!modal.open) {
     if (typeof modal.showModal === "function") {

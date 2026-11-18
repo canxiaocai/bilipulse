@@ -3356,3 +3356,167 @@ def test_incremental_first_page_sync_vs_full_pagination_on_delete(tmp_path: Path
             remaining_bvids = {v["bvid"] for v in db.get_videos(uid)}
             assert len(remaining_bvids) == 99
             assert "BV_old_000" not in remaining_bvids
+
+
+def test_video_history_like_count_snapshots_active_ttl_and_modal_markup(tmp_path: Path):
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+    from app.bilibili.collectors import STATS_ACTIVE_TTL_SEC, select_stats_refresh_bvids
+
+    # 1) Legacy DB without like_count on video_online_snapshots migrates cleanly with NULL for old rows
+    db_path = tmp_path / "like_hist.db"
+    with sqlite3.connect(db_path) as raw_conn:
+        raw_conn.executescript(
+            """
+            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+            INSERT INTO settings VALUES ('online_count_rule', 'minus_1_per_cid_v1', '2026-01-01T00:00:00+08:00');
+            CREATE TABLE account_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uid TEXT NOT NULL,
+                collected_at TEXT NOT NULL,
+                collected_at_ts INTEGER NOT NULL,
+                follower_count INTEGER,
+                following_count INTEGER,
+                online_viewers_total INTEGER,
+                video_count INTEGER NOT NULL DEFAULT 0,
+                videos_succeeded INTEGER NOT NULL DEFAULT 0,
+                extra_metrics TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'success',
+                error_message TEXT,
+                duration_ms INTEGER
+            );
+            CREATE TABLE videos (
+                bvid TEXT PRIMARY KEY,
+                uid TEXT NOT NULL,
+                aid INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                pic TEXT NOT NULL DEFAULT '',
+                pubdate INTEGER NOT NULL DEFAULT 0,
+                duration INTEGER NOT NULL DEFAULT 0,
+                play_count INTEGER NOT NULL DEFAULT 0,
+                like_count INTEGER NOT NULL DEFAULT 0,
+                coin_count INTEGER NOT NULL DEFAULT 0,
+                stats_synced_at TEXT,
+                cids_json TEXT NOT NULL DEFAULT '[]',
+                last_online_count INTEGER NOT NULL DEFAULT 0,
+                last_online_raw TEXT NOT NULL DEFAULT '',
+                last_checked_at TEXT,
+                hot_until_ts INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE video_online_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_id INTEGER NOT NULL REFERENCES account_snapshots(id) ON DELETE CASCADE,
+                bvid TEXT NOT NULL,
+                online_count INTEGER NOT NULL,
+                online_raw TEXT NOT NULL DEFAULT '',
+                play_count INTEGER
+            );
+            INSERT INTO account_snapshots (id, uid, collected_at, collected_at_ts, status)
+            VALUES (1, '777', '2026-01-01T00:00:00+08:00', 1767196800, 'success');
+            INSERT INTO video_online_snapshots (snapshot_id, bvid, online_count, online_raw, play_count)
+            VALUES (1, 'BV_hist', 10, '11', 500);
+            """
+        )
+
+    db = Database(db_path=db_path)
+    db.update_settings({"uid": "777"})
+    # Unsynced video has stats_synced_at=None -> fallback like_count must stay None (no fake 0 baseline)
+    db.upsert_videos("777", [{"bvid": "BV_unsynced", "aid": 2, "title": "Unsynced", "play_count": 300}])
+    # Synced video with 0 likes has stats_synced_at set -> fallback like_count must record 0
+    db.upsert_videos(
+        "777",
+        [{"bvid": "BV_zero_like", "aid": 3, "title": "Zero Like", "play_count": 50, "like_count": 0}],
+    )
+
+    now = datetime.now(timezone.utc).astimezone()
+    db.insert_snapshot(
+        uid="777",
+        follower_count=100,
+        following_count=1,
+        online_viewers_total=15,
+        video_count=3,
+        videos_succeeded=3,
+        extra_metrics={},
+        status="success",
+        error_message=None,
+        duration_ms=40,
+        video_online_items=[
+            {"bvid": "BV_hist", "online_count": 12, "online_raw": "13", "play_count": 620, "like_count": 48},
+            {"bvid": "BV_unsynced", "online_count": 2, "online_raw": "3"},
+            {"bvid": "BV_zero_like", "online_count": 1, "online_raw": "2"},
+        ],
+        collected_at=now - timedelta(minutes=5),
+    )
+    db.insert_snapshot(
+        uid="777",
+        follower_count=102,
+        following_count=1,
+        online_viewers_total=18,
+        video_count=3,
+        videos_succeeded=3,
+        extra_metrics={},
+        status="success",
+        error_message=None,
+        duration_ms=42,
+        video_online_items=[
+            {"bvid": "BV_hist", "online_count": 15, "online_raw": "16", "play_count": 780, "like_count": 65},
+        ],
+        collected_at=now,
+    )
+
+    hist_rows = db.get_video_history("BV_hist", limit=10)
+    assert len(hist_rows) == 3
+    assert hist_rows[0]["play_count"] == 500 and hist_rows[0]["like_count"] is None
+    assert hist_rows[1]["play_count"] == 620 and hist_rows[1]["like_count"] == 48
+    assert hist_rows[2]["play_count"] == 780 and hist_rows[2]["like_count"] == 65
+
+    assert db.get_video_history("BV_unsynced", limit=10)[0]["like_count"] is None
+    assert db.get_video_history("BV_zero_like", limit=10)[0]["like_count"] == 0
+
+    # 2) Active videos refresh stats after STATS_ACTIVE_TTL_SEC (~4 min) while idle showcase waits STATS_HOT_TTL_SEC
+    now_ts = now.timestamp()
+    five_min_ago_iso = (now - timedelta(seconds=STATS_ACTIVE_TTL_SEC + 30)).isoformat()
+    sample_videos = [
+        {
+            "bvid": "BV_idle_showcase",
+            "pubdate": int(now_ts - 30 * 86400),
+            "play_count": 90000,
+            "last_online_count": 0,
+            "hot_until_ts": 0,
+            "stats_synced_at": five_min_ago_iso,
+        },
+        {
+            "bvid": "BV_live_active",
+            "pubdate": int(now_ts - 10 * 86400),
+            "play_count": 5000,
+            "last_online_count": 12,
+            "hot_until_ts": int(now_ts + 600),
+            "stats_synced_at": five_min_ago_iso,
+        },
+        {
+            "bvid": "BV_recent_pub",
+            "pubdate": int(now_ts - 3600),
+            "play_count": 800,
+            "last_online_count": 0,
+            "hot_until_ts": 0,
+            "stats_synced_at": five_min_ago_iso,
+        },
+    ]
+    refreshed = select_stats_refresh_bvids(
+        sample_videos, {"BV_idle_showcase", "BV_live_active", "BV_recent_pub"}, now_ts, quota=10
+    )
+    assert refreshed == ["BV_live_active", "BV_recent_pub"]
+
+    # 3) API & HTML markup expose like_count and dual interval-delta modal charts
+    app = create_app(database=db, enable_scheduler=False)
+    with TestClient(app) as client:
+        api_hist = client.get("/api/videos/BV_hist/history?hours=24").json()["history"]
+        assert len(api_hist) == 2
+        assert [pt["like_count"] for pt in api_hist] == [48, 65]
+
+        html = client.get("/").text
+        assert 'id="modalVideoPlayDeltaChart"' in html
+        assert 'id="modalVideoLikeDeltaChart"' in html
+        assert 'id="modalLikeCount"' in html
+        assert 'id="modalLikeDelta"' in html
