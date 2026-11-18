@@ -1,0 +1,23 @@
+services:
+  bili-monitor:
+    build: .
+    container_name: bili-monitor
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # 注意：容器以非 root 用户 appuser 运行；Linux 宿主机请确保 ./data 目录对容器内 appuser 可写
+      - ./data:/app/data
+    environment:
+      - TZ=Asia/Shanghai
+      - BILI_PORT=8000
+      # 可选：设置管理员密码（保护添加监控账号与后台设置操作；留空则可在网页端按需开启）
+      # - BILI_ADMIN_PASSWORD=your_strong_password
+      # - BILI_ADMIN_SESSION_HOURS=12
+      # 可选：首次启动默认监控的 B站 UID，后续可在网页后台设置中随时修改
+      # - BILI_DEFAULT_UID=100001001
+      # - BILI_DEFAULT_INTERVAL=5
+      # 可选：历史快照保留天数（默认 90 天，设为 0 则永久保留）
+      # - BILI_SNAPSHOT_RETENTION_DAYS=90
+      # 可选：部署在受信任反向代理后时设为 true，以信任 X-Forwarded-For / X-Forwarded-Proto
+      # - BILI_TRUST_PROXY=false

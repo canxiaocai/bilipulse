@@ -1,0 +1,705 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="dark light" />
+  <script>
+    try {
+      const savedTheme = localStorage.getItem("bilipulse_theme");
+      if (savedTheme === "light" || savedTheme === "dark") {
+        document.documentElement.dataset.theme = savedTheme;
+      }
+    } catch {}
+  </script>
+  <title>B站账号实时监控</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 28 28' fill='none'%3E%3Crect width='28' height='28' fill='%2307090E'/%3E%3Crect x='2.5' y='4.5' width='23' height='19' stroke='%2300E5FF' stroke-width='2'/%3E%3Cpolyline points='5.5,16 9,16 11.2,10.5 14,20 16.8,13 19,16 22.5,16' stroke='%23FF2A7A' stroke-width='2.2' stroke-linecap='square' stroke-linejoin='miter'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/static/tokens-layout.css?v=20261118x" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261118x" />
+</head>
+<body>
+  <!-- Top 3px Scheduled Crawl Laser Strip -->
+  <div class="crawl-laser-bar" id="crawlLaserBar" aria-hidden="true">
+    <div class="crawl-laser-fill" id="crawlLaserFill"></div>
+  </div>
+
+  <div class="studio-shell" id="studioShell">
+    <!-- Left Multi-Account Command Sidebar -->
+    <aside class="command-rail account-sidebar" id="accountSidebar" aria-label="监控账号列表">
+      <div class="rail-brand account-rail-head">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter">
+            <rect x="2" y="4" width="20" height="16" />
+            <polyline points="5 13 8.5 13 10.5 8.5 13.5 16.5 15.5 11.5 17.5 13 19 13" stroke="var(--sig-pink)" />
+          </svg>
+        </div>
+        <div class="brand-copy">
+          <span class="brand-title">监控频道</span>
+          <span class="brand-sub mono">SIGNAL CHANNELS</span>
+        </div>
+        <span class="nav-count mono" id="sidebarAccountCount" title="已监控账号数量">0</span>
+        <button type="button" class="btn btn-ghost btn-sm sidebar-close-btn" id="btnCloseSidebar" aria-label="收起账号列表">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square">
+            <line x1="18" y1="6" x2="6" y2="18" />
+            <line x1="6" y1="6" x2="18" y2="18" />
+          </svg>
+        </button>
+      </div>
+
+      <div class="rail-toolbar">
+        <button type="button" class="btn btn-chamfer btn-primary rail-add-btn" id="btnAddAccount">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="square" aria-hidden="true">
+            <line x1="12" y1="5" x2="12" y2="19" />
+            <line x1="5" y1="12" x2="19" y2="12" />
+          </svg>
+          <span>添加监控账号</span>
+        </button>
+
+        <button type="button" class="btn btn-chamfer btn-secondary btn-sm rail-settings-btn" id="btnOpenSettings">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true">
+            <circle cx="12" cy="12" r="3" />
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.08a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.08a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
+          </svg>
+          <span>设置</span>
+        </button>
+
+        <button type="button" class="btn btn-ghost btn-sm rail-live-btn hidden" id="btnLivePulse" title="暂停或恢复示例实时脉冲流">
+          <span class="live-dot" aria-hidden="true"></span>
+          <span>实时脉冲</span>
+        </button>
+      </div>
+
+      <section class="rail-section rail-range-section" aria-label="采样时间窗口">
+        <div class="rail-section-head">
+          <span class="rail-section-label mono">采样窗口</span>
+          <span class="rail-section-kicker mono">HORIZON</span>
+        </div>
+        <div class="range-bar rail-range-grid" id="rangeGroup" role="group" aria-label="采样时间窗口">
+          <span class="range-active-bar" id="rangeActiveBar" aria-hidden="true"></span>
+          <button type="button" class="range-btn mono" data-hours="1">1小时</button>
+          <button type="button" class="range-btn mono" data-hours="6">6小时</button>
+          <button type="button" class="range-btn mono active" data-hours="24">24小时</button>
+          <button type="button" class="range-btn mono" data-hours="168">7天</button>
+          <button type="button" class="range-btn mono" data-hours="720">30天</button>
+          <button type="button" class="range-btn mono" data-hours="0">全部</button>
+        </div>
+      </section>
+
+      <section class="rail-section rail-view-section" aria-label="看板视图">
+        <div class="rail-section-head">
+          <span class="rail-section-label mono">看板视图</span>
+          <span class="rail-section-kicker mono">VIEW</span>
+        </div>
+        <div class="view-tablist rail-view-tablist" id="viewTabList" role="tablist" aria-label="看板视图切换">
+          <button
+            type="button"
+            role="tab"
+            class="view-tab mono"
+            id="tabBtnOverview"
+            aria-selected="true"
+            tabindex="0"
+            data-tab-target="tab-overview"
+          >
+            <span class="view-tab-idx">01</span>
+            <span class="view-tab-label">单账号</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            class="view-tab mono"
+            id="tabBtnCompare"
+            aria-selected="false"
+            tabindex="-1"
+            data-tab-target="tab-compare"
+          >
+            <span class="view-tab-idx">02</span>
+            <span class="view-tab-label">全账号</span>
+            <span class="view-tab-count" id="compareTabCount">0</span>
+          </button>
+        </div>
+      </section>
+
+      <div class="rail-section-head rail-accounts-head">
+        <span class="rail-section-label mono">监控列表</span>
+        <span class="rail-section-kicker mono">ACCOUNTS</span>
+      </div>
+
+      <nav class="rail-nav account-rail-nav" id="accountRailList" aria-label="切换监控账号">
+        <div class="account-rail-empty mono">暂无监控账号</div>
+      </nav>
+
+      <div class="rail-footer">
+        <button type="button" class="btn-rail-theme btn-rail-lock hidden" id="btnSidebarLockAdmin" title="管理会话安全状态">
+          <span class="rail-status-wrap">
+            <span class="theme-icon-pair" aria-hidden="true">
+              <svg id="sidebarLockIconLocked" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square">
+                <rect x="4" y="11" width="16" height="10" />
+                <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+              </svg>
+              <svg id="sidebarLockIconUnlocked" class="hidden" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square">
+                <rect x="4" y="11" width="16" height="10" />
+                <path d="M8 11V7a4 4 0 0 1 7.6-1.7" />
+              </svg>
+            </span>
+            <span>管理权限</span>
+          </span>
+          <span class="mono" id="sidebarLockLabel">需验证</span>
+        </button>
+
+        <button type="button" class="btn-rail-theme" id="btnThemeToggle" aria-label="切换明暗主题" aria-pressed="true" title="切换明暗主题">
+          <span class="rail-status-wrap">
+            <span class="theme-icon-pair" aria-hidden="true">
+              <svg id="themeIconSun" class="hidden" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square">
+                <circle cx="12" cy="12" r="4" />
+                <path d="M12 2v3M12 19v3M4.93 4.93l2.12 2.12M16.95 16.95l2.12 2.12M2 12h3M19 12h3M4.93 19.07l2.12-2.12M16.95 7.05l2.12-2.12" />
+              </svg>
+              <svg id="themeIconMoon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square">
+                <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z" />
+              </svg>
+            </span>
+            <span>界面主题</span>
+          </span>
+          <span class="mono" id="themeLabel">暗夜</span>
+        </button>
+      </div>
+    </aside>
+
+    <div class="sidebar-scrim" id="sidebarScrim" aria-hidden="true"></div>
+
+    <div class="studio-stage" id="studioStage">
+      <header class="signal-topbar">
+        <div class="topbar-identity">
+          <button type="button" class="btn btn-ghost btn-sm sidebar-open-btn" id="btnOpenSidebar" aria-label="打开监控账号列表" aria-controls="accountSidebar" aria-expanded="false">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true">
+              <line x1="3" y1="6" x2="21" y2="6" />
+              <line x1="3" y1="12" x2="21" y2="12" />
+              <line x1="3" y1="18" x2="21" y2="18" />
+            </svg>
+            <span>控制面板</span>
+          </button>
+
+          <div class="account-strip" id="accountPill">
+            <span class="muted mono">尚未绑定监控账号</span>
+          </div>
+        </div>
+      </header>
+
+      <!-- Onboarding Strip when UID is Unbound -->
+      <section class="signal-banner setup-strip hidden" id="setupBanner" aria-label="初始化配置指引">
+        <div class="banner-body">
+          <span class="status-chip mono">未绑定账号</span>
+          <span>当前尚未绑定真实 B站账号编号。点击右上角「设置」完成配置即可开启定时采集，或加载本地示例数据体验监控面板。</span>
+        </div>
+        <div class="banner-actions">
+          <button type="button" class="btn btn-ghost" id="btnLoadDemo">加载示例数据</button>
+          <button type="button" class="btn btn-chamfer btn-primary" id="btnGoSettings">前往配置 →</button>
+        </div>
+      </section>
+
+      <!-- Active Demo Stream Strip -->
+      <section class="signal-banner demo-strip hidden" id="demoBanner" aria-label="示例数据流状态">
+        <div class="banner-body">
+          <span class="demo-badge mono">示例模式</span>
+          <span id="demoPulseStatus">本地示例数据流运行中 · 实时微采样脉冲激活（不写入数据库）</span>
+        </div>
+        <div class="banner-actions">
+          <button type="button" class="btn btn-ghost" id="btnExitDemo">退出示例预览</button>
+        </div>
+      </section>
+
+      <main class="stage-panels">
+        <!-- Main Telemetry Overview -->
+        <section class="tab-panel active" id="tab-overview" role="tabpanel" aria-labelledby="tabBtnOverview">
+          <!-- Unified Dual-Channel Cards (Total + Curve) -->
+          <div class="oscilloscope-grid" role="region" aria-label="核心实时遥测指标">
+            <article class="scope-cell scope-pink" data-stagger>
+              <span class="fiducial fiducial-tl" aria-hidden="true"></span>
+              <span class="fiducial fiducial-tr" aria-hidden="true"></span>
+              <div class="scope-head scope-head-unified scope-head-followers">
+                <div class="scope-kpi-main">
+                  <span class="metric-label">当前粉丝总量</span>
+                  <div class="metric-value mono" id="kpiFollowers">--</div>
+                </div>
+                <div class="follower-daily-panel" id="followerDailyPanel" aria-label="北京时间自然日粉丝量变化">
+                  <div class="follower-daily-grid">
+                    <div class="follower-daily-cell">
+                      <div class="follower-daily-head">
+                        <span class="follower-daily-label">昨日变化</span>
+                        <span class="follower-daily-date mono" id="kpiFollowersYesterdayDate">--</span>
+                      </div>
+                      <div class="follower-daily-value mono is-empty" id="kpiFollowersYesterday">--</div>
+                    </div>
+                    <div class="follower-daily-cell">
+                      <div class="follower-daily-head">
+                        <span class="follower-daily-label">今日变化</span>
+                        <span class="follower-daily-date mono" id="kpiFollowersTodayDate">--</span>
+                      </div>
+                      <div class="follower-daily-value mono is-empty" id="kpiFollowersToday">--</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="scope-plot" id="chartFollowers"></div>
+            </article>
+
+            <article class="scope-cell scope-cyan" data-stagger>
+              <span class="fiducial fiducial-tl" aria-hidden="true"></span>
+              <span class="fiducial fiducial-tr" aria-hidden="true"></span>
+              <div class="scope-head scope-head-unified">
+                <span class="metric-label">全视频实时在看总和</span>
+                <div class="metric-value mono" id="kpiOnline">--</div>
+              </div>
+              <div class="scope-plot" id="chartOnline"></div>
+            </article>
+          </div>
+
+          <!-- Split Dual Leaderboards: Online Viewers (Left) & Total Plays (Right) -->
+          <section class="leaderboard-section" aria-label="视频排行榜">
+            <div class="dual-leaderboard-grid">
+              <div class="leaderboard-pane leaderboard-online">
+                <header class="leaderboard-pane-head">
+                  <h2 class="section-heading">实时在线榜</h2>
+                  <span class="status-chip mono" id="onlineBoardCount">0 个视频</span>
+                </header>
+                <div class="leaderboard-list" id="onlineVideosGrid">
+                  <div class="chart-empty mono">暂无视频采样数据</div>
+                </div>
+                <div class="leaderboard-expand hidden" id="onlineBoardExpandWrap">
+                  <button type="button" class="btn btn-ghost btn-sm mono" id="btnExpandOnline">展开更多 (+50)</button>
+                </div>
+              </div>
+
+              <div class="leaderboard-pane leaderboard-plays">
+                <header class="leaderboard-pane-head">
+                  <h2 class="section-heading">总播放榜</h2>
+                  <span class="status-chip mono" id="playsBoardCount">0 个视频</span>
+                </header>
+                <div class="leaderboard-list" id="playsVideosGrid">
+                  <div class="chart-empty mono">暂无视频采样数据</div>
+                </div>
+                <div class="leaderboard-expand hidden" id="playsBoardExpandWrap">
+                  <button type="button" class="btn btn-ghost btn-sm mono" id="btnExpandPlays">展开更多 (+50)</button>
+                </div>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <!-- Multi-Account Horizontal Progress Comparison Board -->
+        <section class="tab-panel" id="tab-compare" role="tabpanel" aria-labelledby="tabBtnCompare" hidden="until-found">
+          <div class="compare-board-shell">
+            <div class="compare-summary-bar">
+              <div class="compare-summary-metrics">
+                <div class="compare-kpi">
+                  <span class="compare-kpi-label mono">监控账号</span>
+                  <strong class="compare-kpi-val mono" id="compareTotalAccounts">0 个</strong>
+                </div>
+                <div class="compare-kpi compare-kpi-pink">
+                  <span class="compare-kpi-label mono">粉丝量总计</span>
+                  <strong class="compare-kpi-val mono" id="compareTotalFollowers">--</strong>
+                </div>
+                <div class="compare-kpi compare-kpi-cyan">
+                  <span class="compare-kpi-label mono">实时在线总计</span>
+                  <strong class="compare-kpi-val mono" id="compareTotalOnline">--</strong>
+                </div>
+              </div>
+
+              <div class="compare-sort-group" id="compareSortGroup" role="group" aria-label="全账号看板排序方式">
+                <button type="button" class="compare-sort-btn mono active" data-sort="metric" aria-pressed="true">按数值排行</button>
+                <button type="button" class="compare-sort-btn mono" data-sort="order" aria-pressed="false">按列表顺序</button>
+              </div>
+            </div>
+
+            <div class="compare-boards-grid">
+              <article class="compare-pane compare-followers" aria-label="全账号粉丝量横条看板">
+                <span class="fiducial fiducial-tl" aria-hidden="true"></span>
+                <span class="fiducial fiducial-tr" aria-hidden="true"></span>
+                <header class="compare-pane-head">
+                  <div class="compare-pane-title-wrap">
+                    <span class="scope-kicker mono">FOLLOWER TELEMETRY</span>
+                    <h2 class="section-heading">粉丝量对比看板</h2>
+                  </div>
+                  <span class="status-chip mono" id="compareFollowersPeakChip">最高 --</span>
+                </header>
+                <div class="compare-axis-bar" id="compareFollowersAxis" aria-hidden="true">
+                  <span class="compare-axis-lead mono">账号</span>
+                  <div class="compare-axis-ticks mono">
+                    <span>0</span>
+                    <span>25%</span>
+                    <span>50%</span>
+                    <span>75%</span>
+                    <span>100%</span>
+                  </div>
+                </div>
+                <ul class="compare-bar-list" id="compareFollowersList" aria-label="各账号粉丝量水平进度条">
+                  <li class="chart-empty mono">暂无监控账号数据</li>
+                </ul>
+              </article>
+
+              <article class="compare-pane compare-online" aria-label="全账号实时在线横条看板">
+                <span class="fiducial fiducial-tl" aria-hidden="true"></span>
+                <span class="fiducial fiducial-tr" aria-hidden="true"></span>
+                <header class="compare-pane-head">
+                  <div class="compare-pane-title-wrap">
+                    <span class="scope-kicker mono">LIVE VIEWERS TELEMETRY</span>
+                    <h2 class="section-heading">实时在线对比看板</h2>
+                  </div>
+                  <span class="status-chip mono" id="compareOnlinePeakChip">最高 --</span>
+                </header>
+                <div class="compare-axis-bar" id="compareOnlineAxis" aria-hidden="true">
+                  <span class="compare-axis-lead mono">账号</span>
+                  <div class="compare-axis-ticks mono">
+                    <span>0</span>
+                    <span>25%</span>
+                    <span>50%</span>
+                    <span>75%</span>
+                    <span>100%</span>
+                  </div>
+                </div>
+                <ul class="compare-bar-list" id="compareOnlineList" aria-label="各账号实时在线水平进度条">
+                  <li class="chart-empty mono">暂无监控账号数据</li>
+                </ul>
+              </article>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <!-- Native Centered Dual-Channel Video Telemetry Modal -->
+  <dialog class="telemetry-modal" id="videoModal" closedby="any" aria-labelledby="modalVideoTitle">
+    <div class="modal-shell">
+      <header class="modal-header">
+        <div class="modal-identity">
+          <div class="modal-cover-frame hidden" id="modalCoverWrap">
+            <img id="modalVideoCover" referrerpolicy="no-referrer" alt="" />
+          </div>
+          <div class="modal-title-group">
+            <span class="section-kicker mono">视频双通道趋势</span>
+            <h2 class="modal-title" id="modalVideoTitle">视频实时双通道波形</h2>
+            <span class="muted mono" id="modalVideoMeta">--</span>
+          </div>
+        </div>
+
+        <div class="modal-actions">
+          <div
+            class="range-bar modal-range-bar"
+            id="modalRangeGroup"
+            role="toolbar"
+            focusgroup="toolbar wrap"
+            aria-label="视频统计时间窗口"
+            aria-controls="modalStats modalVideoChart modalVideoPlayChart"
+          >
+            <span class="range-active-bar" id="modalRangeActiveBar" aria-hidden="true"></span>
+            <div class="modal-range-options" role="group" aria-label="时间范围">
+              <button type="button" class="range-btn mono" data-hours="1" aria-pressed="false">1小时</button>
+              <button type="button" class="range-btn mono" data-hours="6" aria-pressed="false">6小时</button>
+              <button type="button" class="range-btn mono active" data-hours="24" aria-pressed="true">24小时</button>
+              <button type="button" class="range-btn mono" data-hours="168" aria-pressed="false">7天</button>
+              <button type="button" class="range-btn mono" data-hours="720" aria-pressed="false">30天</button>
+              <button type="button" class="range-btn mono" data-hours="0" aria-pressed="false">全部</button>
+            </div>
+          </div>
+          <div class="modal-action-btns">
+            <a class="btn btn-chamfer btn-secondary mono" id="modalBiliLink" href="https://www.bilibili.com" target="_blank" rel="noopener noreferrer">B站打开 ↗</a>
+            <button type="button" class="btn btn-ghost mono" id="btnCloseModal" aria-label="关闭视频双通道波形弹窗" autofocus>关闭</button>
+          </div>
+        </div>
+      </header>
+
+      <div class="modal-stats" id="modalStats">
+        <div class="modal-stat-cell stat-cyan">
+          <span class="muted mono">当前在看</span>
+          <strong class="mono" id="modalCurrentOnline">--</strong>
+        </div>
+        <div class="modal-stat-cell">
+          <span class="muted mono">在看峰值</span>
+          <strong class="mono" id="modalPeakOnline">--</strong>
+        </div>
+        <div class="modal-stat-cell stat-pink">
+          <span class="muted mono">累计播放</span>
+          <strong class="mono" id="modalPlayCount">--</strong>
+        </div>
+        <div class="modal-stat-cell">
+          <span class="muted mono">区间播放增量</span>
+          <strong class="mono" id="modalPlayDelta">--</strong>
+        </div>
+      </div>
+
+      <div class="modal-charts-grid">
+        <section class="modal-chart-pane pane-cyan" aria-label="实时在线人数折线图">
+          <header class="modal-chart-head">
+            <div class="modal-chart-title-wrap">
+              <span class="scope-kicker mono">实时曲线</span>
+              <h3 class="modal-chart-heading">实时在线人数</h3>
+            </div>
+            <span class="status-chip mono" id="modalOnlineChip">--</span>
+          </header>
+          <div class="scope-plot modal-plot" id="modalVideoChart"></div>
+        </section>
+
+        <section class="modal-chart-pane pane-pink" aria-label="累计播放量折线图">
+          <header class="modal-chart-head">
+            <div class="modal-chart-title-wrap">
+              <span class="scope-kicker mono">累计曲线</span>
+              <h3 class="modal-chart-heading">累计播放量</h3>
+            </div>
+            <span class="status-chip mono" id="modalPlayChip">--</span>
+          </header>
+          <div class="scope-plot modal-plot" id="modalVideoPlayChart"></div>
+        </section>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Native Centered Settings Modal -->
+  <dialog class="telemetry-modal settings-modal" id="settingsModal" closedby="any" aria-labelledby="settingsModalTitle">
+    <div class="modal-shell">
+      <header class="modal-header">
+        <div class="modal-title-group">
+          <span class="section-kicker mono">监控配置</span>
+          <h2 class="modal-title" id="settingsModalTitle">监控设置</h2>
+        </div>
+
+        <div class="modal-actions">
+          <button type="button" class="btn btn-ghost mono" id="btnCloseSettingsModal" aria-label="关闭监控设置弹窗">关闭</button>
+        </div>
+      </header>
+
+      <div class="settings-drawer-body">
+        <form class="blueprint-form settings-drawer-form" id="settingsForm" aria-labelledby="settingsModalTitle">
+          <div class="form-grid">
+            <div class="form-field">
+              <label for="inputUid">B站账号编号 <span class="req" aria-hidden="true">*</span></label>
+              <input type="text" id="inputUid" name="uid" inputmode="numeric" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="例如：100001001" required autofocus />
+            </div>
+
+            <div class="form-field">
+              <label for="inputInterval">采集间隔（分钟）</label>
+              <input type="number" id="inputInterval" name="interval_minutes" min="1" max="1440" value="5" />
+            </div>
+
+            <div class="form-field full">
+              <label for="inputCookie">
+                <span>全局账号凭证（可选）</span>
+                <span class="status-chip mono" id="cookieStatusBadge">未配置</span>
+              </label>
+              <textarea id="inputCookie" name="cookie" rows="3" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="留空则保持当前已保存的全局凭证；如需更新可粘贴完整凭证文本"></textarea>
+            </div>
+
+            <div class="form-field">
+              <label for="inputVideoSync">视频列表同步周期（分钟）</label>
+              <input type="number" id="inputVideoSync" name="video_sync_interval_minutes" min="5" max="1440" value="30" />
+            </div>
+
+            <div class="form-field">
+              <label for="inputDelay">单视频请求间隔（毫秒）</label>
+              <input type="number" id="inputDelay" name="request_delay_ms" min="50" max="5000" value="200" />
+            </div>
+
+            <div class="form-field full checkbox-row">
+              <label class="switch-label" for="inputEnabled">
+                <span class="toggle-switch">
+                  <input type="checkbox" id="inputEnabled" name="enabled" checked />
+                  <span class="toggle-slider"></span>
+                </span>
+                <span>启用后台自动定时采集</span>
+              </label>
+            </div>
+
+            <div class="form-field full admin-password-field">
+              <label for="inputAdminPassword">
+                <span>管理员密码保护（可选）</span>
+                <span class="status-chip mono" id="adminPasswordStatusBadge">未设置</span>
+              </label>
+              <div class="password-input-wrap">
+                <input
+                  type="password"
+                  id="inputAdminPassword"
+                  name="admin_password"
+                  autocomplete="new-password"
+                  enterkeyhint="done"
+                  placeholder="输入新密码以启用或修改；留空则保持当前状态"
+                />
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-sm password-toggle-btn"
+                  id="btnToggleSettingsAdminPassword"
+                  aria-pressed="false"
+                  aria-label="显示管理员密码"
+                  aria-controls="inputAdminPassword"
+                  aria-describedby="settingsPasswordToggleWarning"
+                >
+                  <svg class="icon-eye" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true">
+                    <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7Z" />
+                    <circle cx="12" cy="12" r="3" />
+                  </svg>
+                  <svg class="icon-eye-off hidden" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true">
+                    <path d="M17.94 17.94A10.94 10.94 0 0 1 12 19c-7 0-11-7-11-7a21.8 21.8 0 0 1 5.06-5.94" />
+                    <path d="M9.9 4.24A10.94 10.94 0 0 1 12 5c7 0 11 7 11 7a21.8 21.8 0 0 1-2.16 3.19" />
+                    <line x1="1" y1="1" x2="23" y2="23" />
+                  </svg>
+                </button>
+              </div>
+              <span id="settingsPasswordToggleWarning" class="visually-hidden">警告：开启后将在屏幕上显示密码明文。</span>
+            </div>
+          </div>
+
+          <div class="form-actions">
+            <button type="button" class="btn btn-chamfer btn-secondary" id="btnTestConn">测试连接</button>
+            <button type="button" class="btn btn-chamfer btn-secondary" id="btnSyncVideos" title="立即重新拉取全部主创投稿并采集">同步视频列表</button>
+            <button type="button" class="btn btn-ghost" id="btnClearCookie">清空凭证</button>
+            <button type="button" class="btn btn-ghost hidden" id="btnClearAdminPassword">清除管理密码</button>
+            <button type="button" class="btn btn-ghost hidden" id="btnLockAdmin">锁定权限</button>
+            <button type="submit" class="btn btn-chamfer btn-primary" id="btnSaveSettings">保存设置</button>
+          </div>
+
+          <div class="test-result hidden" id="testResultBox" role="status" aria-live="polite"></div>
+        </form>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Native Centered Add/Edit Account Modal -->
+  <dialog class="telemetry-modal account-modal" id="accountModal" closedby="any" aria-labelledby="accountModalTitle">
+    <div class="modal-shell">
+      <header class="modal-header">
+        <div class="modal-title-group">
+          <span class="section-kicker mono" id="accountModalKicker">新增监控频道</span>
+          <h2 class="modal-title" id="accountModalTitle">添加监控账号</h2>
+        </div>
+
+        <div class="modal-actions">
+          <button type="button" class="btn btn-ghost mono" id="btnCloseAccountModal" aria-label="关闭账号配置弹窗">关闭</button>
+        </div>
+      </header>
+
+      <div class="account-modal-body">
+        <form class="blueprint-form settings-drawer-form account-modal-form" id="accountForm" aria-labelledby="accountModalTitle" novalidate>
+          <div class="form-grid">
+            <div class="form-field full">
+              <label for="accountInputUid">B站账号编号 <span class="req" aria-hidden="true">*</span></label>
+              <input type="text" id="accountInputUid" name="uid" inputmode="numeric" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="例如：100001001" required autofocus />
+            </div>
+
+            <div class="form-field full checkbox-row">
+              <label class="switch-label" for="accountInputEnabled">
+                <span class="toggle-switch">
+                  <input type="checkbox" id="accountInputEnabled" name="enabled" checked />
+                  <span class="toggle-slider"></span>
+                </span>
+                <span>启用该账号的后台自动定时采集</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="form-actions">
+            <button type="button" class="btn btn-chamfer btn-secondary" id="btnAccountTestConn">测试连接</button>
+            <button type="submit" class="btn btn-chamfer btn-primary" id="btnAccountSave">添加并监控</button>
+          </div>
+
+          <div class="test-result hidden" id="accountTestResultBox" role="status" aria-live="polite"></div>
+        </form>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Native Centered Delete Account Confirmation Modal -->
+  <dialog class="telemetry-modal confirm-modal" id="confirmDeleteModal" closedby="any" aria-labelledby="confirmDeleteTitle">
+    <div class="modal-shell">
+      <header class="modal-header">
+        <div class="modal-title-group">
+          <span class="section-kicker mono">移除监控频道</span>
+          <h2 class="modal-title" id="confirmDeleteTitle">确认移除监控账号</h2>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-ghost mono" id="btnCancelDelete" autofocus>取消</button>
+        </div>
+      </header>
+
+      <div class="confirm-modal-body">
+        <p class="confirm-lead" id="confirmDeleteMessage">确定要从左侧监控列表中移除该账号吗？</p>
+        <label class="confirm-checkbox-row" for="deleteDataCheckbox">
+          <input type="checkbox" id="deleteDataCheckbox" />
+          <span>同时删除该账号已采集的历史快照与视频缓存数据</span>
+        </label>
+        <div class="confirm-modal-actions">
+          <button type="button" class="btn btn-ghost" id="btnCancelDeleteFooter">保留账号</button>
+          <button type="button" class="btn btn-chamfer btn-danger" id="btnConfirmDelete">确认移除</button>
+        </div>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Native Centered Admin Password Verification Modal -->
+  <dialog class="telemetry-modal admin-auth-modal" id="adminAuthModal" closedby="any" aria-labelledby="adminAuthTitle">
+    <div class="modal-shell">
+      <header class="modal-header">
+        <div class="modal-title-group">
+          <h2 class="modal-title" id="adminAuthTitle">管理员密码</h2>
+        </div>
+
+        <div class="modal-actions">
+          <button type="button" class="btn btn-ghost mono" id="btnCloseAdminAuthModal" aria-label="关闭管理员密码弹窗">关闭</button>
+        </div>
+      </header>
+
+      <div class="admin-auth-body">
+        <form class="blueprint-form settings-drawer-form admin-auth-form" id="adminAuthForm" aria-labelledby="adminAuthTitle" novalidate>
+          <div class="form-grid">
+            <div class="form-field full">
+              <label for="adminAuthInput">管理员密码 <span class="req" aria-hidden="true">*</span></label>
+              <div class="password-input-wrap">
+                <input
+                  type="password"
+                  id="adminAuthInput"
+                  name="password"
+                  autocomplete="current-password"
+                  enterkeyhint="done"
+                  aria-describedby="adminAuthErrorBox"
+                  placeholder="请输入管理员密码"
+                  required
+                  autofocus
+                />
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-sm password-toggle-btn"
+                  id="btnToggleAdminAuthPassword"
+                  aria-pressed="false"
+                  aria-label="显示密码"
+                  aria-controls="adminAuthInput"
+                  aria-describedby="adminAuthToggleWarning"
+                >
+                  <svg class="icon-eye" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true">
+                    <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7Z" />
+                    <circle cx="12" cy="12" r="3" />
+                  </svg>
+                  <svg class="icon-eye-off hidden" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true">
+                    <path d="M17.94 17.94A10.94 10.94 0 0 1 12 19c-7 0-11-7-11-7a21.8 21.8 0 0 1 5.06-5.94" />
+                    <path d="M9.9 4.24A10.94 10.94 0 0 1 12 5c7 0 11 7 11 7a21.8 21.8 0 0 1-2.16 3.19" />
+                    <line x1="1" y1="1" x2="23" y2="23" />
+                  </svg>
+                </button>
+              </div>
+              <span id="adminAuthToggleWarning" class="visually-hidden">警告：开启后将在屏幕上显示密码明文。</span>
+            </div>
+          </div>
+
+          <div class="test-result fail is-err hidden" id="adminAuthErrorBox" role="alert" aria-live="polite"></div>
+
+          <div class="form-actions admin-auth-actions">
+            <button type="button" class="btn btn-ghost" id="btnCancelAdminAuth">取消</button>
+            <button type="submit" class="btn btn-chamfer btn-primary" id="btnSubmitAdminAuth">验证并继续</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- HUD Toast Notifications Stack -->
+  <div class="toast-stack" id="toastStack" aria-live="polite"></div>
+
+  <script type="module" src="/static/app.js?v=20261118x"></script>
+</body>
+</html>

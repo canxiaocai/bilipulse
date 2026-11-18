@@ -1,0 +1,377 @@
+import asyncio
+import logging
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+from app.bilibili.client import BilibiliAPIError, BilibiliClient
+from app.database import Database
+
+logger = logging.getLogger(__name__)
+
+VIDEO_SYNC_RULE = "owner_only_v1"
+ONLINE_COUNT_RULE = "minus_1_per_cid_v1"
+
+
+def adjust_online_count(raw_count: int) -> int:
+    """Subtract 1 baseline viewer reported by Bilibili /x/player/online/total per CID."""
+    return max(0, int(raw_count) - 1)
+
+
+@dataclass
+class CrawlContext:
+    uid: str
+    client: BilibiliClient
+    db: Database
+    settings: dict[str, str]
+    force_sync_videos: bool = False
+    follower_count: Optional[int] = None
+    following_count: Optional[int] = None
+    online_viewers_total: Optional[int] = None
+    video_count: int = 0
+    videos_succeeded: int = 0
+    video_online_items: list[dict[str, Any]] = field(default_factory=list)
+    extra_metrics: dict[str, Any] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+
+
+class BaseCollector(ABC):
+    """Extensible collector interface for adding new Bilibili metrics."""
+
+    name: str = "base"
+
+    @abstractmethod
+    async def collect(self, ctx: CrawlContext) -> None:
+        """Populate metrics on CrawlContext."""
+
+
+class AccountFollowerCollector(BaseCollector):
+    """Collects follower count, following count, and profile metadata."""
+
+    name = "account_follower"
+
+    async def collect(self, ctx: CrawlContext) -> None:
+        stat = await ctx.client.get_relation_stat(ctx.uid)
+        ctx.follower_count = stat["follower"]
+        ctx.following_count = stat["following"]
+
+        try:
+            card = await ctx.client.get_account_card(ctx.uid)
+            if card.get("name") or card.get("face"):
+                await asyncio.to_thread(
+                    ctx.db.update_account_profile,
+                    ctx.uid,
+                    account_name=card.get("name") or None,
+                    account_face=card.get("face") or None,
+                )
+            ctx.extra_metrics["archive_count_reported"] = card.get("archive_count", 0)
+        except Exception as exc:
+            logger.warning("Failed to fetch account card for %s: %s", ctx.uid, exc)
+
+
+class AllVideosOnlineCollector(BaseCollector):
+    """Syncs user's uploaded videos and sums real-time concurrent viewers across all videos."""
+
+    name = "all_videos_online"
+
+    async def collect(self, ctx: CrawlContext) -> None:
+        delay_sec = max(0.05, int(ctx.settings.get("request_delay_ms", "200") or 200) / 1000.0)
+        sync_interval_sec = (
+            max(5, int(ctx.settings.get("video_sync_interval_minutes", "30") or 30)) * 60
+        )
+
+        cached_videos = await asyncio.to_thread(ctx.db.get_videos, ctx.uid)
+        last_sync_ts = int(ctx.settings.get(f"last_video_sync_ts_{ctx.uid}", "0") or 0)
+        reported_count = int(ctx.extra_metrics.get("archive_count_reported", 0) or 0)
+        last_reported_count = int(ctx.settings.get(f"last_archive_count_{ctx.uid}", "0") or 0)
+
+        needs_sync = (
+            ctx.force_sync_videos
+            or not cached_videos
+            or ctx.settings.get(f"video_sync_rule_{ctx.uid}", "") != VIDEO_SYNC_RULE
+            or (time.time() - last_sync_ts) >= sync_interval_sec
+            or (
+                reported_count > 0
+                and last_reported_count > 0
+                and reported_count != last_reported_count
+            )
+        )
+
+        if needs_sync:
+            try:
+                fetched_videos = await ctx.client.get_all_videos(ctx.uid)
+                target_uid = str(ctx.uid).strip()
+                owned_videos = [
+                    v
+                    for v in fetched_videos
+                    if not (v.get("up_mid") and str(v["up_mid"]).strip() != target_uid)
+                ]
+                if owned_videos:
+                    await asyncio.to_thread(ctx.db.upsert_videos, ctx.uid, owned_videos)
+                active_bvids = {v["bvid"] for v in owned_videos}
+                await asyncio.to_thread(
+                    ctx.db.delete_stale_videos, ctx.uid, active_bvids, allow_empty=True
+                )
+                sync_updates: dict[str, Any] = {
+                    f"last_video_sync_ts_{ctx.uid}": str(int(time.time())),
+                    f"video_sync_rule_{ctx.uid}": VIDEO_SYNC_RULE,
+                }
+                if (
+                    "archive_count_reported" in ctx.extra_metrics
+                    or not ctx.settings.get(f"last_archive_count_{ctx.uid}")
+                ):
+                    sync_updates[f"last_archive_count_{ctx.uid}"] = str(reported_count)
+                await asyncio.to_thread(ctx.db.update_settings, sync_updates)
+                ctx.settings.update({k: str(v) for k, v in sync_updates.items()})
+                cached_videos = await asyncio.to_thread(ctx.db.get_videos, ctx.uid)
+            except Exception as exc:
+                msg = f"同步视频列表失败: {exc}"
+                logger.warning(msg)
+                ctx.errors.append(msg)
+                if not cached_videos:
+                    raise
+
+        ctx.video_count = len(cached_videos)
+        if not cached_videos:
+            ctx.online_viewers_total = 0
+            ctx.videos_succeeded = 0
+            ctx.extra_metrics["total_video_plays"] = 0
+            return
+
+        ctx.extra_metrics["total_video_plays"] = sum(
+            int(v.get("play_count", 0)) for v in cached_videos
+        )
+
+        semaphore = asyncio.Semaphore(4)
+        abort_412 = asyncio.Event()
+
+        async def fetch_single_video(video: dict[str, Any]) -> Optional[dict[str, Any]]:
+            if abort_412.is_set():
+                return None
+            async with semaphore:
+                if abort_412.is_set():
+                    return None
+                bvid = video["bvid"]
+                cids = video.get("cids") or []
+                if not cids:
+                    try:
+                        cids = await ctx.client.get_video_cids(bvid)
+                        if cids:
+                            await asyncio.to_thread(ctx.db.update_video_cids, bvid, cids)
+                        await asyncio.sleep(delay_sec)
+                    except BilibiliAPIError as exc:
+                        ctx.errors.append(f"{bvid} 获取CID失败: {exc}")
+                        if exc.code == 412:
+                            abort_412.set()
+                        return None
+                    except Exception as exc:
+                        ctx.errors.append(f"{bvid} 获取CID失败: {exc}")
+                        return None
+
+                if not cids:
+                    return None
+
+                video_online = 0
+                raw_parts: list[str] = []
+                succeeded_parts = 0
+                for part in cids:
+                    if abort_412.is_set():
+                        return None
+                    try:
+                        count, raw = await ctx.client.get_video_online_total(bvid, int(part["cid"]))
+                        video_online += adjust_online_count(count)
+                        raw_parts.append(raw)
+                        succeeded_parts += 1
+                        await asyncio.sleep(delay_sec)
+                    except BilibiliAPIError as exc:
+                        ctx.errors.append(f"{bvid}(cid={part['cid']}) 在线人数失败: {exc}")
+                        if exc.code == 412:
+                            abort_412.set()
+                            return None
+                        continue
+                    except Exception as exc:
+                        ctx.errors.append(f"{bvid}(cid={part['cid']}) 在线人数失败: {exc}")
+                        continue
+
+                if succeeded_parts == 0:
+                    return None
+
+                online_raw = raw_parts[0] if len(raw_parts) == 1 else "+".join(raw_parts)
+                return {
+                    "bvid": bvid,
+                    "online_count": video_online,
+                    "online_raw": online_raw,
+                    "play_count": int(video.get("play_count", 0)),
+                }
+
+        results = await asyncio.gather(*(fetch_single_video(v) for v in cached_videos))
+        succeeded_items = [item for item in results if item is not None]
+        ctx.video_online_items = succeeded_items
+        ctx.videos_succeeded = len(succeeded_items)
+        ctx.online_viewers_total = sum(item["online_count"] for item in succeeded_items)
+
+
+class CrawlService:
+    """Coordinates modular collectors and persists snapshots safely."""
+
+    def __init__(self, database: Database, collectors: Optional[list[BaseCollector]] = None) -> None:
+        self.db = database
+        self.collectors: list[BaseCollector] = collectors or [
+            AccountFollowerCollector(),
+            AllVideosOnlineCollector(),
+        ]
+        self._lock = asyncio.Lock()
+        self.crawling_uid: Optional[str] = None
+
+    @property
+    def is_crawling(self) -> bool:
+        return self._lock.locked()
+
+    def register_collector(self, collector: BaseCollector) -> None:
+        """Register an additional collector for future metric extensions."""
+        self.collectors.append(collector)
+
+    async def _crawl_single_uid(
+        self, uid: str, force_sync_videos: bool = False
+    ) -> dict[str, Any]:
+        target_uid = uid.strip()
+        if not target_uid:
+            return {"skipped": True, "reason": "尚未配置 B站 UID"}
+
+        settings = await asyncio.to_thread(self.db.get_all_settings)
+        cookie = await asyncio.to_thread(self.db.get_effective_cookie, target_uid)
+
+        started = time.perf_counter()
+        self.crawling_uid = target_uid
+        try:
+            async with BilibiliClient(cookie=cookie) as client:
+                ctx = CrawlContext(
+                    uid=target_uid,
+                    client=client,
+                    db=self.db,
+                    settings=settings,
+                    force_sync_videos=force_sync_videos,
+                )
+                for collector in self.collectors:
+                    try:
+                        await collector.collect(ctx)
+                    except BilibiliAPIError as exc:
+                        err = f"[{collector.name}] {exc}"
+                        logger.error(err)
+                        ctx.errors.append(err)
+                    except Exception as exc:
+                        err = f"[{collector.name}] 未预期异常: {exc}"
+                        logger.exception(err)
+                        ctx.errors.append(err)
+
+            duration_ms = int((time.perf_counter() - started) * 1000)
+
+            if ctx.follower_count is None and ctx.online_viewers_total is None:
+                status = "error"
+            elif ctx.errors or (ctx.video_count > 0 and ctx.videos_succeeded < ctx.video_count):
+                status = "partial"
+            else:
+                status = "success"
+
+            error_message = " | ".join(ctx.errors[:5]) if ctx.errors else None
+            if ctx.errors and len(ctx.errors) > 5:
+                error_message = f"{error_message} (共 {len(ctx.errors)} 条警告)"
+
+            snapshot_id = await asyncio.to_thread(
+                self.db.insert_snapshot,
+                uid=target_uid,
+                follower_count=ctx.follower_count,
+                following_count=ctx.following_count,
+                online_viewers_total=ctx.online_viewers_total,
+                video_count=ctx.video_count,
+                videos_succeeded=ctx.videos_succeeded,
+                extra_metrics=ctx.extra_metrics,
+                status=status,
+                error_message=error_message,
+                duration_ms=duration_ms,
+                video_online_items=ctx.video_online_items,
+            )
+
+            return {
+                "skipped": False,
+                "snapshot_id": snapshot_id,
+                "uid": target_uid,
+                "status": status,
+                "follower_count": ctx.follower_count,
+                "online_viewers_total": ctx.online_viewers_total,
+                "video_count": ctx.video_count,
+                "videos_succeeded": ctx.videos_succeeded,
+                "duration_ms": duration_ms,
+                "error_message": error_message,
+            }
+        finally:
+            self.crawling_uid = None
+
+    async def fetch_account_profile(self, uid: str, cookie: Optional[str] = None) -> None:
+        """Best-effort fetch of account name and avatar without blocking on the crawl lock."""
+        target_uid = uid.strip()
+        if not target_uid:
+            return
+        clean_cookie = (cookie or "").strip()
+        if not clean_cookie:
+            clean_cookie = await asyncio.to_thread(self.db.get_effective_cookie, target_uid)
+        try:
+            async with BilibiliClient(cookie=clean_cookie) as client:
+                card = await client.get_account_card(target_uid)
+            if card.get("name") or card.get("face"):
+                await asyncio.to_thread(
+                    self.db.update_account_profile,
+                    target_uid,
+                    account_name=card.get("name") or None,
+                    account_face=card.get("face") or None,
+                )
+        except Exception as exc:
+            logger.warning("Failed to prefetch account profile for %s: %s", target_uid, exc)
+
+    async def run_crawl(
+        self,
+        force_sync_videos: bool = False,
+        uid: Optional[str] = None,
+        wait: bool = False,
+    ) -> dict[str, Any]:
+        if not wait and self._lock.locked():
+            return {"skipped": True, "reason": "已有采集任务正在进行中"}
+
+        async with self._lock:
+            target_uid = (
+                uid.strip()
+                if uid is not None
+                else (await asyncio.to_thread(self.db.get_setting, "uid", "")).strip()
+            )
+            if not target_uid:
+                return {"skipped": True, "reason": "尚未配置 B站 UID"}
+            if wait and uid is not None:
+                acc = await asyncio.to_thread(self.db.get_account, target_uid)
+                if acc is None or not acc.get("enabled"):
+                    return {"skipped": True, "reason": "账号已删除或已暂停"}
+            return await self._crawl_single_uid(target_uid, force_sync_videos=force_sync_videos)
+
+    async def run_crawl_all(self, force_sync_videos: bool = False) -> dict[str, Any]:
+        if self._lock.locked():
+            return {"skipped": True, "reason": "已有采集任务正在进行中"}
+
+        async with self._lock:
+            accounts = await asyncio.to_thread(self.db.get_enabled_accounts)
+            if not accounts:
+                return {"skipped": True, "reason": "没有启用的监控账号"}
+
+            results: list[dict[str, Any]] = []
+            for idx, acc in enumerate(accounts):
+                res = await self._crawl_single_uid(
+                    acc["uid"], force_sync_videos=force_sync_videos
+                )
+                results.append(res)
+                if idx < len(accounts) - 1:
+                    await asyncio.sleep(0.5)
+
+            return {
+                "skipped": False,
+                "total": len(accounts),
+                "results": results,
+            }

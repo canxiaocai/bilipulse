@@ -1,0 +1,2960 @@
+import asyncio
+import time
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.bilibili.client import (
+    BilibiliAPIError,
+    BilibiliClient,
+    parse_duration_seconds,
+    parse_online_count,
+)
+from app.bilibili.collectors import (
+    VIDEO_SYNC_RULE,
+    AllVideosOnlineCollector,
+    CrawlContext,
+    CrawlService,
+)
+from app.database import Database
+from app.main import create_app
+
+
+@pytest.fixture(autouse=True)
+def _disable_default_admin_password_for_unit_tests(monkeypatch):
+    monkeypatch.delenv("BILI_ADMIN_PASSWORD", raising=False)
+    monkeypatch.delenv("BILI_TRUST_PROXY", raising=False)
+    monkeypatch.setenv("BILI_DEFAULT_ADMIN_PASSWORD", "")
+    BilibiliClient.clear_credential_cache()
+    yield
+    BilibiliClient.clear_credential_cache()
+
+
+def test_parse_online_count():
+    assert parse_online_count("0") == 0
+    assert parse_online_count("11") == 11
+    assert parse_online_count("100+") == 100
+    assert parse_online_count("1.2万+") == 12000
+    assert parse_online_count("10万+") == 100000
+    assert parse_online_count("2亿") == 200000000
+    assert parse_online_count("-") == 0
+    assert parse_online_count("") == 0
+    assert parse_online_count(None) == 0
+
+
+def test_wbi_signing_strips_special_chars():
+    query = BilibiliClient.sign_wbi_params(
+        {"mid": "12345", "keyword": "a!b'c(d)e*"},
+        "7cd084941338484aae1ad9425b84077c",
+        "4932caff0ff746eab6f01bf08b70ac45",
+    )
+    assert "w_rid=" in query
+    assert "wts=" in query
+    assert "keyword=abcde" in query
+
+
+def test_database_settings_and_snapshots(tmp_path: Path):
+    db = Database(db_path=tmp_path / "test.db")
+    pub = db.get_public_settings()
+    assert pub["uid"] == ""
+    assert pub["interval_minutes"] == 5
+    assert pub["has_cookie"] is False
+
+    updated = db.update_settings({"uid": "100001001", "cookie": "SESSDATA=secret_token_12345"})
+    assert updated["uid"] == "100001001"
+    assert updated["has_cookie"] is True
+    assert "secret_token_12345" not in updated["cookie_preview"]
+
+    db.upsert_videos(
+        "100001001",
+        [
+            {
+                "bvid": "BV1xx",
+                "aid": 1001,
+                "title": "Video A",
+                "play_count": 500,
+                "cids": [{"cid": 11, "page": 1, "part": "P1"}],
+            }
+        ],
+    )
+    snap1 = db.insert_snapshot(
+        uid="100001001",
+        follower_count=1000,
+        following_count=10,
+        online_viewers_total=25,
+        video_count=1,
+        videos_succeeded=1,
+        extra_metrics={"total_video_plays": 500},
+        status="success",
+        error_message=None,
+        duration_ms=120,
+        video_online_items=[{"bvid": "BV1xx", "online_count": 25, "online_raw": "25"}],
+    )
+    assert snap1 > 0
+    latest, prev = db.get_latest_two_snapshots("100001001")
+    assert latest is not None
+    assert prev is None
+    assert latest["follower_count"] == 1000
+    assert latest["online_viewers_total"] == 25
+
+    history = db.get_video_history("BV1xx")
+    assert len(history) == 1
+    assert history[0]["online_count"] == 25
+    assert history[0]["play_count"] == 500
+
+
+def test_crawl_service_sums_all_videos(tmp_path: Path):
+    db = Database(db_path=tmp_path / "crawl.db")
+    db.update_settings({"uid": "123456", "request_delay_ms": "50"})
+
+    fake_client = AsyncMock()
+    fake_client.__aenter__.return_value = fake_client
+    fake_client.__aexit__.return_value = None
+    fake_client.get_relation_stat.return_value = {"follower": 54321, "following": 12}
+    fake_client.get_account_card.return_value = {
+        "name": "测试UP主",
+        "face": "https://example.com/face.jpg",
+        "follower": 54321,
+        "archive_count": 2,
+    }
+    fake_client.get_all_videos.return_value = [
+        {"bvid": "BV1A", "aid": 1, "title": "Video 1", "pic": "", "pubdate": 100, "duration": 60, "play_count": 300},
+        {"bvid": "BV1B", "aid": 2, "title": "Video 2", "pic": "", "pubdate": 200, "duration": 90, "play_count": 700},
+    ]
+
+    async def fake_cids(bvid: str):
+        if bvid == "BV1A":
+            return [{"cid": 101, "page": 1, "part": "P1"}]
+        return [{"cid": 201, "page": 1, "part": "P1"}, {"cid": 202, "page": 2, "part": "P2"}]
+
+    async def fake_online(bvid: str, cid: int):
+        mapping = {101: (12, "12"), 201: (8, "8"), 202: (5, "5")}
+        return mapping[cid]
+
+    fake_client.get_video_cids.side_effect = fake_cids
+    fake_client.get_video_online_total.side_effect = fake_online
+
+    service = CrawlService(db)
+    with patch("app.bilibili.collectors.BilibiliClient", return_value=fake_client):
+        result = asyncio.run(service.run_crawl(force_sync_videos=True))
+
+    assert result["skipped"] is False
+    assert result["status"] == "success"
+    assert result["follower_count"] == 54321
+    assert result["online_viewers_total"] == 22  # (12 - 1) + (8 - 1) + (5 - 1)
+    assert result["video_count"] == 2
+    assert result["videos_succeeded"] == 2
+    videos = {v["bvid"]: v for v in db.get_videos("123456")}
+    assert videos["BV1A"]["last_online_count"] == 11
+    assert videos["BV1A"]["last_online_raw"] == "12"
+    assert videos["BV1B"]["last_online_count"] == 11
+    assert videos["BV1B"]["last_online_raw"] == "8+5"
+
+    pub = db.get_public_settings()
+    assert pub["account_name"] == "测试UP主"
+
+
+def test_fastapi_routes(tmp_path: Path):
+    db = Database(db_path=tmp_path / "api.db")
+    app = create_app(database=db, enable_scheduler=False)
+    with TestClient(app) as client:
+        assert client.get("/api/health").json() == {"status": "ok"}
+
+        bad_uid = client.put("/api/settings", json={"uid": "abc"})
+        assert bad_uid.status_code == 400
+
+        ok_put = client.put("/api/settings", json={"uid": "100001001", "interval_minutes": 5, "enabled": False})
+        assert ok_put.status_code == 200
+        assert ok_put.json()["uid"] == "100001001"
+
+        dash = client.get("/api/dashboard?hours=24")
+        assert dash.status_code == 200
+        assert dash.json()["settings"]["uid"] == "100001001"
+
+        html_resp = client.get("/")
+        assert html_resp.status_code == 200
+        assert "B站账号实时监控" in html_resp.text
+        assert "btnOpenSettings" in html_resp.text
+        assert "btnCrawlNow" not in html_resp.text
+        assert "btnCrawlAll" not in html_resp.text
+        assert client.post("/api/crawl/all").status_code == 404
+
+
+def test_series_filters_non_up_joint_videos_and_paginates_partial_pages():
+    async def scenario():
+        uid = "3546100000000001"
+        async with BilibiliClient() as client:
+            client._session_bootstrapped = True
+
+            async def fake_request(url, params=None, referer=None, retries=2):
+                assert "recArchivesByKeywords" in url
+                pn = params["pn"]
+                if pn == 1:
+                    # raw_count < ps (3 < 100) AND filtered page is empty, while pn * ps < total (100 < 150)
+                    return {
+                        "code": 0,
+                        "data": {
+                            "page": {"total": 150},
+                            "archives": [
+                                {
+                                    "bvid": "BV1collab1",
+                                    "aid": 1,
+                                    "title": "Collaborator Joint 1",
+                                    "upMid": 200002002,
+                                    "stat": {"view": 999},
+                                },
+                                {
+                                    "bvid": "BV1collab2",
+                                    "aid": 2,
+                                    "title": "Collaborator Joint 2",
+                                    "upMid": "200002002",
+                                    "stat": {"view": 888},
+                                },
+                            ],
+                        },
+                    }
+                if pn == 2:
+                    return {
+                        "code": 0,
+                        "data": {
+                            "page": {"total": 150},
+                            "archives": [
+                                {
+                                    "bvid": "BV1solo",
+                                    "aid": 3,
+                                    "title": "Solo Video",
+                                    "upMid": int(uid),
+                                    "stat": {"view": 100},
+                                },
+                                {
+                                    "bvid": "BV1up_joint",
+                                    "aid": 4,
+                                    "title": "UP-Owned Joint Video",
+                                    "upMid": uid,
+                                    "stat": {"view": 200},
+                                },
+                                {
+                                    "bvid": "BV1no_upmid",
+                                    "aid": 5,
+                                    "title": "Missing upMid Fallback",
+                                    "stat": {"view": 50},
+                                },
+                                {
+                                    "bvid": "BV1collab3",
+                                    "aid": 6,
+                                    "title": "Collaborator Joint 3",
+                                    "upMid": 999999,
+                                    "stat": {"view": 777},
+                                },
+                            ],
+                        },
+                    }
+                raise AssertionError(f"Unexpected page {pn}")
+
+            with patch.object(client, "_request_json", side_effect=fake_request):
+                with patch("app.bilibili.client.asyncio.sleep", new=AsyncMock()):
+                    videos = await client.get_all_videos(uid)
+
+            assert [v["bvid"] for v in videos] == ["BV1solo", "BV1up_joint", "BV1no_upmid"]
+            assert all(v["up_mid"] == uid for v in videos)
+
+    asyncio.run(scenario())
+
+
+def test_wbi_filters_mid_and_verifies_union_video_owner():
+    async def scenario():
+        uid = "3546100000000001"
+        async with BilibiliClient() as client:
+            client._session_bootstrapped = True
+            client._wbi_keys = ("a" * 32, "b" * 32)
+            client._wbi_fetched_at = time.time()
+
+            async def fake_request(url, params=None, referer=None, retries=2):
+                if "recArchivesByKeywords" in url:
+                    raise BilibiliAPIError("series blocked", code=-352)
+                if "wbi/arc/search" in url:
+                    return {
+                        "code": 0,
+                        "data": {
+                            "page": {"count": 5},
+                            "list": {
+                                "vlist": [
+                                    {
+                                        "bvid": "BV1other_mid",
+                                        "aid": 10,
+                                        "title": "Other mid",
+                                        "mid": 200002002,
+                                        "is_union_video": 1,
+                                        "play": 123,
+                                    },
+                                    {
+                                        "bvid": "BV1union_not_owner",
+                                        "aid": 11,
+                                        "title": "Union disguised mid",
+                                        "mid": int(uid),
+                                        "is_union_video": 1,
+                                        "play": 456,
+                                    },
+                                    {
+                                        "bvid": "BV1union_owner",
+                                        "aid": 12,
+                                        "title": "Union owned by UP",
+                                        "mid": int(uid),
+                                        "is_union_video": 1,
+                                        "play": 789,
+                                    },
+                                    {
+                                        "bvid": "BV1union_view_err",
+                                        "aid": 13,
+                                        "title": "Union view transient error",
+                                        "mid": int(uid),
+                                        "is_union_video": 1,
+                                        "play": 10,
+                                    },
+                                    {
+                                        "bvid": "BV1solo_wbi",
+                                        "aid": 14,
+                                        "title": "Solo WBI",
+                                        "mid": int(uid),
+                                        "is_union_video": 0,
+                                        "play": "250",
+                                    },
+                                ]
+                            },
+                        },
+                    }
+                if "web-interface/view" in url:
+                    bvid = params["bvid"]
+                    if bvid == "BV1union_not_owner":
+                        return {"code": 0, "data": {"owner": {"mid": 200002002}}}
+                    if bvid == "BV1union_owner":
+                        return {"code": 0, "data": {"owner": {"mid": int(uid)}}}
+                    if bvid == "BV1union_view_err":
+                        raise BilibiliAPIError("transient timeout", code=-504)
+                raise AssertionError(f"Unexpected URL: {url}")
+
+            with patch.object(client, "_request_json", side_effect=fake_request):
+                videos = await client.get_all_videos(uid)
+
+            assert [v["bvid"] for v in videos] == [
+                "BV1union_owner",
+                "BV1union_view_err",
+                "BV1solo_wbi",
+            ]
+            assert all(v["up_mid"] == uid for v in videos)
+
+    asyncio.run(scenario())
+
+
+def test_get_video_owner_mid():
+    async def scenario():
+        async with BilibiliClient() as client:
+            with patch.object(
+                client,
+                "_request_json",
+                new=AsyncMock(return_value={"code": 0, "data": {"owner": {"mid": 200002002}}}),
+            ):
+                assert await client.get_video_owner_mid("BV1test") == "200002002"
+
+            with patch.object(
+                client,
+                "_request_json",
+                new=AsyncMock(return_value={"code": 0, "data": {"owner": {}}}),
+            ):
+                assert await client.get_video_owner_mid("BV1missing") is None
+
+            with patch.object(
+                client,
+                "_request_json",
+                new=AsyncMock(return_value={"code": -404, "message": "not found"}),
+            ):
+                with pytest.raises(BilibiliAPIError):
+                    await client.get_video_owner_mid("BV1err")
+
+    asyncio.run(scenario())
+
+
+def test_database_delete_stale_videos_allow_empty(tmp_path: Path):
+    db = Database(db_path=tmp_path / "stale.db")
+    uid = "3546100000000001"
+    db.upsert_videos(
+        uid,
+        [
+            {"bvid": "BV1A", "aid": 1, "title": "A"},
+            {"bvid": "BV1B", "aid": 2, "title": "B"},
+        ],
+    )
+    assert db.delete_stale_videos(uid, set(), allow_empty=False) == 0
+    assert len(db.get_videos(uid)) == 2
+
+    deleted = db.delete_stale_videos(uid, set(), allow_empty=True)
+    assert deleted == 2
+    assert db.get_videos(uid) == []
+
+
+def test_collector_rule_upgrade_purges_cached_joint_and_avoids_resync_loop(tmp_path: Path):
+    uid = "3546100000000001"
+    db = Database(db_path=tmp_path / "collector.db")
+    now_ts = int(time.time())
+    db.update_settings(
+        {
+            "uid": uid,
+            "request_delay_ms": "50",
+            "video_sync_interval_minutes": "30",
+            f"last_video_sync_ts_{uid}": str(now_ts),
+        }
+    )
+    # Pre-populate legacy cache with 1 owned video + 2 collaborator joint videos
+    db.upsert_videos(
+        uid,
+        [
+            {"bvid": "BV1owned", "aid": 1, "title": "Owned", "play_count": 100, "cids": [{"cid": 11, "page": 1, "part": "P1"}]},
+            {"bvid": "BV1collab1", "aid": 2, "title": "Collab 1", "play_count": 500, "cids": [{"cid": 22, "page": 1, "part": "P1"}]},
+            {"bvid": "BV1collab2", "aid": 3, "title": "Collab 2", "play_count": 900, "cids": [{"cid": 33, "page": 1, "part": "P1"}]},
+        ],
+    )
+
+    fake_client = AsyncMock()
+    fake_client.__aenter__.return_value = fake_client
+    fake_client.__aexit__.return_value = None
+    fake_client.get_relation_stat.return_value = {"follower": 1000, "following": 5}
+    fake_client.get_account_card.return_value = {
+        "name": "Tester",
+        "face": "",
+        "follower": 1000,
+        "archive_count": 3,  # Bilibili card still reports 3 (1 owned + 2 collaborator)
+    }
+    fake_client.get_all_videos.return_value = [
+        {"bvid": "BV1owned", "aid": 1, "title": "Owned", "pic": "", "pubdate": 100, "duration": 60, "play_count": 100, "up_mid": uid},
+        {"bvid": "BV1collab1", "aid": 2, "title": "Collab 1", "pic": "", "pubdate": 101, "duration": 60, "play_count": 500, "up_mid": "200002002"},
+    ]
+    fake_client.get_video_online_total.return_value = (7, "7")
+
+    service = CrawlService(db)
+    with patch("app.bilibili.collectors.BilibiliClient", return_value=fake_client):
+        # 1) Rule-upgrade crawl (non-forced): should resync despite recent last_video_sync_ts
+        res1 = asyncio.run(service.run_crawl(force_sync_videos=False))
+        assert res1["status"] == "success"
+        assert res1["video_count"] == 1
+        assert res1["online_viewers_total"] == 6  # 7 - 1
+        assert fake_client.get_all_videos.await_count == 1
+        assert [v["bvid"] for v in db.get_videos(uid)] == ["BV1owned"]
+        assert db.get_setting(f"video_sync_rule_{uid}") == VIDEO_SYNC_RULE
+        assert db.get_setting(f"last_archive_count_{uid}") == "3"
+
+        # 2) Next crawl: archive_count_reported (3) != len(cached_videos) (1),
+        #    but matches last_archive_count (3) -> MUST NOT trigger resync loop!
+        res2 = asyncio.run(service.run_crawl(force_sync_videos=False))
+        assert res2["status"] == "success"
+        assert res2["video_count"] == 1
+        assert fake_client.get_all_videos.await_count == 1
+
+        # 3) Archive count changes (3 -> 4): should trigger resync
+        fake_client.get_account_card.return_value["archive_count"] = 4
+        res3 = asyncio.run(service.run_crawl(force_sync_videos=False))
+        assert res3["status"] == "success"
+        assert fake_client.get_all_videos.await_count == 2
+        assert db.get_setting(f"last_archive_count_{uid}") == "4"
+
+
+def test_collector_purges_all_when_only_non_up_videos_and_skips_metadata_on_error(tmp_path: Path):
+    uid = "3546100000000001"
+    db = Database(db_path=tmp_path / "collector_empty.db")
+    db.update_settings({"uid": uid, "request_delay_ms": "50"})
+    db.upsert_videos(
+        uid,
+        [{"bvid": "BV1collab_only", "aid": 1, "title": "Collab Only", "play_count": 300}],
+    )
+
+    # Failed fetch must NOT update video_sync_rule or purge cached videos
+    failing_client = AsyncMock()
+    failing_client.get_all_videos.side_effect = BilibiliAPIError("temporary error", code=-500)
+    collector = AllVideosOnlineCollector()
+    ctx_fail = CrawlContext(
+        uid=uid,
+        client=failing_client,
+        db=db,
+        settings=db.get_all_settings(),
+        force_sync_videos=True,
+        extra_metrics={"archive_count_reported": 1},
+    )
+    asyncio.run(collector.collect(ctx_fail))
+    assert len(db.get_videos(uid)) == 1
+    assert db.get_setting(f"video_sync_rule_{uid}") == ""
+    assert db.get_setting(f"last_video_sync_ts_{uid}") == ""
+
+    # Successful fetch returning only non-UP video (empty after filtering) purges cache via allow_empty=True
+    clean_client = AsyncMock()
+    clean_client.get_all_videos.return_value = [
+        {"bvid": "BV1collab_only", "aid": 1, "title": "Collab Only", "up_mid": "200002002"}
+    ]
+    ctx_ok = CrawlContext(
+        uid=uid,
+        client=clean_client,
+        db=db,
+        settings=db.get_all_settings(),
+        force_sync_videos=True,
+        extra_metrics={"archive_count_reported": 1},
+    )
+    asyncio.run(collector.collect(ctx_ok))
+    assert db.get_videos(uid) == []
+    assert ctx_ok.video_count == 0
+    assert ctx_ok.online_viewers_total == 0
+    assert db.get_setting(f"video_sync_rule_{uid}") == VIDEO_SYNC_RULE
+    assert db.get_setting(f"last_archive_count_{uid}") == "1"
+
+
+def test_test_connection_filters_non_up_videos(tmp_path: Path):
+    uid = "3546100000000001"
+    db = Database(db_path=tmp_path / "test_conn.db")
+    app = create_app(database=db, enable_scheduler=False)
+
+    async def fake_request(self_client, url, params=None, referer=None, retries=2):
+        if "relation/stat" in url:
+            return {"code": 0, "data": {"follower": 2000, "following": 10}}
+        if "web-interface/card" in url:
+            return {
+                "code": 0,
+                "data": {
+                    "card": {"name": "UP主", "face": "https://example.com/a.jpg"},
+                    "follower": 2000,
+                    "archive_count": 5,
+                },
+            }
+        if "recArchivesByKeywords" in url:
+            assert params["ps"] == 100
+            return {
+                "code": 0,
+                "data": {
+                    "page": {"total": 5},
+                    "archives": [
+                        {"bvid": "BV1collabA", "aid": 1, "title": "Collab A", "upMid": 200002002},
+                        {"bvid": "BV1own1", "aid": 2, "title": "Own 1", "upMid": int(uid)},
+                        {"bvid": "BV1collabB", "aid": 3, "title": "Collab B", "upMid": 200002002},
+                        {"bvid": "BV1own2", "aid": 4, "title": "Own 2", "upMid": int(uid)},
+                        {"bvid": "BV1own3", "aid": 5, "title": "Own 3", "upMid": int(uid)},
+                    ],
+                },
+            }
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    with patch.object(BilibiliClient, "ensure_session_tokens", new=AsyncMock()):
+        with patch.object(BilibiliClient, "_request_json", new=fake_request):
+            with TestClient(app) as client:
+                resp = client.post("/api/test-connection", json={"uid": uid})
+                assert resp.status_code == 200
+                body = resp.json()
+                assert body["ok"] is True
+                assert body["video_total"] == 3
+                assert body["sample_videos"] == [
+                    {"bvid": "BV1own1", "title": "Own 1"},
+                    {"bvid": "BV1own2", "title": "Own 2"},
+                    {"bvid": "BV1own3", "title": "Own 3"},
+                ]
+
+    async def fake_request_large(self_client, url, params=None, referer=None, retries=2):
+        if "recArchivesByKeywords" in url:
+            return {
+                "code": 0,
+                "data": {
+                    "page": {"total": 150},
+                    "archives": [
+                        {"bvid": "BV1collabX", "aid": 10, "title": "Collab X", "upMid": 999},
+                        {"bvid": "BV1ownX", "aid": 11, "title": "Own X", "upMid": int(uid)},
+                    ],
+                },
+            }
+        return await fake_request(self_client, url, params=params, referer=referer, retries=retries)
+
+    with patch.object(BilibiliClient, "ensure_session_tokens", new=AsyncMock()):
+        with patch.object(BilibiliClient, "_request_json", new=fake_request_large):
+            with TestClient(app) as client:
+                resp = client.post("/api/test-connection", json={"uid": uid})
+                assert resp.status_code == 200
+                body = resp.json()
+                assert body["ok"] is True
+                assert body["video_total"] == 150
+                assert body["sample_videos"] == [{"bvid": "BV1ownX", "title": "Own X"}]
+
+
+def test_online_count_subtracts_one_per_cid_and_clamps_to_zero(tmp_path: Path):
+    db = Database(db_path=tmp_path / "clamp.db")
+    db.update_settings({"uid": "123456", "request_delay_ms": "50"})
+    db.upsert_videos(
+        "123456",
+        [
+            {"bvid": "BV1zero", "aid": 1, "title": "Zero", "cids": [{"cid": 1, "page": 1, "part": "P1"}]},
+            {"bvid": "BV1one", "aid": 2, "title": "One", "cids": [{"cid": 2, "page": 1, "part": "P1"}]},
+            {
+                "bvid": "BV1multi",
+                "aid": 3,
+                "title": "Multi",
+                "cids": [
+                    {"cid": 3, "page": 1, "part": "P1"},
+                    {"cid": 4, "page": 2, "part": "P2"},
+                ],
+            },
+        ],
+    )
+    db.update_settings(
+        {
+            "last_video_sync_ts_123456": str(int(time.time())),
+            "video_sync_rule_123456": VIDEO_SYNC_RULE,
+        }
+    )
+
+    fake_client = AsyncMock()
+    fake_client.__aenter__.return_value = fake_client
+    fake_client.__aexit__.return_value = None
+    fake_client.get_relation_stat.return_value = {"follower": 100, "following": 1}
+    fake_client.get_account_card.return_value = {
+        "name": "Tester",
+        "face": "",
+        "follower": 100,
+        "archive_count": 3,
+    }
+
+    async def fake_online(bvid: str, cid: int):
+        mapping = {1: (0, "0"), 2: (1, "1"), 3: (1, "1"), 4: (3, "3")}
+        return mapping[cid]
+
+    fake_client.get_video_online_total.side_effect = fake_online
+
+    service = CrawlService(db)
+    with patch("app.bilibili.collectors.BilibiliClient", return_value=fake_client):
+        result = asyncio.run(service.run_crawl(force_sync_videos=False))
+
+    assert result["status"] == "success"
+    assert result["online_viewers_total"] == 2  # 0 + 0 + (0 + 2)
+    videos = {v["bvid"]: v for v in db.get_videos("123456")}
+    assert videos["BV1zero"]["last_online_count"] == 0
+    assert videos["BV1one"]["last_online_count"] == 0
+    assert videos["BV1multi"]["last_online_count"] == 2
+    assert videos["BV1multi"]["last_online_raw"] == "1+3"
+
+
+def test_database_migrates_legacy_online_counts_once(tmp_path: Path):
+    import sqlite3
+
+    db_path = tmp_path / "legacy.db"
+    db = Database(db_path=db_path)
+    # Simulate a legacy database before online_count_rule existed
+    with db.connection() as conn:
+        conn.execute("DELETE FROM settings WHERE key = 'online_count_rule'")
+    db.upsert_videos(
+        "123",
+        [
+            {"bvid": "BV1A", "aid": 1, "title": "A", "cids": [{"cid": 11, "page": 1, "part": "P1"}]},
+            {
+                "bvid": "BV1B",
+                "aid": 2,
+                "title": "B",
+                "cids": [{"cid": 21, "page": 1, "part": "P1"}, {"cid": 22, "page": 2, "part": "P2"}],
+            },
+        ],
+    )
+    db.insert_snapshot(
+        uid="123",
+        follower_count=500,
+        following_count=5,
+        online_viewers_total=14,
+        video_count=2,
+        videos_succeeded=2,
+        extra_metrics={},
+        status="success",
+        error_message=None,
+        duration_ms=100,
+        video_online_items=[
+            {"bvid": "BV1A", "online_count": 1, "online_raw": "1"},
+            {"bvid": "BV1B", "online_count": 13, "online_raw": "8+5"},
+        ],
+    )
+
+    # Re-initializing Database triggers one-time migration
+    migrated = Database(db_path=db_path)
+    latest, _ = migrated.get_latest_two_snapshots("123")
+    assert latest is not None
+    assert latest["online_viewers_total"] == 11  # (1-1) + (8-1) + (5-1)
+    videos = {v["bvid"]: v for v in migrated.get_videos("123")}
+    assert videos["BV1A"]["last_online_count"] == 0
+    assert videos["BV1B"]["last_online_count"] == 11
+    assert migrated.get_video_history("BV1A")[0]["online_count"] == 0
+    assert migrated.get_video_history("BV1B")[0]["online_count"] == 11
+
+    # Re-initializing again must be idempotent (must NOT subtract a second time)
+    migrated_again = Database(db_path=db_path)
+    latest2, _ = migrated_again.get_latest_two_snapshots("123")
+    assert latest2 is not None
+    assert latest2["online_viewers_total"] == 11
+    with sqlite3.connect(db_path) as raw_conn:
+        row = raw_conn.execute("SELECT value FROM settings WHERE key = 'online_count_rule'").fetchone()
+        assert row is not None and row[0] == "minus_1_per_cid_v1"
+
+
+def test_video_history_records_play_count_and_migrates_legacy_schema(tmp_path: Path):
+    import sqlite3
+
+    db_path = tmp_path / "play_hist.db"
+    # Create legacy video_online_snapshots table without play_count column
+    with sqlite3.connect(db_path) as raw_conn:
+        raw_conn.executescript(
+            """
+            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+            CREATE TABLE account_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uid TEXT NOT NULL,
+                collected_at TEXT NOT NULL,
+                collected_at_ts INTEGER NOT NULL,
+                follower_count INTEGER,
+                following_count INTEGER,
+                online_viewers_total INTEGER,
+                video_count INTEGER NOT NULL DEFAULT 0,
+                videos_succeeded INTEGER NOT NULL DEFAULT 0,
+                extra_metrics TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'success',
+                error_message TEXT,
+                duration_ms INTEGER
+            );
+            CREATE TABLE videos (
+                bvid TEXT PRIMARY KEY,
+                uid TEXT NOT NULL,
+                aid INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                pic TEXT NOT NULL DEFAULT '',
+                pubdate INTEGER NOT NULL DEFAULT 0,
+                duration INTEGER NOT NULL DEFAULT 0,
+                play_count INTEGER NOT NULL DEFAULT 0,
+                cids_json TEXT NOT NULL DEFAULT '[]',
+                last_online_count INTEGER NOT NULL DEFAULT 0,
+                last_online_raw TEXT NOT NULL DEFAULT '',
+                last_checked_at TEXT,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE video_online_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_id INTEGER NOT NULL REFERENCES account_snapshots(id) ON DELETE CASCADE,
+                bvid TEXT NOT NULL,
+                online_count INTEGER NOT NULL,
+                online_raw TEXT NOT NULL DEFAULT ''
+            );
+            """
+        )
+
+    db = Database(db_path=db_path)
+    db.upsert_videos("999", [{"bvid": "BV1play", "aid": 10, "title": "Play Test", "play_count": 1200}])
+    db.insert_snapshot(
+        uid="999",
+        follower_count=100,
+        following_count=1,
+        online_viewers_total=8,
+        video_count=1,
+        videos_succeeded=1,
+        extra_metrics={},
+        status="success",
+        error_message=None,
+        duration_ms=50,
+        video_online_items=[{"bvid": "BV1play", "online_count": 8, "online_raw": "8", "play_count": 1250}],
+    )
+
+    app = create_app(database=db, enable_scheduler=False)
+    with TestClient(app) as client:
+        resp = client.get("/api/videos/BV1play/history?limit=10")
+        assert resp.status_code == 200
+        hist = resp.json()["history"]
+        assert len(hist) == 1
+        assert hist[0]["online_count"] == 8
+        assert hist[0]["play_count"] == 1250
+
+
+def test_multi_account_crud_and_switching(tmp_path: Path):
+    db = Database(db_path=tmp_path / "multi_acc.db")
+    app = create_app(database=db, enable_scheduler=False)
+
+    with TestClient(app) as client:
+        # Initially empty
+        res0 = client.get("/api/accounts")
+        assert res0.status_code == 200
+        assert res0.json() == {"active_uid": "", "accounts": []}
+
+        # Invalid UID rejected
+        bad = client.post("/api/accounts", json={"uid": "not_digits"})
+        assert bad.status_code == 400
+
+        # Configure global cookie once; all accounts inherit it across switches/deletions
+        set_global = client.put("/api/settings", json={"cookie": "SESSDATA=global_shared_12345"})
+        assert set_global.status_code == 200
+        assert set_global.json()["has_cookie"] is True
+
+        # Add first account without per-account cookie
+        add1 = client.post(
+            "/api/accounts",
+            json={"uid": "10001", "enabled": True},
+        )
+        assert add1.status_code == 200
+        assert add1.json()["active_uid"] == "10001"
+        assert len(add1.json()["accounts"]) == 1
+        assert add1.json()["accounts"][0]["has_cookie"] is True
+
+        # Duplicate rejected
+        dup = client.post("/api/accounts", json={"uid": "10001"})
+        assert dup.status_code == 409
+
+        # Add second account and keep active on it; global cookie remains active
+        add2 = client.post(
+            "/api/accounts",
+            json={"uid": "20002", "cookie": "", "enabled": True, "set_active": True},
+        )
+        assert add2.status_code == 200
+        assert add2.json()["active_uid"] == "20002"
+        assert [a["uid"] for a in add2.json()["accounts"]] == ["10001", "20002"]
+        assert all(a["has_cookie"] is True for a in add2.json()["accounts"])
+
+        # Seed distinct snapshots for each UID
+        db.insert_snapshot(
+            uid="10001",
+            follower_count=1111,
+            following_count=10,
+            online_viewers_total=22,
+            video_count=1,
+            videos_succeeded=1,
+            extra_metrics={},
+            status="success",
+            error_message=None,
+            duration_ms=50,
+            video_online_items=[],
+        )
+        db.insert_snapshot(
+            uid="20002",
+            follower_count=2222,
+            following_count=20,
+            online_viewers_total=44,
+            video_count=2,
+            videos_succeeded=2,
+            extra_metrics={},
+            status="success",
+            error_message=None,
+            duration_ms=60,
+            video_online_items=[],
+        )
+
+        # Dashboard query for explicit uid vs active uid
+        dash2 = client.get("/api/dashboard?hours=24")
+        assert dash2.status_code == 200
+        assert dash2.json()["settings"]["uid"] == "20002"
+        assert dash2.json()["latest"]["follower_count"] == 2222
+        assert len(dash2.json()["accounts"]) == 2
+
+        dash1_explicit = client.get("/api/dashboard?hours=24&uid=10001")
+        assert dash1_explicit.status_code == 200
+        assert dash1_explicit.json()["settings"]["uid"] == "10001"
+        assert dash1_explicit.json()["latest"]["follower_count"] == 1111
+
+        # Activate account 10001
+        act = client.post("/api/accounts/10001/activate")
+        assert act.status_code == 200
+        assert act.json()["active_uid"] == "10001"
+        assert client.get("/api/settings").json()["uid"] == "10001"
+        assert client.get("/api/settings").json()["has_cookie"] is True
+
+        # Update account 20002 enabled flag
+        upd = client.put("/api/accounts/20002", json={"enabled": False})
+        assert upd.status_code == 200
+        assert upd.json()["account"]["enabled"] is False
+
+        # Delete active account 10001 with delete_data=True -> falls back to 20002 and keeps global cookie
+        dlt = client.delete("/api/accounts/10001?delete_data=true")
+        assert dlt.status_code == 200
+        assert dlt.json()["active_uid"] == "20002"
+        assert client.get("/api/settings").json()["has_cookie"] is True
+        assert db.count_snapshots("10001") == 0
+        assert db.count_snapshots("20002") == 1
+
+
+def test_legacy_single_account_migrates_to_monitored_accounts(tmp_path: Path):
+    import sqlite3
+
+    db_path = tmp_path / "legacy_single.db"
+    with sqlite3.connect(db_path) as raw_conn:
+        raw_conn.executescript(
+            """
+            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+            INSERT INTO settings (key, value, updated_at) VALUES
+                ('uid', '888888', '2026-01-01T00:00:00Z'),
+                ('account_name', '老账号', '2026-01-01T00:00:00Z'),
+                ('account_face', 'https://example.com/old.jpg', '2026-01-01T00:00:00Z'),
+                ('cookie', 'SESSDATA=legacy_cookie_9999', '2026-01-01T00:00:00Z'),
+                ('enabled', 'true', '2026-01-01T00:00:00Z');
+            """
+        )
+
+    db = Database(db_path=db_path)
+    accounts = db.get_accounts_summary()
+    assert len(accounts) == 1
+    assert accounts[0]["uid"] == "888888"
+    assert accounts[0]["account_name"] == "老账号"
+    assert accounts[0]["has_cookie"] is True
+    assert accounts[0]["enabled"] is True
+
+
+def test_crawl_all_crawls_enabled_accounts_with_isolated_cookies_and_profiles(tmp_path: Path):
+    db = Database(db_path=tmp_path / "crawl_all.db")
+    db.create_account("101", cookie="SESSDATA=cookie_101", enabled=True, set_active=True)
+    db.create_account("202", cookie="SESSDATA=cookie_202", enabled=True, set_active=False)
+    db.create_account("303", cookie="SESSDATA=cookie_303", enabled=False, set_active=False)
+
+    seen_cookies: dict[str, str] = {}
+
+    def make_client(cookie: str = "", **kwargs):
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.__aexit__.return_value = None
+
+        async def get_relation_stat(uid: str):
+            seen_cookies[uid] = cookie
+            return {"follower": 1000 if uid == "101" else 2000, "following": 5}
+
+        async def get_account_card(uid: str):
+            return {
+                "name": f"UP_{uid}",
+                "face": f"https://example.com/{uid}.jpg",
+                "follower": 1000 if uid == "101" else 2000,
+                "archive_count": 1,
+            }
+
+        async def get_all_videos(uid: str):
+            return [
+                {
+                    "bvid": f"BV1_{uid}",
+                    "aid": int(uid),
+                    "title": f"Video {uid}",
+                    "pic": "",
+                    "pubdate": 100,
+                    "duration": 60,
+                    "play_count": 500,
+                    "up_mid": uid,
+                }
+            ]
+
+        async def get_video_cids(bvid: str):
+            return [{"cid": int(bvid.split("_")[1]) * 10, "page": 1, "part": "P1"}]
+
+        async def get_video_online_total(bvid: str, cid: int):
+            return (11, "11") if bvid == "BV1_101" else (21, "21")
+
+        client.get_relation_stat.side_effect = get_relation_stat
+        client.get_account_card.side_effect = get_account_card
+        client.get_all_videos.side_effect = get_all_videos
+        client.get_video_cids.side_effect = get_video_cids
+        client.get_video_online_total.side_effect = get_video_online_total
+        return client
+
+    service = CrawlService(db)
+    with patch("app.bilibili.collectors.BilibiliClient", side_effect=make_client):
+        res = asyncio.run(service.run_crawl_all(force_sync_videos=True))
+
+    assert res["skipped"] is False
+    assert res["total"] == 2
+    assert seen_cookies == {"101": "SESSDATA=cookie_101", "202": "SESSDATA=cookie_202"}
+
+    summaries = {a["uid"]: a for a in db.get_accounts_summary()}
+    assert summaries["101"]["account_name"] == "UP_101"
+    assert summaries["101"]["latest_follower_count"] == 1000
+    assert summaries["101"]["latest_online_viewers_total"] == 10
+    assert summaries["202"]["account_name"] == "UP_202"
+    assert summaries["202"]["latest_follower_count"] == 2000
+    assert summaries["202"]["latest_online_viewers_total"] == 20
+    assert summaries["303"]["latest_follower_count"] is None
+
+    # Active account 101 settings must NOT be overwritten by 202's profile
+    assert db.get_public_settings()["account_name"] == "UP_101"
+
+
+def test_account_reorder_persists_sort_order_and_crawl_order(tmp_path: Path):
+    db = Database(db_path=tmp_path / "reorder.db")
+    app = create_app(database=db, enable_scheduler=False)
+
+    with TestClient(app) as client:
+        for uid, set_active in [("10001", True), ("20002", False), ("30003", False)]:
+            resp = client.post(
+                "/api/accounts",
+                json={"uid": uid, "enabled": True, "set_active": set_active},
+            )
+            assert resp.status_code == 200
+
+        initial = client.get("/api/accounts").json()["accounts"]
+        assert [a["uid"] for a in initial] == ["10001", "20002", "30003"]
+
+        # Invalid UID rejected
+        bad = client.put("/api/accounts/reorder", json={"uids": ["10001", "invalid"]})
+        assert bad.status_code == 400
+
+        # Reorder accounts
+        reordered = client.put(
+            "/api/accounts/reorder",
+            json={"uids": ["30003", "10001", "20002", "30003"]},
+        )
+        assert reordered.status_code == 200
+        body = reordered.json()
+        assert body["active_uid"] == "10001"
+        assert [a["uid"] for a in body["accounts"]] == ["30003", "10001", "20002"]
+        assert [a["sort_order"] for a in body["accounts"]] == [0, 1, 2]
+
+        # Persists across subsequent GET /api/accounts, GET /api/dashboard, and enabled crawl order
+        listed = client.get("/api/accounts").json()["accounts"]
+        assert [a["uid"] for a in listed] == ["30003", "10001", "20002"]
+
+        dash = client.get("/api/dashboard?hours=24").json()
+        assert [a["uid"] for a in dash["accounts"]] == ["30003", "10001", "20002"]
+        assert [a["uid"] for a in db.get_enabled_accounts()] == ["30003", "10001", "20002"]
+
+        # Partial list keeps omitted existing accounts after the specified ones
+        partial = client.put("/api/accounts/reorder", json={"uids": ["20002"]})
+        assert partial.status_code == 200
+        assert [a["uid"] for a in partial.json()["accounts"]] == ["20002", "30003", "10001"]
+
+        # Deleting active account (10001) falls back to the first account in sorted order (20002)
+        dlt = client.delete("/api/accounts/10001")
+        assert dlt.status_code == 200
+        assert dlt.json()["active_uid"] == "20002"
+
+
+def test_run_crawl_wait_queues_behind_active_crawl(tmp_path: Path):
+    db = Database(db_path=tmp_path / "queue.db")
+    db.create_account("101", enabled=True, set_active=True)
+    db.create_account("202", enabled=True, set_active=False)
+
+    def make_client(cookie: str = "", **kwargs):
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.__aexit__.return_value = None
+
+        async def get_relation_stat(uid: str):
+            if uid == "101":
+                await asyncio.sleep(0.05)
+            return {"follower": int(uid) * 10, "following": 1}
+
+        async def get_account_card(uid: str):
+            return {
+                "name": f"UP_{uid}",
+                "face": f"https://example.com/{uid}.jpg",
+                "follower": int(uid) * 10,
+                "archive_count": 0,
+            }
+
+        client.get_relation_stat.side_effect = get_relation_stat
+        client.get_account_card.side_effect = get_account_card
+        client.get_all_videos.return_value = []
+        return client
+
+    service = CrawlService(db)
+
+    async def scenario():
+        t1 = asyncio.create_task(service.run_crawl(uid="101", force_sync_videos=True, wait=True))
+        await asyncio.sleep(0.01)
+        assert service.is_crawling is True
+        t2 = asyncio.create_task(service.run_crawl(uid="202", force_sync_videos=True, wait=True))
+        return await asyncio.gather(t1, t2)
+
+    with patch("app.bilibili.collectors.BilibiliClient", side_effect=make_client):
+        r1, r2 = asyncio.run(scenario())
+
+    assert r1["skipped"] is False
+    assert r2["skipped"] is False
+    summaries = {a["uid"]: a for a in db.get_accounts_summary()}
+    assert summaries["101"]["latest_follower_count"] == 1010
+    assert summaries["202"]["latest_follower_count"] == 2020
+    assert summaries["202"]["account_name"] == "UP_202"
+
+
+def test_scheduler_reschedule_preserves_existing_countdown(tmp_path: Path):
+    from app.scheduler import JOB_ID, SchedulerManager
+
+    db = Database(db_path=tmp_path / "sched.db")
+    db.create_account("101", enabled=True, set_active=True)
+    service = CrawlService(db)
+    mgr = SchedulerManager(db, service)
+
+    async def scenario():
+        mgr.start()
+        try:
+            job_before = mgr.scheduler.get_job(JOB_ID)
+            assert job_before is not None
+            next_before = job_before.next_run_time
+
+            # Adding another account with same interval_minutes must NOT reset next_run_time
+            db.create_account("202", enabled=True, set_active=False)
+            mgr.reschedule()
+            job_after = mgr.scheduler.get_job(JOB_ID)
+            assert job_after is not None
+            assert job_after.next_run_time == next_before
+
+            # Changing interval_minutes MUST reschedule with new interval
+            db.update_settings({"interval_minutes": "10"})
+            mgr.reschedule()
+            job_changed = mgr.scheduler.get_job(JOB_ID)
+            assert job_changed is not None
+            assert int(job_changed.trigger.interval.total_seconds()) == 600
+        finally:
+            mgr.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_global_cookie_shared_across_accounts_and_test_connection(tmp_path: Path):
+    db = Database(db_path=tmp_path / "global_cookie.db")
+    app = create_app(database=db, enable_scheduler=False)
+
+    seen_crawl_cookies: dict[str, str] = {}
+    seen_test_cookies: list[str] = []
+
+    def make_crawl_client(cookie: str = "", **kwargs):
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.__aexit__.return_value = None
+
+        async def get_relation_stat(uid: str):
+            seen_crawl_cookies[uid] = cookie
+            return {"follower": 100, "following": 1}
+
+        async def get_account_card(uid: str):
+            return {"name": f"UP_{uid}", "face": "", "follower": 100, "archive_count": 0}
+
+        client.get_relation_stat.side_effect = get_relation_stat
+        client.get_account_card.side_effect = get_account_card
+        client.get_all_videos.return_value = []
+        return client
+
+    def make_test_client(cookie: str = "", **kwargs):
+        seen_test_cookies.append(cookie)
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.__aexit__.return_value = None
+        client.get_relation_stat.return_value = {"follower": 123, "following": 4}
+        client.get_account_card.return_value = {"name": "UP_202", "face": "", "follower": 123, "archive_count": 0}
+        client.get_videos_page_series.return_value = ([], 0)
+        return client
+
+    with TestClient(app) as client:
+        assert client.post("/api/accounts", json={"uid": "101", "enabled": True}).status_code == 200
+        assert client.post("/api/accounts", json={"uid": "202", "enabled": True}).status_code == 200
+        assert client.put("/api/settings", json={"cookie": "SESSDATA=shared_global_abc"}).status_code == 200
+
+        service = CrawlService(db)
+        with patch("app.bilibili.collectors.BilibiliClient", side_effect=make_crawl_client):
+            res = asyncio.run(service.run_crawl_all(force_sync_videos=True))
+        assert res["skipped"] is False
+        assert seen_crawl_cookies == {
+            "101": "SESSDATA=shared_global_abc",
+            "202": "SESSDATA=shared_global_abc",
+        }
+
+        with patch("app.routers.settings.BilibiliClient", side_effect=make_test_client):
+            test_resp = client.post("/api/test-connection", json={"uid": "202"})
+        assert test_resp.status_code == 200
+        assert test_resp.json()["ok"] is True
+        assert seen_test_cookies == ["SESSDATA=shared_global_abc"]
+
+        # Clearing global cookie clears it for all accounts
+        clr = client.put("/api/settings", json={"cookie": ""})
+        assert clr.status_code == 200
+        assert clr.json()["has_cookie"] is False
+        accs = client.get("/api/accounts").json()["accounts"]
+        assert all(a["has_cookie"] is False for a in accs)
+
+
+def test_database_migrates_legacy_account_cookie_to_global(tmp_path: Path):
+    import sqlite3
+
+    db_path = tmp_path / "legacy_acc_cookie.db"
+    db = Database(db_path=db_path)
+    # Simulate a legacy DB state before global_cookie_migrated_v1 existed
+    with db.connection() as conn:
+        conn.execute("DELETE FROM settings WHERE key = 'global_cookie_migrated_v1'")
+        conn.execute("UPDATE settings SET value = '' WHERE key = 'cookie'")
+        conn.execute(
+            """
+            INSERT INTO monitored_accounts (
+                uid, account_name, account_face, cookie, enabled, sort_order, created_at, updated_at
+            ) VALUES ('101', 'A', '', 'SESSDATA=from_acc_101', 1, 0, '2026-01-01', '2026-01-01'),
+                     ('202', 'B', '', '', 1, 1, '2026-01-01', '2026-01-01')
+            """
+        )
+
+    migrated = Database(db_path=db_path)
+    assert migrated.get_public_settings()["has_cookie"] is True
+    assert migrated.get_effective_cookie("101") == "SESSDATA=from_acc_101"
+    assert migrated.get_effective_cookie("202") == "SESSDATA=from_acc_101"
+
+    # Legacy per-account cookie was cleared so global clear affects all accounts
+    migrated.update_settings({"cookie": ""})
+    assert migrated.get_effective_cookie("101") == ""
+    assert migrated.get_effective_cookie("202") == ""
+    with sqlite3.connect(db_path) as raw_conn:
+        row = raw_conn.execute("SELECT cookie FROM monitored_accounts WHERE uid = '101'").fetchone()
+        assert row is not None and row[0] == ""
+
+
+def test_follower_daily_changes_beijing_natural_days(tmp_path: Path):
+    from datetime import datetime, timedelta, timezone
+
+    bjt = timezone(timedelta(hours=8))
+    db = Database(db_path=tmp_path / "daily.db")
+    uid = "3546100000000001"
+
+    def insert_at(dt_bjt: datetime, followers: int | None):
+        db.insert_snapshot(
+            uid=uid,
+            follower_count=followers,
+            following_count=10,
+            online_viewers_total=20,
+            video_count=1,
+            videos_succeeded=1,
+            extra_metrics={},
+            status="success" if followers is not None else "failed",
+            error_message=None,
+            duration_ms=50,
+            video_online_items=[],
+            collected_at=dt_bjt,
+        )
+
+    # Now = 2026-11-18 13:50:00 BJT (UTC+8)
+    now_bjt = datetime(2026, 11, 18, 13, 50, 0, tzinfo=bjt)
+    now_ts = int(now_bjt.timestamp())
+
+    # Empty uid / no snapshots
+    empty_res = db.get_follower_daily_changes("", now_ts=now_ts)
+    assert empty_res == {
+        "yesterday": None,
+        "today": None,
+        "yesterday_date": "2026-11-17",
+        "today_date": "2026-11-18",
+        "timezone": "Asia/Shanghai",
+    }
+    assert db.get_follower_daily_changes(uid, now_ts=now_ts)["today"] is None
+
+    # 1. Single snapshot today only -> today change is None (establishing baseline)
+    insert_at(datetime(2026, 11, 18, 0, 34, 0, tzinfo=bjt), 19977)
+    res_one = db.get_follower_daily_changes(uid, now_ts=now_ts)
+    assert res_one["yesterday"] is None
+    assert res_one["today"] is None
+
+    # 2. Second snapshot today (still no yesterday data) -> today = 20343 - 19977 = +366
+    insert_at(datetime(2026, 11, 18, 13, 42, 0, tzinfo=bjt), 20343)
+    res_today_only = db.get_follower_daily_changes(uid, now_ts=now_ts)
+    assert res_today_only["yesterday"] is None
+    assert res_today_only["today"] == 366
+
+    # 3. Add yesterday snapshots (2026-11-17 01:00 and 23:55 BJT, which spans UTC date boundary!)
+    # Note: 2026-11-17 01:00 BJT == 2026-11-16 17:00 UTC, 2026-11-17 23:55 BJT == 2026-11-17 15:55 UTC
+    insert_at(datetime(2026, 11, 17, 1, 0, 0, tzinfo=bjt), 19800)
+    insert_at(datetime(2026, 11, 17, 23, 55, 0, tzinfo=bjt), 19970)
+    # Failed snapshot today with None follower_count should be ignored
+    insert_at(datetime(2026, 11, 18, 13, 45, 0, tzinfo=bjt), None)
+    res_two_days = db.get_follower_daily_changes(uid, now_ts=now_ts)
+    # Yesterday has no 2026-11-16 close -> uses yesterday first->last: 19970 - 19800 = 170
+    assert res_two_days["yesterday"] == 170
+    # Today uses yesterday close (19970) -> today last (20343): 20343 - 19970 = 373
+    assert res_two_days["today"] == 373
+
+    # 4. Add 2026-11-16 close (23:50 BJT) -> yesterday uses 2026-11-16 close (19750) -> 19970 - 19750 = 220
+    insert_at(datetime(2026, 11, 16, 23, 50, 0, tzinfo=bjt), 19750)
+    res_three_days = db.get_follower_daily_changes(uid, now_ts=now_ts)
+    assert res_three_days["yesterday"] == 220
+    assert res_three_days["today"] == 373
+
+    # 5. Boundary check: 2026-11-18 07:30 BJT (still 2026-11-17 23:30 UTC!) belongs to 2026-11-18 BJT
+    db2 = Database(db_path=tmp_path / "utc_boundary.db")
+    db2.insert_snapshot(
+        uid=uid,
+        follower_count=1000,
+        following_count=1,
+        online_viewers_total=0,
+        video_count=0,
+        videos_succeeded=0,
+        extra_metrics={},
+        status="success",
+        error_message=None,
+        duration_ms=10,
+        video_online_items=[],
+        collected_at=datetime(2026, 11, 18, 0, 5, 0, tzinfo=bjt),  # 2026-11-17 16:05 UTC
+    )
+    db2.insert_snapshot(
+        uid=uid,
+        follower_count=988,
+        following_count=1,
+        online_viewers_total=0,
+        video_count=0,
+        videos_succeeded=0,
+        extra_metrics={},
+        status="success",
+        error_message=None,
+        duration_ms=10,
+        video_online_items=[],
+        collected_at=datetime(2026, 11, 18, 7, 30, 0, tzinfo=bjt),  # 2026-11-17 23:30 UTC
+    )
+    res_neg = db2.get_follower_daily_changes(
+        uid, now_ts=int(datetime(2026, 11, 18, 8, 0, 0, tzinfo=bjt).timestamp())
+    )
+    assert res_neg["yesterday"] is None
+    assert res_neg["today"] == -12
+
+
+def test_dashboard_api_returns_follower_daily_independent_of_hours_filter(tmp_path: Path):
+    from datetime import datetime, timedelta, timezone
+
+    bjt = timezone(timedelta(hours=8))
+    db = Database(db_path=tmp_path / "dash_daily.db")
+    app = create_app(database=db, enable_scheduler=False)
+
+    now_bjt = datetime.now(timezone.utc).astimezone(bjt)
+    today_00_10 = now_bjt.replace(hour=0, minute=10, second=0, microsecond=0)
+    yesterday_12_00 = today_00_10 - timedelta(hours=12, minutes=10)
+    yesterday_23_50 = today_00_10 - timedelta(minutes=20)
+    day_before_23_50 = yesterday_12_00 - timedelta(hours=12)
+
+    with TestClient(app) as client:
+        assert client.post("/api/accounts", json={"uid": "998877", "enabled": True}).status_code == 200
+        for dt, followers in [
+            (day_before_23_50, 5000),
+            (yesterday_12_00, 5050),
+            (yesterday_23_50, 5120),
+            (today_00_10, 5135),
+            (now_bjt, 5160),
+        ]:
+            db.insert_snapshot(
+                uid="998877",
+                follower_count=followers,
+                following_count=10,
+                online_viewers_total=5,
+                video_count=1,
+                videos_succeeded=1,
+                extra_metrics={},
+                status="success",
+                error_message=None,
+                duration_ms=20,
+                video_online_items=[],
+                collected_at=dt,
+            )
+
+        # Even with hours=1, yesterday & today BJT natural day stats remain complete
+        dash = client.get("/api/dashboard?hours=1")
+        assert dash.status_code == 200
+        daily = dash.json()["follower_daily"]
+        assert daily["yesterday"] == 120
+        assert daily["today"] == 40
+        assert daily["timezone"] == "Asia/Shanghai"
+        assert daily["today_date"] == now_bjt.strftime("%Y-%m-%d")
+
+        html_resp = client.get("/")
+        assert html_resp.status_code == 200
+        assert "kpiFollowersYesterday" in html_resp.text
+        assert "kpiFollowersToday" in html_resp.text
+        assert "followerDailyPanel" in html_resp.text
+
+
+def test_video_history_hours_filter_and_downsampling(tmp_path: Path):
+    from datetime import datetime, timedelta, timezone
+
+    db = Database(db_path=tmp_path / "video_hours.db")
+    db.update_settings({"uid": "556677"})
+    db.upsert_videos(
+        "556677",
+        [{"bvid": "BV1win", "aid": 2001, "title": "Window Video", "play_count": 5000}],
+    )
+
+    now = datetime.now(timezone.utc).astimezone()
+    # Insert 400 points over ~40 hours (every 6 minutes) with a distinct historical peak at -20h
+    for idx in range(400):
+        dt = now - timedelta(minutes=(399 - idx) * 6)
+        online = 180 if idx == 199 else 10 + (idx % 15)
+        plays = 1000 + idx * 10
+        db.insert_snapshot(
+            uid="556677",
+            follower_count=100,
+            following_count=1,
+            online_viewers_total=online,
+            video_count=1,
+            videos_succeeded=1,
+            extra_metrics={},
+            status="success",
+            error_message=None,
+            duration_ms=20,
+            video_online_items=[
+                {
+                    "bvid": "BV1win",
+                    "online_count": online,
+                    "online_raw": str(online),
+                    "play_count": plays,
+                }
+            ],
+            collected_at=dt,
+        )
+
+    app = create_app(database=db, enable_scheduler=False)
+    with TestClient(app) as client:
+        # 1-hour window: ~10 recent points, no -20h peak
+        r_1h = client.get("/api/videos/BV1win/history?hours=1")
+        assert r_1h.status_code == 200
+        h_1h = r_1h.json()["history"]
+        assert 9 <= len(h_1h) <= 12
+        assert max(pt["online_count"] for pt in h_1h) < 30
+        assert h_1h[-1]["play_count"] - h_1h[0]["play_count"] == (len(h_1h) - 1) * 10
+
+        # 6-hour window: ~60 points
+        r_6h = client.get("/api/videos/BV1win/history?hours=6")
+        assert r_6h.status_code == 200
+        h_6h = r_6h.json()["history"]
+        assert 59 <= len(h_6h) <= 62
+        assert max(pt["online_count"] for pt in h_6h) < 30
+
+        # 24-hour window: ~240 points, includes the -20h peak of 180
+        r_24h = client.get("/api/videos/BV1win/history?hours=24")
+        assert r_24h.status_code == 200
+        h_24h = r_24h.json()["history"]
+        assert 238 <= len(h_24h) <= 242
+        assert max(pt["online_count"] for pt in h_24h) == 180
+
+        # All-time window (hours=0): 400 points downsampled, still preserves first/last play & peak
+        r_all = client.get("/api/videos/BV1win/history?hours=0")
+        assert r_all.status_code == 200
+        h_all = r_all.json()["history"]
+        assert len(h_all) <= 330
+        assert h_all[0]["play_count"] == 1000
+        assert h_all[-1]["play_count"] == 4990
+        assert max(pt["online_count"] for pt in h_all) == 180
+
+        # Modal time-window toolbar markup present in index.html
+        html_resp = client.get("/")
+        assert html_resp.status_code == 200
+        assert 'id="modalRangeGroup"' in html_resp.text
+        for h in ("1", "6", "24", "168", "720", "0"):
+            assert f'data-hours="{h}"' in html_resp.text
+
+
+def test_admin_password_db_auth_flow_and_protection(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("BILI_ADMIN_PASSWORD", raising=False)
+    db = Database(db_path=tmp_path / "admin_db.db")
+    app = create_app(database=db, enable_scheduler=False)
+
+    with TestClient(app) as client:
+        # Initially no admin password is set
+        status0 = client.get("/api/admin/status")
+        assert status0.status_code == 200
+        assert status0.json() == {"enabled": False, "authenticated": True, "source": "none"}
+
+        # Set admin password via settings
+        put_pw = client.put(
+            "/api/settings",
+            json={"uid": "100001001", "admin_password": "secret-pass-01"},
+        )
+        assert put_pw.status_code == 200
+        body_pw = put_pw.json()
+        assert body_pw["admin_auth"] == {
+            "enabled": True,
+            "authenticated": False,
+            "source": "db",
+        }
+        assert "secret-pass-01" not in put_pw.text
+        assert "admin_password_hash" not in put_pw.text
+
+        # Read-only endpoints remain accessible
+        dash = client.get("/api/dashboard?hours=24")
+        assert dash.status_code == 200
+        assert dash.json()["admin_auth"] == {
+            "enabled": True,
+            "authenticated": False,
+            "source": "db",
+        }
+        assert client.get("/api/accounts").status_code == 200
+        assert client.get("/api/health").status_code == 200
+
+        # Protected config & account endpoints reject unauthenticated requests
+        assert client.get("/api/settings").status_code == 401
+        assert client.put("/api/settings", json={"interval_minutes": 10}).status_code == 401
+        assert client.post("/api/accounts", json={"uid": "123456"}).status_code == 401
+        assert client.put("/api/accounts/100001001", json={"enabled": False}).status_code == 401
+        assert client.put("/api/accounts/reorder", json={"uids": ["100001001"]}).status_code == 401
+        assert client.post("/api/accounts/100001001/activate").status_code == 401
+        assert client.delete("/api/accounts/100001001").status_code == 401
+        assert client.post("/api/test-connection", json={"uid": "100001001"}).status_code == 401
+        assert client.post("/api/crawl/now").status_code == 401
+
+        # Wrong password returns 401
+        bad_verify = client.post("/api/admin/verify", json={"password": "wrong"})
+        assert bad_verify.status_code == 401
+
+        # Correct password sets HttpOnly session cookie and unlocks endpoints
+        ok_verify = client.post("/api/admin/verify", json={"password": "secret-pass-01"})
+        assert ok_verify.status_code == 200
+        assert ok_verify.json() == {
+            "ok": True,
+            "enabled": True,
+            "authenticated": True,
+            "source": "db",
+        }
+        assert "bilipulse_admin_session" in ok_verify.cookies
+
+        assert client.get("/api/settings").status_code == 200
+        assert client.post("/api/accounts", json={"uid": "123456", "enabled": True}).status_code == 200
+        assert client.put("/api/settings", json={"interval_minutes": 10}).status_code == 200
+
+        # Logout locks session again
+        logout_resp = client.post("/api/admin/logout")
+        assert logout_resp.status_code == 200
+        assert logout_resp.json()["authenticated"] is False
+        assert client.get("/api/settings").status_code == 401
+
+        # Re-verify and clear DB password
+        assert client.post("/api/admin/verify", json={"password": "secret-pass-01"}).status_code == 200
+        clear_resp = client.put("/api/settings", json={"admin_password": ""})
+        assert clear_resp.status_code == 200
+        assert clear_resp.json()["admin_auth"] == {
+            "enabled": False,
+            "authenticated": True,
+            "source": "none",
+        }
+        assert client.get("/api/settings").status_code == 200
+
+        # Frontend HTML exposes centered admin auth dialog and password toggle
+        html_resp = client.get("/")
+        assert html_resp.status_code == 200
+        assert "adminAuthModal" in html_resp.text
+        assert "adminAuthForm" in html_resp.text
+        assert "adminAuthInput" in html_resp.text
+        assert "btnToggleAdminAuthPassword" in html_resp.text
+        assert "inputAdminPassword" in html_resp.text
+
+
+def test_admin_password_env_precedence_rate_limit_and_invalidation(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("BILI_ADMIN_PASSWORD", "env-master-2026")
+    db = Database(db_path=tmp_path / "admin_env.db")
+    app = create_app(database=db, enable_scheduler=False)
+
+    with TestClient(app) as client:
+        status = client.get("/api/admin/status").json()
+        assert status == {"enabled": True, "authenticated": False, "source": "env"}
+
+        assert client.post("/api/accounts", json={"uid": "555555"}).status_code == 401
+        assert client.post("/api/admin/verify", json={"password": "env-master-2026"}).status_code == 200
+
+        # Env-managed password cannot be modified or cleared via web settings API
+        override_resp = client.put("/api/settings", json={"admin_password": "new-pw"})
+        assert override_resp.status_code == 400
+
+        # Changing BILI_ADMIN_PASSWORD invalidates existing session cookies automatically
+        monkeypatch.setenv("BILI_ADMIN_PASSWORD", "env-master-rotated")
+        assert client.get("/api/settings").status_code == 401
+
+        # Rate limiter blocks after 5 consecutive failed attempts
+        for _ in range(5):
+            r = client.post("/api/admin/verify", json={"password": "bad-guess"})
+            assert r.status_code == 401
+        locked = client.post("/api/admin/verify", json={"password": "env-master-rotated"})
+        assert locked.status_code == 429
+
+
+def test_default_admin_password_none_and_env_seed(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("BILI_ADMIN_PASSWORD", raising=False)
+    monkeypatch.delenv("BILI_DEFAULT_ADMIN_PASSWORD", raising=False)
+
+    # 1) Out of the box with no env vars -> no password seeded
+    unseeded_db = Database(db_path=tmp_path / "unseeded.db")
+    unseeded_app = create_app(database=unseeded_db, enable_scheduler=False)
+    with TestClient(unseeded_app) as client0:
+        assert client0.get("/api/admin/status").json() == {
+            "enabled": False,
+            "authenticated": True,
+            "source": "none",
+        }
+        assert client0.get("/api/settings").status_code == 200
+
+    # 2) When BILI_DEFAULT_ADMIN_PASSWORD is set -> seeds initial DB password once
+    monkeypatch.setenv("BILI_DEFAULT_ADMIN_PASSWORD", "seeded-admin-pass")
+    db_path = tmp_path / "default_pw.db"
+    db = Database(db_path=db_path)
+    app = create_app(database=db, enable_scheduler=False)
+
+    with TestClient(app) as client:
+        status = client.get("/api/admin/status").json()
+        assert status == {"enabled": True, "authenticated": False, "source": "db"}
+        assert client.get("/api/settings").status_code == 401
+        assert client.post("/api/admin/verify", json={"password": "wrong"}).status_code == 401
+        assert client.post("/api/admin/verify", json={"password": "seeded-admin-pass"}).status_code == 200
+        assert client.get("/api/settings").status_code == 200
+
+        # Clearing password stays cleared across DB re-initialization even if env var remains set
+        assert client.put("/api/settings", json={"admin_password": ""}).status_code == 200
+
+    reloaded_db = Database(db_path=db_path)
+    app2 = create_app(database=reloaded_db, enable_scheduler=False)
+    with TestClient(app2) as client2:
+        assert client2.get("/api/admin/status").json() == {
+            "enabled": False,
+            "authenticated": True,
+            "source": "none",
+        }
+
+
+def test_lazy_database_proxy_defers_init_and_forwards_attributes(tmp_path: Path, monkeypatch):
+    import os
+    import subprocess
+    import sys
+    import threading
+    from app.database import _LazyDatabase
+
+    # 1) Importing app.database and app.main in a fresh process must NOT create DB file
+    sub_db_path = tmp_path / "sub_dir" / "never_touched.db"
+    env = os.environ.copy()
+    env["BILI_DB_PATH"] = str(sub_db_path)
+    env["BILI_DATA_DIR"] = str(tmp_path / "sub_data")
+    env["BILI_DEFAULT_ADMIN_PASSWORD"] = ""
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import app.database, app.main; "
+                "assert repr(app.database.db) == '<_LazyDatabase uninitialized>'; "
+                "print('ok')"
+            ),
+        ],
+        cwd=str(Path(__file__).resolve().parent.parent),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert proc.stdout.strip() == "ok"
+    assert not sub_db_path.exists()
+
+    # 2) Direct _LazyDatabase attribute forwarding & thread-safe single initialization
+    lazy_path = tmp_path / "lazy_dir" / "lazy_unit.db"
+    monkeypatch.setattr("app.database.DB_PATH", lazy_path)
+    lazy = _LazyDatabase()
+    assert not lazy_path.exists()
+    assert repr(lazy) == "<_LazyDatabase uninitialized>"
+    assert object.__getattribute__(lazy, "_instance") is None
+
+    results: list[dict] = []
+    barrier = threading.Barrier(4)
+
+    def _worker() -> None:
+        barrier.wait()
+        results.append(lazy.get_public_settings())
+
+    threads = [threading.Thread(target=_worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(results) == 4
+    assert lazy_path.exists()
+    inst = object.__getattribute__(lazy, "_instance")
+    assert isinstance(inst, Database)
+    assert lazy.db_path == lazy_path
+    assert repr(lazy) == repr(inst)
+
+    lazy.custom_marker = "forwarded"
+    assert inst.custom_marker == "forwarded"
+    assert lazy.custom_marker == "forwarded"
+    del lazy.custom_marker
+    assert not hasattr(lazy, "custom_marker")
+
+
+def test_upsert_videos_preserves_cached_duration_when_incoming_zero(tmp_path: Path):
+    db = Database(db_path=tmp_path / "duration_preserve.db")
+    uid = "100001001"
+
+    db.upsert_videos(
+        uid,
+        [
+            {
+                "bvid": "BV1dur",
+                "aid": 100,
+                "title": "Initial Title",
+                "duration": 185,
+                "play_count": 1000,
+            }
+        ],
+    )
+    v0 = {v["bvid"]: v for v in db.get_videos(uid)}
+    assert v0["BV1dur"]["duration"] == 185
+
+    # Incoming duration=0 (e.g., incomplete fallback item) must NOT clobber cached duration 185
+    db.upsert_videos(
+        uid,
+        [
+            {
+                "bvid": "BV1dur",
+                "aid": 100,
+                "title": "Updated Title",
+                "duration": 0,
+                "play_count": 1500,
+            },
+            {
+                "bvid": "BV1new_zero",
+                "aid": 101,
+                "title": "New Zero Duration",
+                "duration": 0,
+                "play_count": 50,
+            },
+        ],
+    )
+    v1 = {v["bvid"]: v for v in db.get_videos(uid)}
+    assert v1["BV1dur"]["duration"] == 185
+    assert v1["BV1dur"]["title"] == "Updated Title"
+    assert v1["BV1dur"]["play_count"] == 1500
+    assert v1["BV1new_zero"]["duration"] == 0
+
+    # Positive incoming duration updates cached duration normally
+    db.upsert_videos(
+        uid,
+        [
+            {
+                "bvid": "BV1dur",
+                "aid": 100,
+                "title": "Updated Title",
+                "duration": 240,
+                "play_count": 1600,
+            }
+        ],
+    )
+    v2 = {v["bvid"]: v for v in db.get_videos(uid)}
+    assert v2["BV1dur"]["duration"] == 240
+
+
+def test_delete_stale_videos_and_delete_account_purge_orphan_video_snapshots(tmp_path: Path):
+    db = Database(db_path=tmp_path / "orphan_cleanup.db")
+
+    # Verify composite index exists and optimize() runs cleanly
+    with db.connection() as conn:
+        indexes = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+    assert "idx_videos_uid_online_pubdate" in indexes
+    db.optimize()
+
+    db.create_account("10001", enabled=True, set_active=True)
+    db.create_account("20002", enabled=True, set_active=False)
+
+    # Seed > 500 stale videos on 10001 to also exercise chunked SQLite parameter deletion
+    stale_bvids = [f"BV1stale_{idx:03d}" for idx in range(520)]
+    videos_1 = [{"bvid": "BV1keep", "aid": 1, "title": "Keep", "play_count": 100}] + [
+        {"bvid": bvid, "aid": idx + 2, "title": f"Stale {idx}", "play_count": 10}
+        for idx, bvid in enumerate(stale_bvids)
+    ]
+    db.upsert_videos("10001", videos_1)
+    snap_1 = db.insert_snapshot(
+        uid="10001",
+        follower_count=1000,
+        following_count=10,
+        online_viewers_total=521,
+        video_count=521,
+        videos_succeeded=521,
+        extra_metrics={},
+        status="success",
+        error_message=None,
+        duration_ms=80,
+        video_online_items=[
+            {"bvid": v["bvid"], "online_count": 1, "online_raw": "2"} for v in videos_1
+        ],
+    )
+
+    deleted_count = db.delete_stale_videos("10001", {"BV1keep"})
+    assert deleted_count == 520
+    assert [v["bvid"] for v in db.get_videos("10001")] == ["BV1keep"]
+    with db.connection() as conn:
+        remaining_1 = [
+            r["bvid"]
+            for r in conn.execute(
+                "SELECT bvid FROM video_online_snapshots WHERE snapshot_id = ?", (snap_1,)
+            ).fetchall()
+        ]
+    assert remaining_1 == ["BV1keep"]
+
+    # Seed 20002 videos + snapshot, plus an orphan row attached to snap_1 for BV2_orphan
+    db.upsert_videos(
+        "20002",
+        [
+            {"bvid": "BV2_main", "aid": 2001, "title": "Main 2", "play_count": 300},
+            {"bvid": "BV2_orphan", "aid": 2002, "title": "Orphan 2", "play_count": 400},
+        ],
+    )
+    db.insert_snapshot(
+        uid="20002",
+        follower_count=2000,
+        following_count=5,
+        online_viewers_total=9,
+        video_count=2,
+        videos_succeeded=2,
+        extra_metrics={},
+        status="success",
+        error_message=None,
+        duration_ms=50,
+        video_online_items=[
+            {"bvid": "BV2_main", "online_count": 5, "online_raw": "6"},
+            {"bvid": "BV2_orphan", "online_count": 4, "online_raw": "5"},
+        ],
+    )
+    with db.connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO video_online_snapshots (snapshot_id, bvid, online_count, online_raw, play_count)
+            VALUES (?, 'BV2_orphan', 3, '4', 400)
+            """,
+            (snap_1,),
+        )
+
+    res = db.delete_account("20002", delete_data=True)
+    assert res == {"deleted": True, "uid": "20002", "active_uid": "10001"}
+    assert db.count_snapshots("20002") == 0
+    assert db.get_videos("20002") == []
+    with db.connection() as conn:
+        cnt_2 = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM video_online_snapshots WHERE bvid IN ('BV2_main', 'BV2_orphan')"
+        ).fetchone()["cnt"]
+        cnt_keep = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM video_online_snapshots WHERE bvid = 'BV1keep'"
+        ).fetchone()["cnt"]
+    assert cnt_2 == 0
+    assert cnt_keep == 1
+
+
+def test_get_accounts_summary_multi_account_deltas_and_video_count_fallback(tmp_path: Path):
+    from datetime import datetime, timedelta, timezone
+
+    db = Database(db_path=tmp_path / "summary_bulk.db")
+    db.update_settings({"cookie": "SESSDATA=global_cookie_abcdef123456"})
+
+    db.create_account("1001", cookie="", enabled=True, account_name="UP_1001", set_active=True)
+    db.create_account(
+        "1002",
+        cookie="SESSDATA=override_cookie_999999888",
+        enabled=True,
+        account_name="UP_1002",
+        set_active=False,
+    )
+    db.create_account("1003", cookie="", enabled=True, account_name="UP_1003", set_active=False)
+    db.create_account("1004", cookie="", enabled=False, account_name="UP_1004", set_active=False)
+
+    t0 = datetime(2026, 11, 18, 10, 0, 0, tzinfo=timezone.utc)
+    t1 = t0 + timedelta(minutes=5)
+
+    # 1001: 3 rows in videos table + 2 snapshots (positive deltas)
+    db.upsert_videos(
+        "1001",
+        [
+            {"bvid": "BV1_1", "aid": 1, "title": "V1"},
+            {"bvid": "BV1_2", "aid": 2, "title": "V2"},
+            {"bvid": "BV1_3", "aid": 3, "title": "V3"},
+        ],
+    )
+    db.insert_snapshot(
+        uid="1001",
+        follower_count=1000,
+        following_count=10,
+        online_viewers_total=20,
+        video_count=3,
+        videos_succeeded=3,
+        extra_metrics={},
+        status="success",
+        error_message=None,
+        duration_ms=40,
+        video_online_items=[],
+        collected_at=t0,
+    )
+    db.insert_snapshot(
+        uid="1001",
+        follower_count=1045,
+        following_count=10,
+        online_viewers_total=35,
+        video_count=3,
+        videos_succeeded=3,
+        extra_metrics={},
+        status="success",
+        error_message=None,
+        duration_ms=45,
+        video_online_items=[],
+        collected_at=t1,
+    )
+
+    # 1002: 0 rows in videos table -> falls back to latest snapshot video_count (9), negative deltas
+    db.insert_snapshot(
+        uid="1002",
+        follower_count=500,
+        following_count=5,
+        online_viewers_total=18,
+        video_count=9,
+        videos_succeeded=9,
+        extra_metrics={},
+        status="success",
+        error_message=None,
+        duration_ms=30,
+        video_online_items=[],
+        collected_at=t0,
+    )
+    db.insert_snapshot(
+        uid="1002",
+        follower_count=488,
+        following_count=5,
+        online_viewers_total=11,
+        video_count=9,
+        videos_succeeded=8,
+        extra_metrics={},
+        status="partial",
+        error_message="warn",
+        duration_ms=35,
+        video_online_items=[],
+        collected_at=t1,
+    )
+
+    # 1003: only 1 snapshot -> deltas are None
+    db.insert_snapshot(
+        uid="1003",
+        follower_count=300,
+        following_count=2,
+        online_viewers_total=4,
+        video_count=2,
+        videos_succeeded=2,
+        extra_metrics={},
+        status="success",
+        error_message=None,
+        duration_ms=25,
+        video_online_items=[],
+        collected_at=t1,
+    )
+
+    summaries = {a["uid"]: a for a in db.get_accounts_summary(crawling_uid="1002")}
+    assert list(summaries.keys()) == ["1001", "1002", "1003", "1004"]
+
+    assert summaries["1001"]["latest_follower_count"] == 1045
+    assert summaries["1001"]["latest_online_viewers_total"] == 35
+    assert summaries["1001"]["follower_delta"] == 45
+    assert summaries["1001"]["online_delta"] == 15
+    assert summaries["1001"]["video_count"] == 3
+    assert summaries["1001"]["has_cookie"] is True
+    assert summaries["1001"]["is_crawling"] is False
+
+    assert summaries["1002"]["latest_follower_count"] == 488
+    assert summaries["1002"]["latest_online_viewers_total"] == 11
+    assert summaries["1002"]["follower_delta"] == -12
+    assert summaries["1002"]["online_delta"] == -7
+    assert summaries["1002"]["video_count"] == 9
+    assert summaries["1002"]["last_crawl_status"] == "partial"
+    assert summaries["1002"]["cookie_preview"] != summaries["1001"]["cookie_preview"]
+    assert summaries["1002"]["is_crawling"] is True
+
+    assert summaries["1003"]["latest_follower_count"] == 300
+    assert summaries["1003"]["follower_delta"] is None
+    assert summaries["1003"]["online_delta"] is None
+    assert summaries["1003"]["video_count"] == 2
+
+    assert summaries["1004"]["latest_follower_count"] is None
+    assert summaries["1004"]["follower_delta"] is None
+    assert summaries["1004"]["online_delta"] is None
+    assert summaries["1004"]["video_count"] == 0
+    assert summaries["1004"]["enabled"] is False
+
+
+def test_prune_old_snapshots_retention_and_keep_latest_two_per_uid(tmp_path: Path):
+    from datetime import datetime, timedelta, timezone
+
+    db = Database(db_path=tmp_path / "retention.db")
+    now = datetime.now(timezone.utc)
+
+    for uid in ("111", "222", "333"):
+        db.upsert_videos(uid, [{"bvid": f"BV_{uid}", "aid": int(uid), "title": f"Vid {uid}"}])
+
+    def seed(uid: str, days_ago: int, followers: int) -> int:
+        return db.insert_snapshot(
+            uid=uid,
+            follower_count=followers,
+            following_count=1,
+            online_viewers_total=5,
+            video_count=1,
+            videos_succeeded=1,
+            extra_metrics={},
+            status="success",
+            error_message=None,
+            duration_ms=20,
+            video_online_items=[{"bvid": f"BV_{uid}", "online_count": 5, "online_raw": "6"}],
+            collected_at=now - timedelta(days=days_ago),
+        )
+
+    # uid 111: 3 expired (>30d) + 2 recent (<30d) -> 3 deleted, 2 kept
+    for d in (100, 60, 40, 10, 1):
+        seed("111", d, 1000 - d)
+    # uid 222: only 2 snapshots, BOTH expired (>30d) -> 0 deleted, both preserved!
+    for d in (120, 95):
+        seed("222", d, 2000 - d)
+    # uid 333: 4 snapshots, ALL expired (>30d) -> oldest 2 deleted, newest 2 (-80d, -50d) preserved!
+    for d in (200, 150, 80, 50):
+        seed("333", d, 3000 - d)
+
+    # 1) retention_days == 0 (unlimited) keeps everything
+    db.update_settings({"snapshot_retention_days": "0"})
+    assert db.get_public_settings()["snapshot_retention_days"] == 0
+    assert db.prune_old_snapshots() == {"deleted_snapshots": 0, "retention_days": 0}
+    assert db.prune_old_snapshots(0) == {"deleted_snapshots": 0, "retention_days": 0}
+    assert db.count_snapshots("111") == 5
+    assert db.count_snapshots("222") == 2
+    assert db.count_snapshots("333") == 4
+
+    # 2) retention_days == 30 deletes expired snapshots beyond top-2 per UID and cascades child rows
+    db.update_settings({"snapshot_retention_days": "30"})
+    pruned = db.prune_old_snapshots()
+    assert pruned == {"deleted_snapshots": 5, "retention_days": 30}
+    assert db.count_snapshots("111") == 2
+    assert db.count_snapshots("222") == 2
+    assert db.count_snapshots("333") == 2
+
+    latest_333, prev_333 = db.get_latest_two_snapshots("333")
+    assert latest_333 is not None and latest_333["follower_count"] == 2950  # -50d
+    assert prev_333 is not None and prev_333["follower_count"] == 2920  # -80d
+
+    # Child video_online_snapshots cascaded cleanly via ON DELETE CASCADE
+    assert len(db.get_video_history("BV_111")) == 2
+    assert len(db.get_video_history("BV_222")) == 2
+    assert len(db.get_video_history("BV_333")) == 2
+    with db.connection() as conn:
+        total_child_rows = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM video_online_snapshots"
+        ).fetchone()["cnt"]
+    assert total_child_rows == 6
+
+
+def test_parse_duration_seconds_and_wbi_fallback_duration():
+    assert parse_duration_seconds("12:34") == 754
+    assert parse_duration_seconds("1:02:03") == 3723
+    assert parse_duration_seconds("00:08") == 8
+    assert parse_duration_seconds(90) == 90
+    assert parse_duration_seconds("45") == 45
+    assert parse_duration_seconds(0) == 0
+    assert parse_duration_seconds("") == 0
+    assert parse_duration_seconds("-") == 0
+    assert parse_duration_seconds(None) == 0
+    assert parse_duration_seconds(True) == 0
+    assert parse_duration_seconds("bad:val") == 0
+    assert parse_duration_seconds("-15") == 0
+    assert parse_duration_seconds("1:2:3:4") == 0
+
+    async def scenario():
+        uid = "100001001"
+        async with BilibiliClient() as client:
+            client._session_bootstrapped = True
+            client._wbi_keys = ("a" * 32, "b" * 32)
+            client._wbi_fetched_at = time.time()
+
+            async def fake_request(url, params=None, referer=None, retries=2):
+                if "recArchivesByKeywords" in url:
+                    raise BilibiliAPIError("series unavailable", code=-352)
+                if "wbi/arc/search" in url:
+                    return {
+                        "code": 0,
+                        "data": {
+                            "page": {"count": 3},
+                            "list": {
+                                "vlist": [
+                                    {
+                                        "bvid": "BV1mmss",
+                                        "aid": 1,
+                                        "title": "MMSS",
+                                        "mid": int(uid),
+                                        "length": "12:34",
+                                        "play": 100,
+                                    },
+                                    {
+                                        "bvid": "BV1hhmmss",
+                                        "aid": 2,
+                                        "title": "HHMMSS",
+                                        "mid": int(uid),
+                                        "length": "1:02:03",
+                                        "play": 200,
+                                    },
+                                    {
+                                        "bvid": "BV1numeric_fallback",
+                                        "aid": 3,
+                                        "title": "Fallback Duration",
+                                        "mid": int(uid),
+                                        "length": "",
+                                        "duration": 55,
+                                        "play": 300,
+                                    },
+                                ]
+                            },
+                        },
+                    }
+                raise AssertionError(f"Unexpected URL: {url}")
+
+            with patch.object(client, "_request_json", side_effect=fake_request):
+                videos = await client.get_all_videos(uid)
+
+            by_bvid = {v["bvid"]: v["duration"] for v in videos}
+            assert by_bvid == {
+                "BV1mmss": 754,
+                "BV1hhmmss": 3723,
+                "BV1numeric_fallback": 55,
+            }
+
+    asyncio.run(scenario())
+
+
+def test_bilibili_client_cross_instance_credential_and_wbi_cache():
+    import httpx
+
+    BilibiliClient.clear_credential_cache()
+
+    async def scenario():
+        cookie = "SESSDATA=cached_session_token_abc"
+        calls: list[str] = []
+        img_key = "7cd084941338484aae1ad9425b84077c"
+        sub_key = "4932caff0ff746eab6f01bf08b70ac45"
+
+        async def fake_get(url: str, **kwargs):
+            calls.append(url)
+            req = httpx.Request("GET", url)
+            if "finger/spi" in url:
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"b_3": "buvid3_cached", "b_4": "buvid4_cached"}},
+                    request=req,
+                )
+            if "web-interface/nav" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "wbi_img": {
+                                "img_url": f"https://i0.hdslb.com/bfs/wbi/{img_key}.png",
+                                "sub_url": f"https://i0.hdslb.com/bfs/wbi/{sub_key}.png",
+                            }
+                        },
+                    },
+                    request=req,
+                )
+            raise AssertionError(f"Unexpected GET {url}")
+
+        async def fake_post(url: str, **kwargs):
+            calls.append(url)
+            req = httpx.Request("POST", url)
+            if "GenWebTicket" in url:
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"ticket": "ticket_cached"}},
+                    request=req,
+                )
+            raise AssertionError(f"Unexpected POST {url}")
+
+        # 1) First client fetches session tokens + WBI keys from network and populates cache
+        async with BilibiliClient(cookie=cookie) as client1:
+            with (
+                patch.object(client1._client, "get", side_effect=fake_get),
+                patch.object(client1._client, "post", side_effect=fake_post),
+            ):
+                await client1.ensure_session_tokens()
+                keys1 = await client1._get_wbi_keys()
+        assert keys1 == (img_key, sub_key)
+        assert len(calls) == 3
+
+        # 2) Second client with same cookie reuses cached tokens & WBI keys with zero HTTP calls
+        async with BilibiliClient(cookie=cookie) as client2:
+            with (
+                patch.object(
+                    client2._client,
+                    "get",
+                    side_effect=AssertionError("Expected credential cache hit for GET"),
+                ),
+                patch.object(
+                    client2._client,
+                    "post",
+                    side_effect=AssertionError("Expected credential cache hit for POST"),
+                ),
+            ):
+                await client2.ensure_session_tokens()
+                keys2 = await client2._get_wbi_keys()
+            assert keys2 == (img_key, sub_key)
+            assert client2._client.cookies.get("buvid3") == "buvid3_cached"
+            assert client2._client.cookies.get("buvid4") == "buvid4_cached"
+            assert client2._client.cookies.get("bili_ticket") == "ticket_cached"
+
+        # 3) Bounded cache size eviction + clear_credential_cache()
+        for idx in range(BilibiliClient.MAX_CREDENTIAL_CACHE_SIZE + 10):
+            BilibiliClient._get_or_create_cache_entry(f"key_{idx}")
+        assert len(BilibiliClient._CREDENTIAL_CACHE) == BilibiliClient.MAX_CREDENTIAL_CACHE_SIZE
+
+        BilibiliClient.clear_credential_cache()
+        assert len(BilibiliClient._CREDENTIAL_CACHE) == 0
+
+        # After clearing cache, a third client fetches from network again
+        calls.clear()
+        async with BilibiliClient(cookie=cookie) as client3:
+            with (
+                patch.object(client3._client, "get", side_effect=fake_get),
+                patch.object(client3._client, "post", side_effect=fake_post),
+            ):
+                await client3.ensure_session_tokens()
+                keys3 = await client3._get_wbi_keys()
+        assert keys3 == (img_key, sub_key)
+        assert len(calls) == 3
+
+    asyncio.run(scenario())
+
+
+def test_bilibili_client_wbi_invalidation_and_412_vs_429_retry():
+    import httpx
+
+    async def scenario():
+        async with BilibiliClient(cookie="SESSDATA=retry_test") as client:
+            # 1) WBI cache invalidation on /wbi/ -403 and -412 while keeping session_tokens
+            for err_code in (-403, -412):
+                entry = BilibiliClient._get_or_create_cache_entry(client._cookie_key)
+                entry["session_tokens"] = {"buvid3": "keep_me"}
+                entry["session_fetched_at"] = time.time()
+                entry["wbi_keys"] = ("a" * 32, "b" * 32)
+                entry["wbi_fetched_at"] = time.time()
+                client._wbi_keys = ("a" * 32, "b" * 32)
+                client._wbi_fetched_at = time.time()
+
+                wbi_url = "https://api.bilibili.com/x/space/wbi/arc/search?mid=1&w_rid=xyz"
+                resp_err = httpx.Response(
+                    200,
+                    json={"code": err_code, "message": "wbi signature error"},
+                    request=httpx.Request("GET", wbi_url),
+                )
+                with patch.object(client._client, "get", new=AsyncMock(return_value=resp_err)):
+                    payload = await client._request_json(wbi_url, retries=2)
+                assert payload["code"] == err_code
+                assert client._wbi_keys is None
+                assert "wbi_keys" not in BilibiliClient._CREDENTIAL_CACHE[client._cookie_key]
+                assert BilibiliClient._CREDENTIAL_CACHE[client._cookie_key]["session_tokens"] == {
+                    "buvid3": "keep_me"
+                }
+
+            # 2) HTTP 412 fails immediately on first attempt without retry or sleep
+            url_412 = "https://api.bilibili.com/x/player/online/total"
+            mock_get_412 = AsyncMock(
+                return_value=httpx.Response(412, request=httpx.Request("GET", url_412))
+            )
+            mock_sleep_412 = AsyncMock()
+            with (
+                patch.object(client._client, "get", new=mock_get_412),
+                patch("app.bilibili.client.asyncio.sleep", new=mock_sleep_412),
+            ):
+                with pytest.raises(BilibiliAPIError) as exc_412:
+                    await client._request_json(url_412, retries=2)
+            assert exc_412.value.code == 412
+            assert mock_get_412.await_count == 1
+            assert mock_sleep_412.await_count == 0
+
+            # 3) HTTP 429 backs off exponentially (1.5s, 3.0s) and succeeds when retry recovers
+            url_429 = "https://api.bilibili.com/x/relation/stat"
+            req_429 = httpx.Request("GET", url_429)
+            mock_get_429 = AsyncMock(
+                side_effect=[
+                    httpx.Response(429, request=req_429),
+                    httpx.Response(429, request=req_429),
+                    httpx.Response(200, json={"code": 0, "data": {"follower": 99}}, request=req_429),
+                ]
+            )
+            mock_sleep_429 = AsyncMock()
+            with (
+                patch.object(client._client, "get", new=mock_get_429),
+                patch("app.bilibili.client.asyncio.sleep", new=mock_sleep_429),
+            ):
+                recovered = await client._request_json(url_429, retries=2)
+            assert recovered == {"code": 0, "data": {"follower": 99}}
+            assert mock_get_429.await_count == 3
+            assert [c.args[0] for c in mock_sleep_429.await_args_list] == [1.5, 3.0]
+
+            # 4) Exhausted HTTP 429 raises BilibiliAPIError(code=429)
+            mock_get_429_fail = AsyncMock(return_value=httpx.Response(429, request=req_429))
+            with (
+                patch.object(client._client, "get", new=mock_get_429_fail),
+                patch("app.bilibili.client.asyncio.sleep", new=AsyncMock()),
+            ):
+                with pytest.raises(BilibiliAPIError) as exc_429:
+                    await client._request_json(url_429, retries=1)
+            assert exc_429.value.code == 429
+            assert mock_get_429_fail.await_count == 2
+
+    asyncio.run(scenario())
+
+
+def test_collector_multi_cid_partial_fault_tolerance_and_412_circuit_breaker(tmp_path: Path):
+    # 1) Multi-CID partial fault tolerance: retains succeeded CIDs and marks snapshot "partial"
+    uid_partial = "777888"
+    db_partial = Database(db_path=tmp_path / "partial_cid.db")
+    db_partial.update_settings(
+        {
+            "uid": uid_partial,
+            "request_delay_ms": "50",
+            f"last_video_sync_ts_{uid_partial}": str(int(time.time())),
+            f"video_sync_rule_{uid_partial}": VIDEO_SYNC_RULE,
+        }
+    )
+    db_partial.upsert_videos(
+        uid_partial,
+        [
+            {
+                "bvid": "BV1multi",
+                "aid": 1,
+                "title": "Three Part Video",
+                "play_count": 1000,
+                "cids": [
+                    {"cid": 101, "page": 1, "part": "P1"},
+                    {"cid": 102, "page": 2, "part": "P2"},
+                    {"cid": 103, "page": 3, "part": "P3"},
+                ],
+            },
+            {
+                "bvid": "BV1all_fail",
+                "aid": 2,
+                "title": "All CIDs Fail",
+                "play_count": 500,
+                "cids": [
+                    {"cid": 201, "page": 1, "part": "P1"},
+                    {"cid": 202, "page": 2, "part": "P2"},
+                ],
+            },
+        ],
+    )
+
+    fake_partial_client = AsyncMock()
+    fake_partial_client.__aenter__.return_value = fake_partial_client
+    fake_partial_client.__aexit__.return_value = None
+    fake_partial_client.get_relation_stat.return_value = {"follower": 888, "following": 3}
+    fake_partial_client.get_account_card.return_value = {
+        "name": "PartialUP",
+        "face": "",
+        "follower": 888,
+        "archive_count": 2,
+    }
+
+    async def fake_online_partial(bvid: str, cid: int):
+        if cid == 101:
+            return (11, "11")  # adjusted -> 10
+        if cid == 102:
+            raise BilibiliAPIError("cid 102 timeout", code=-504)
+        if cid == 103:
+            return (6, "6")  # adjusted -> 5
+        raise BilibiliAPIError("cid unavailable", code=-404)
+
+    fake_partial_client.get_video_online_total.side_effect = fake_online_partial
+    svc_partial = CrawlService(db_partial)
+    with patch("app.bilibili.collectors.BilibiliClient", return_value=fake_partial_client):
+        res_partial = asyncio.run(svc_partial.run_crawl(force_sync_videos=False))
+
+    assert res_partial["status"] == "partial"
+    assert res_partial["video_count"] == 2
+    assert res_partial["videos_succeeded"] == 1
+    assert res_partial["online_viewers_total"] == 15  # 10 + 5
+    assert "BV1multi(cid=102)" in (res_partial["error_message"] or "")
+    vids_partial = {v["bvid"]: v for v in db_partial.get_videos(uid_partial)}
+    assert vids_partial["BV1multi"]["last_online_count"] == 15
+    assert vids_partial["BV1multi"]["last_online_raw"] == "11+6"
+
+    # 2) HTTP 412 circuit breaker: immediately halts remaining CIDs and unstarted videos
+    uid_412 = "999000"
+    db_412 = Database(db_path=tmp_path / "breaker_412.db")
+    db_412.update_settings(
+        {
+            "uid": uid_412,
+            "request_delay_ms": "50",
+            f"last_video_sync_ts_{uid_412}": str(int(time.time())),
+            f"video_sync_rule_{uid_412}": VIDEO_SYNC_RULE,
+        }
+    )
+    seeded_412 = [
+        {
+            "bvid": "BV412_0",
+            "aid": 1,
+            "title": "Trigger 412",
+            "pubdate": 1000,
+            "cids": [
+                {"cid": 10, "page": 1, "part": "P1"},
+                {"cid": 11, "page": 2, "part": "P2"},
+                {"cid": 12, "page": 3, "part": "P3"},
+            ],
+        }
+    ] + [
+        {
+            "bvid": f"BV412_{i}",
+            "aid": i + 1,
+            "title": f"Queued {i}",
+            "pubdate": 1000 - i,
+            "cids": [{"cid": 100 + i, "page": 1, "part": "P1"}],
+        }
+        for i in range(1, 10)
+    ]
+    db_412.upsert_videos(uid_412, seeded_412)
+
+    fake_412_client = AsyncMock()
+    fake_412_client.__aenter__.return_value = fake_412_client
+    fake_412_client.__aexit__.return_value = None
+    fake_412_client.get_relation_stat.return_value = {"follower": 500, "following": 2}
+    fake_412_client.get_account_card.return_value = {
+        "name": "BreakerUP",
+        "face": "",
+        "follower": 500,
+        "archive_count": 10,
+    }
+
+    polled_cids: list[int] = []
+
+    async def fake_online_412(bvid: str, cid: int):
+        polled_cids.append(cid)
+        if cid == 11 or len(polled_cids) == 1:
+            raise BilibiliAPIError("HTTP 412 anti-bot", code=412)
+        return (3, "3")
+
+    fake_412_client.get_video_online_total.side_effect = fake_online_412
+    svc_412 = CrawlService(db_412)
+    with patch("app.bilibili.collectors.BilibiliClient", return_value=fake_412_client):
+        res_412 = asyncio.run(svc_412.run_crawl(force_sync_videos=False))
+
+    assert res_412["status"] == "partial"
+    assert "412" in (res_412["error_message"] or "")
+    # Subsequent CIDs (11, 12) on BV412_0 and queued videos beyond Semaphore(4) were aborted!
+    assert 12 not in polled_cids
+    assert len(polled_cids) <= 4
+
+
+def test_admin_rate_limiter_trust_proxy_max_keys_and_secure_cookie_header(
+    tmp_path: Path, monkeypatch
+):
+    from starlette.requests import Request
+    from app.auth import AdminVerifyRateLimiter
+
+    monkeypatch.setenv("BILI_ADMIN_PASSWORD", "proxy-guard-pw")
+
+    # 1) Default (BILI_TRUST_PROXY unset/false): ignores X-Forwarded-Proto and X-Forwarded-For
+    monkeypatch.setenv("BILI_TRUST_PROXY", "false")
+    db_untrusted = Database(db_path=tmp_path / "proxy_untrusted.db")
+    app_untrusted = create_app(database=db_untrusted, enable_scheduler=False)
+    with TestClient(app_untrusted) as client:
+        ok_resp = client.post(
+            "/api/admin/verify",
+            json={"password": "proxy-guard-pw"},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        assert ok_resp.status_code == 200
+        set_cookie_untrusted = ok_resp.headers.get("set-cookie", "").lower()
+        assert "bilipulse_admin_session=" in set_cookie_untrusted
+        assert "secure" not in set_cookie_untrusted
+
+        assert client.post("/api/admin/logout").status_code == 200
+
+        # Spoofing distinct X-Forwarded-For values cannot bypass rate limiting
+        for idx in range(5):
+            r = client.post(
+                "/api/admin/verify",
+                json={"password": "wrong"},
+                headers={"X-Forwarded-For": f"198.51.100.{idx + 1}"},
+            )
+            assert r.status_code == 401
+        blocked = client.post(
+            "/api/admin/verify",
+            json={"password": "proxy-guard-pw"},
+            headers={"X-Forwarded-For": "203.0.113.99"},
+        )
+        assert blocked.status_code == 429
+
+    # 2) BILI_TRUST_PROXY=true: honors X-Forwarded-For per client IP and X-Forwarded-Proto=https
+    monkeypatch.setenv("BILI_TRUST_PROXY", "true")
+    db_trusted = Database(db_path=tmp_path / "proxy_trusted.db")
+    app_trusted = create_app(database=db_trusted, enable_scheduler=False)
+    with TestClient(app_trusted) as client:
+        for _ in range(5):
+            r = client.post(
+                "/api/admin/verify",
+                json={"password": "wrong"},
+                headers={"X-Forwarded-For": "198.51.100.10, 10.0.0.1"},
+            )
+            assert r.status_code == 401
+        assert (
+            client.post(
+                "/api/admin/verify",
+                json={"password": "proxy-guard-pw"},
+                headers={"X-Forwarded-For": "198.51.100.10, 10.0.0.1"},
+            ).status_code
+            == 429
+        )
+
+        # Different forwarded IP remains allowed and receives Secure cookie over X-Forwarded-Proto: https
+        ok_trusted = client.post(
+            "/api/admin/verify",
+            json={"password": "proxy-guard-pw"},
+            headers={
+                "X-Forwarded-For": "198.51.100.20, 10.0.0.1",
+                "X-Forwarded-Proto": "https",
+            },
+        )
+        assert ok_trusted.status_code == 200
+        set_cookie_trusted = ok_trusted.headers.get("set-cookie", "").lower()
+        assert "secure" in set_cookie_trusted
+
+    # 3) max_keys bounded memory eviction (prunes expired first, then evicts oldest key)
+    limiter = AdminVerifyRateLimiter(max_failures=3, window_seconds=60, max_keys=3)
+
+    def _make_req(ip: str) -> Request:
+        return Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/admin/verify",
+                "headers": [(b"x-forwarded-for", ip.encode("ascii"))],
+                "client": ("127.0.0.1", 50000),
+            }
+        )
+
+    clock = [100.0]
+    with patch("app.auth.time.monotonic", side_effect=lambda: clock[0]):
+        for idx, ip in enumerate(("10.0.0.1", "10.0.0.2", "10.0.0.3")):
+            clock[0] = 100.0 + idx * 10.0
+            limiter.record_failure(_make_req(ip))
+        assert set(limiter._failures.keys()) == {"10.0.0.1", "10.0.0.2", "10.0.0.3"}
+
+        # At capacity with all keys unexpired -> evicts oldest (10.0.0.1)
+        clock[0] = 130.0
+        limiter.record_failure(_make_req("10.0.0.4"))
+        assert len(limiter._failures) == 3
+        assert set(limiter._failures.keys()) == {"10.0.0.2", "10.0.0.3", "10.0.0.4"}
+
+        # Advance past window for 10.0.0.2 (110) and 10.0.0.3 (120), keeping 10.0.0.4 (130) valid
+        clock[0] = 185.0
+        limiter.record_failure(_make_req("10.0.0.5"))
+        assert set(limiter._failures.keys()) == {"10.0.0.4", "10.0.0.5"}
+
+
+def test_settings_retention_api_background_crawl_now_and_scheduler_optimizations(tmp_path: Path):
+    from app.scheduler import RETENTION_JOB_ID, SchedulerManager
+
+    db = Database(db_path=tmp_path / "api_sched_opt.db")
+    app = create_app(database=db, enable_scheduler=False)
+
+    with TestClient(app) as client:
+        # 1) SettingsOut & PUT /api/settings snapshot_retention_days (including 0 = unlimited)
+        s0 = client.get("/api/settings")
+        assert s0.status_code == 200
+        assert s0.json()["snapshot_retention_days"] == 90
+        assert client.get("/api/dashboard").json()["settings"]["snapshot_retention_days"] == 90
+
+        s_15 = client.put("/api/settings", json={"snapshot_retention_days": 15})
+        assert s_15.status_code == 200
+        assert s_15.json()["snapshot_retention_days"] == 15
+
+        s_zero = client.put("/api/settings", json={"snapshot_retention_days": 0})
+        assert s_zero.status_code == 200
+        assert s_zero.json()["snapshot_retention_days"] == 0
+        assert client.get("/api/settings").json()["snapshot_retention_days"] == 0
+        assert client.get("/api/dashboard").json()["settings"]["snapshot_retention_days"] == 0
+
+        assert client.put("/api/settings", json={"snapshot_retention_days": -1}).status_code == 422
+        assert client.put("/api/settings", json={"snapshot_retention_days": 3651}).status_code == 422
+
+        # 2) POST /api/crawl/now?background=true: 400 invalid/missing UID, 200 accepted, 409 when busy
+        assert client.post("/api/crawl/now?background=true").status_code == 400
+        assert client.post("/api/crawl/now?background=true&uid=not_digits").status_code == 400
+
+        assert client.put("/api/settings", json={"uid": "100001001"}).status_code == 200
+
+        bg_calls: list[tuple[bool, str | None]] = []
+
+        async def fake_bg_crawl(
+            force_sync_videos: bool = False,
+            uid: str | None = None,
+            wait: bool = False,
+        ):
+            bg_calls.append((force_sync_videos, uid))
+            return {"skipped": False, "uid": uid, "status": "success"}
+
+        with patch.object(app.state.crawl_service, "run_crawl", side_effect=fake_bg_crawl):
+            ok_bg = client.post("/api/crawl/now?background=true&force_sync_videos=true")
+            assert ok_bg.status_code == 200
+            assert ok_bg.json() == {
+                "accepted": True,
+                "background": True,
+                "uid": "100001001",
+            }
+        assert bg_calls == [(True, "100001001")]
+
+        # Busy lock -> 409 Conflict
+        with patch.object(
+            type(app.state.crawl_service),
+            "is_crawling",
+            new_callable=lambda: property(lambda self: True),
+        ):
+            busy_bg = client.post("/api/crawl/now?background=true")
+            assert busy_bg.status_code == 409
+
+        # 3) /api/dashboard deduplicates settings and latest_two_snapshots queries
+        db.insert_snapshot(
+            uid="100001001",
+            follower_count=1234,
+            following_count=5,
+            online_viewers_total=10,
+            video_count=1,
+            videos_succeeded=1,
+            extra_metrics={},
+            status="success",
+            error_message=None,
+            duration_ms=25,
+            video_online_items=[],
+        )
+        with (
+            patch.object(
+                db, "get_public_settings", wraps=db.get_public_settings
+            ) as spy_pub_settings,
+            patch.object(
+                db, "get_latest_two_snapshots", wraps=db.get_latest_two_snapshots
+            ) as spy_latest_two,
+        ):
+            dash_resp = client.get("/api/dashboard?hours=24")
+            assert dash_resp.status_code == 200
+            assert dash_resp.json()["scheduler"]["last_crawl_status"] == "success"
+            assert spy_pub_settings.call_count == 1
+            assert spy_latest_two.call_count == 1
+
+    # 4) SchedulerManager tracked background tasks, retention job, and get_status deduplication
+    svc = CrawlService(db)
+    mgr = SchedulerManager(db, svc)
+
+    pre_pub = db.get_public_settings(uid="100001001")
+    with (
+        patch.object(
+            db,
+            "get_public_settings",
+            side_effect=AssertionError("pub_settings was already provided"),
+        ),
+        patch.object(
+            db,
+            "get_latest_two_snapshots",
+            side_effect=AssertionError("latest_snapshot was already provided"),
+        ),
+    ):
+        st_none = mgr.get_status(uid="100001001", pub_settings=pre_pub, latest_snapshot=None)
+        assert st_none["last_crawl_at"] is None
+        assert st_none["last_crawl_status"] is None
+
+        st_snap = mgr.get_status(
+            uid="100001001",
+            pub_settings=pre_pub,
+            latest_snapshot={"collected_at": "2026-11-18T12:00:00+08:00", "status": "partial"},
+        )
+        assert st_snap["last_crawl_at"] == "2026-11-18T12:00:00+08:00"
+        assert st_snap["last_crawl_status"] == "partial"
+
+    async def sched_scenario():
+        mgr.start()
+        try:
+            assert mgr.scheduler.get_job(RETENTION_JOB_ID) is not None
+
+            # Normal task tracked while running and removed on completion
+            gate = asyncio.Event()
+
+            async def _short_task() -> str:
+                await gate.wait()
+                return "done"
+
+            t_ok = mgr.spawn_background_task(_short_task(), name="test_short_bg")
+            assert t_ok in mgr._bg_tasks
+            gate.set()
+            await t_ok
+            await asyncio.sleep(0)
+            assert t_ok not in mgr._bg_tasks
+
+            # Failing task logs exception cleanly and removes itself from _bg_tasks
+            async def _failing_task() -> None:
+                raise RuntimeError("expected test error")
+
+            with patch("app.scheduler.logger.exception") as mock_log_exc:
+                t_err = mgr.spawn_background_task(_failing_task(), name="test_fail_bg")
+                await asyncio.sleep(0.02)
+                assert t_err not in mgr._bg_tasks
+                assert mock_log_exc.called
+
+            # Long-running task is cancelled when shutdown() runs
+            async def _sleeper() -> None:
+                await asyncio.sleep(60)
+
+            t_long = mgr.spawn_background_task(_sleeper(), name="test_long_bg")
+            assert t_long in mgr._bg_tasks
+        finally:
+            mgr.shutdown()
+
+        await asyncio.sleep(0)
+        assert t_long.cancelled()
+        assert len(mgr._bg_tasks) == 0
+
+    asyncio.run(sched_scenario())
+
+
+def test_batch_insert_snapshot_play_fallback_effective_cookie_and_settings_prune_dispatch(
+    tmp_path: Path,
+):
+    db = Database(db_path=tmp_path / "batch_and_profile.db")
+    uid = "100001001"
+    db.create_account(uid, cookie="", enabled=True, set_active=True)
+    db.update_settings({"cookie": "SESSDATA=global_profile_cookie_xyz"})
+
+    # 1) insert_snapshot bulk missing play_count lookup from videos + executemany
+    db.upsert_videos(
+        uid,
+        [
+            {"bvid": "BV_fallback", "aid": 1, "title": "Fallback Play", "play_count": 4321},
+            {"bvid": "BV_explicit", "aid": 2, "title": "Explicit Play", "play_count": 1000},
+        ],
+    )
+    db.insert_snapshot(
+        uid=uid,
+        follower_count=900,
+        following_count=10,
+        online_viewers_total=15,
+        video_count=2,
+        videos_succeeded=2,
+        extra_metrics={},
+        status="success",
+        error_message=None,
+        duration_ms=30,
+        video_online_items=[
+            {"bvid": "BV_fallback", "online_count": 7, "online_raw": "8"},
+            {"bvid": "BV_explicit", "online_count": 8, "online_raw": "9", "play_count": 1111},
+        ],
+    )
+    assert db.get_video_history("BV_fallback")[0]["play_count"] == 4321
+    assert db.get_video_history("BV_explicit")[0]["play_count"] == 1111
+
+    # 2) CrawlService.fetch_account_profile resolves effective cookie when cookie is None
+    seen_cookies: list[str] = []
+
+    def make_profile_client(cookie: str = "", **kwargs):
+        seen_cookies.append(cookie)
+        c = AsyncMock()
+        c.__aenter__.return_value = c
+        c.__aexit__.return_value = None
+        c.get_account_card.return_value = {
+            "name": "FetchedName",
+            "face": "https://example.com/fetched.jpg",
+            "follower": 900,
+            "archive_count": 2,
+        }
+        return c
+
+    svc = CrawlService(db)
+    with patch("app.bilibili.collectors.BilibiliClient", side_effect=make_profile_client):
+        asyncio.run(svc.fetch_account_profile(uid, cookie=None))
+    assert seen_cookies == ["SESSDATA=global_profile_cookie_xyz"]
+    assert db.get_public_settings(uid=uid)["account_name"] == "FetchedName"
+
+    # 3) PUT /api/settings spawns prune_old_snapshots when enable_scheduler=True and retention > 0
+    app = create_app(database=db, enable_scheduler=False)
+    app.state.enable_scheduler = True
+    with TestClient(app) as client:
+        with patch.object(
+            db,
+            "prune_old_snapshots",
+            wraps=db.prune_old_snapshots,
+        ) as spy_prune:
+            r_zero = client.put("/api/settings", json={"snapshot_retention_days": 0})
+            assert r_zero.status_code == 200
+            assert spy_prune.call_count == 0
+
+            r_pos = client.put("/api/settings", json={"snapshot_retention_days": 60})
+            assert r_pos.status_code == 200
+            assert spy_prune.call_count == 1
+            assert spy_prune.call_args.args == (60,)
+
+
+def test_create_account_bootstrap_and_fetch_profile_empty_cookie_preserve_global_cookie(
+    tmp_path: Path,
+):
+    db = Database(db_path=tmp_path / "bootstrap_global_cookie.db")
+    db.update_settings({"cookie": "SESSDATA=global_bootstrap_tok", "request_delay_ms": "50"})
+
+    seen_cookies: list[str] = []
+
+    def make_client(cookie: str = "", **kwargs):
+        seen_cookies.append(cookie)
+        c = AsyncMock()
+        c.__aenter__.return_value = c
+        c.__aexit__.return_value = None
+        c.get_account_card.return_value = {
+            "name": "BootstrapUP",
+            "face": "https://example.com/boot.jpg",
+            "follower": 777,
+            "archive_count": 0,
+        }
+        c.get_relation_stat.return_value = {"follower": 777, "following": 9}
+        c.get_all_videos.return_value = []
+        return c
+
+    # 1) Direct fetch_account_profile with "" and whitespace cookie falls back to global cookie
+    db.create_account("555111", cookie="", enabled=False, set_active=False)
+    svc = CrawlService(db)
+    with patch("app.bilibili.collectors.BilibiliClient", side_effect=make_client):
+        asyncio.run(svc.fetch_account_profile("555111", cookie=""))
+        asyncio.run(svc.fetch_account_profile("555111", cookie="   "))
+    assert seen_cookies == [
+        "SESSDATA=global_bootstrap_tok",
+        "SESSDATA=global_bootstrap_tok",
+    ]
+
+    # 2) POST /api/accounts (omitting cookie -> default "") under enable_scheduler=True
+    seen_cookies.clear()
+    app = create_app(database=db, enable_scheduler=True)
+    with patch("app.bilibili.collectors.BilibiliClient", side_effect=make_client):
+        with TestClient(app) as client:
+            resp = client.post("/api/accounts", json={"uid": "889900", "enabled": True})
+            assert resp.status_code == 200
+
+            # Wait briefly for tracked bootstrap background task to complete inside lifespan
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                accs = {a["uid"]: a for a in client.get("/api/accounts").json()["accounts"]}
+                if (
+                    accs["889900"]["account_name"] == "BootstrapUP"
+                    and accs["889900"]["latest_follower_count"] == 777
+                ):
+                    break
+                time.sleep(0.02)
+
+            accs_final = {a["uid"]: a for a in client.get("/api/accounts").json()["accounts"]}
+            assert accs_final["889900"]["account_name"] == "BootstrapUP"
+            assert accs_final["889900"]["latest_follower_count"] == 777
+
+    # Both fetch_account_profile and run_crawl used global cookie, never ""
+    assert len(seen_cookies) >= 2
+    assert all(c == "SESSDATA=global_bootstrap_tok" for c in seen_cookies)
+
+
+def test_bilibili_client_partial_session_token_healing_and_cookie_isolation():
+    import httpx
+
+    BilibiliClient.clear_credential_cache()
+
+    async def scenario():
+        cookie_heal = "SESSDATA=heal_session_account"
+        spi_attempts = 0
+        ticket_attempts = 0
+
+        async def spi_fail_first(url: str, **kwargs):
+            nonlocal spi_attempts
+            spi_attempts += 1
+            req = httpx.Request("GET", url)
+            if spi_attempts == 1:
+                raise httpx.ConnectError("transient spi failure", request=req)
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"b_3": "buvid3_healed", "b_4": "buvid4_healed"}},
+                request=req,
+            )
+
+        async def ticket_ok_once(url: str, **kwargs):
+            nonlocal ticket_attempts
+            ticket_attempts += 1
+            if ticket_attempts > 1:
+                raise AssertionError("GenWebTicket should be reused from cache without re-fetching")
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"ticket": "ticket_initial_ok"}},
+                request=httpx.Request("POST", url),
+            )
+
+        # 1) Client 1: finger/spi fails transiently while GenWebTicket succeeds
+        async with BilibiliClient(cookie=cookie_heal) as c1:
+            with (
+                patch.object(c1._client, "get", side_effect=spi_fail_first),
+                patch.object(c1._client, "post", side_effect=ticket_ok_once),
+            ):
+                await c1.ensure_session_tokens()
+            assert c1._client.cookies.get("bili_ticket") == "ticket_initial_ok"
+            assert c1._client.cookies.get("buvid3") is None
+        assert spi_attempts == 1
+        assert ticket_attempts == 1
+
+        # 2) Client 2 (same cookie): reuses cached bili_ticket (0 POSTs) and heals missing buvid3
+        async with BilibiliClient(cookie=cookie_heal) as c2:
+            with (
+                patch.object(c2._client, "get", side_effect=spi_fail_first),
+                patch.object(c2._client, "post", side_effect=ticket_ok_once),
+            ):
+                await c2.ensure_session_tokens()
+            assert c2._client.cookies.get("bili_ticket") == "ticket_initial_ok"
+            assert c2._client.cookies.get("buvid3") == "buvid3_healed"
+            assert c2._client.cookies.get("buvid4") == "buvid4_healed"
+        assert spi_attempts == 2
+        assert ticket_attempts == 1
+
+        # 3) Client 3 (same cookie): full cache hit for merged tokens with 0 HTTP calls
+        async with BilibiliClient(cookie=cookie_heal) as c3:
+            with (
+                patch.object(
+                    c3._client,
+                    "get",
+                    side_effect=AssertionError("Expected full session token cache hit"),
+                ),
+                patch.object(
+                    c3._client,
+                    "post",
+                    side_effect=AssertionError("Expected full session token cache hit"),
+                ),
+            ):
+                await c3.ensure_session_tokens()
+            assert c3._client.cookies.get("bili_ticket") == "ticket_initial_ok"
+            assert c3._client.cookies.get("buvid3") == "buvid3_healed"
+
+        # 4) Cookie isolation: distinct cookies never leak bili_ticket / buvid3 across accounts
+        for label, raw_cookie in (("A", "SESSDATA=acc_a"), ("B", "SESSDATA=acc_b")):
+            async with BilibiliClient(cookie=raw_cookie) as client_seed:
+                with (
+                    patch.object(
+                        client_seed._client,
+                        "get",
+                        new=AsyncMock(
+                            return_value=httpx.Response(
+                                200,
+                                json={
+                                    "code": 0,
+                                    "data": {"b_3": f"buvid3_{label}", "b_4": f"buvid4_{label}"},
+                                },
+                                request=httpx.Request("GET", "https://api.bilibili.com/spi"),
+                            )
+                        ),
+                    ),
+                    patch.object(
+                        client_seed._client,
+                        "post",
+                        new=AsyncMock(
+                            return_value=httpx.Response(
+                                200,
+                                json={"code": 0, "data": {"ticket": f"ticket_{label}"}},
+                                request=httpx.Request("POST", "https://api.bilibili.com/ticket"),
+                            )
+                        ),
+                    ),
+                ):
+                    await client_seed.ensure_session_tokens()
+
+        async with (
+            BilibiliClient(cookie="SESSDATA=acc_a") as ca,
+            BilibiliClient(cookie="SESSDATA=acc_b") as cb,
+        ):
+            for c_inst in (ca, cb):
+                c_inst._client.get = AsyncMock(side_effect=AssertionError("unexpected GET"))
+                c_inst._client.post = AsyncMock(side_effect=AssertionError("unexpected POST"))
+            await ca.ensure_session_tokens()
+            await cb.ensure_session_tokens()
+
+            assert ca._client.cookies.get("buvid3") == "buvid3_A"
+            assert ca._client.cookies.get("bili_ticket") == "ticket_A"
+            assert cb._client.cookies.get("buvid3") == "buvid3_B"
+            assert cb._client.cookies.get("bili_ticket") == "ticket_B"
+
+    asyncio.run(scenario())
