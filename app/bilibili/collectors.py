@@ -14,17 +14,63 @@ logger = logging.getLogger(__name__)
 VIDEO_SYNC_RULE = "owner_only_v2"
 ONLINE_COUNT_RULE = "minus_1_per_cid_v1"
 
+# Adaptive 5-tier video scheduling levels (lower = higher priority)
+TIER_FAST = 0      # T0: newly published (<=24h), high online (>=3), or surging play velocity
+TIER_ACTIVE = 1    # T1: active viewers (1-2), recent (24-72h), or moderate play velocity
+TIER_WARM = 2      # T2: warm/observation (3-14d, newest floor, or streak < 2)
+TIER_SLEEP = 3     # T3: dormant (zero_online_streak 2..5 or low trickle plays)
+TIER_FROZEN = 4    # T4: deep-frozen (>14d, zero_online_streak >= 6, near-zero plays)
+
+FAST_PULSE_INTERVAL_MINUTES = 2
+FAST_ONLINE_THRESHOLD = 3
+FAST_NEW_PUB_WINDOW_SEC = 24 * 3600
+ACTIVE_NEW_PUB_WINDOW_SEC = 72 * 3600
+WARM_NEW_PUB_WINDOW_SEC = 14 * 86400
+WARM_NEWEST_FLOOR = 5
+FAST_PLAY_RATE_THRESHOLD = 80.0
+ACTIVE_PLAY_RATE_THRESHOLD = 25.0
+WARM_PLAY_RATE_THRESHOLD = 5.0
+SLEEP_PLAY_RATE_THRESHOLD = 1.0
+SLEEP_ZERO_STREAK = 2
+FROZEN_ZERO_STREAK = 6
+
+# Effective online polling TTLs (slightly below nominal intervals to avoid scheduler jitter skips)
+ONLINE_TTL_BY_TIER: dict[int, int] = {
+    TIER_FAST: 105,      # nominal 2 min
+    TIER_ACTIVE: 270,    # nominal 5 min
+    TIER_WARM: 1740,     # nominal 30 min
+    TIER_SLEEP: 21300,   # nominal 6 hours
+    TIER_FROZEN: 86100,  # nominal 24 hours
+}
+
+# Stats (/x/web-interface/view) refresh TTLs
+STATS_ACTIVE_TTL_SEC = 240
+STATS_TTL_BY_TIER: dict[int, int] = {
+    TIER_FAST: STATS_ACTIVE_TTL_SEC,  # 4 min
+    TIER_ACTIVE: 900,                 # 15 min
+    TIER_WARM: 7200,                  # 2 hours (when play_count changed)
+    TIER_SLEEP: 21600,                # 6 hours (when play_count changed)
+    TIER_FROZEN: 43200,               # 12 hours (when play_count changed)
+}
+STATS_UNCHANGED_TTL_BY_TIER: dict[int, int] = {
+    TIER_WARM: 21600,     # 6 hours when play_count unchanged
+    TIER_SLEEP: 259200,   # 72 hours when play_count unchanged
+    TIER_FROZEN: 604800,  # 7 days when play_count unchanged
+}
+
+STATS_BACKOFF_ERROR_CODES = frozenset({-404, 62002, 62004, 62012, -403})
+ONLINE_BACKOFF_ERROR_CODES = frozenset({-404, 62002, 62004, 62012})
+STATS_BACKOFF_SECONDS = 24 * 3600
+
+# Budgets & sync intervals
 TIERED_VIDEO_THRESHOLD = 80
-HOT_NEWEST_LIMIT = 25
-HOT_TOP_PLAYS_LIMIT = 40
 COLD_POLL_BATCH_SIZE = 30
+MAX_ONLINE_POLL_PER_ACCOUNT = 150
 SHOWCASE_TOP_LIMIT = 50
 STATS_REFRESH_QUOTA = 30
-STATS_ACTIVE_TTL_SEC = 240
-STATS_RECENT_PUB_WINDOW_SEC = 3 * 86400
-STATS_HOT_TTL_SEC = 3600
-STATS_COLD_TTL_SEC = 86400
-FULL_VIDEO_SYNC_INTERVAL_SEC = 12 * 3600
+FAST_PULSE_MAX_VIDEOS = 100
+FAST_PULSE_STATS_QUOTA = 24
+FULL_VIDEO_SYNC_INTERVAL_SEC = 6 * 3600
 
 
 def _parse_iso_ts(raw: Any) -> Optional[float]:
@@ -54,62 +100,182 @@ def _is_valid_stat_payload(stat: Any) -> bool:
     )
 
 
-def select_polled_videos(
-    videos: list[dict[str, Any]], now_ts: float
-) -> tuple[list[dict[str, Any]], set[str], bool]:
-    """Select videos to poll for real-time online viewers using Hot + Cold round-robin tiers."""
-    if len(videos) <= TIERED_VIDEO_THRESHOLD:
-        all_bvids = {v["bvid"] for v in videos}
-        return list(videos), all_bvids, False
-
-    active_bvids = {
-        v["bvid"]
-        for v in videos
-        if int(v.get("last_online_count") or 0) > 0 or int(v.get("hot_until_ts") or 0) > now_ts
-    }
-    newest_bvids = {
+def _get_newest_floor_bvids(videos: list[dict[str, Any]]) -> set[str]:
+    """Return up to WARM_NEWEST_FLOOR most recently published BVids for an account."""
+    if not videos:
+        return set()
+    return {
         v["bvid"]
         for v in sorted(
             videos,
             key=lambda x: (int(x.get("pubdate") or 0), x["bvid"]),
             reverse=True,
-        )[:HOT_NEWEST_LIMIT]
+        )[:WARM_NEWEST_FLOOR]
     }
-    top_plays_bvids = {
-        v["bvid"]
-        for v in sorted(
-            videos,
-            key=lambda x: (
-                int(x.get("play_count") or 0),
-                int(x.get("pubdate") or 0),
-                x["bvid"],
-            ),
-            reverse=True,
-        )[:HOT_TOP_PLAYS_LIMIT]
-    }
-    hot_bvids = active_bvids | newest_bvids | top_plays_bvids
 
-    hot_videos = sorted(
-        (v for v in videos if v["bvid"] in hot_bvids),
+
+def classify_video_tier(
+    video: dict[str, Any],
+    now_ts: float,
+    newest_floor_bvids: Optional[set[str]] = None,
+) -> int:
+    """Classify a video into adaptive polling tier T0 (fast) .. T4 (frozen)."""
+    online = int(video.get("last_online_count") or 0)
+    pubdate = int(video.get("pubdate") or 0)
+    pub_age = (now_ts - pubdate) if pubdate > 0 else float("inf")
+    fast_until = int(video.get("fast_until_ts") or 0)
+    hot_until = int(video.get("hot_until_ts") or 0)
+    play_rate = float(video.get("play_rate_per_hour") or 0.0)
+    zero_streak = int(video.get("zero_online_streak") or 0)
+
+    if (
+        pub_age <= FAST_NEW_PUB_WINDOW_SEC
+        or online >= FAST_ONLINE_THRESHOLD
+        or play_rate >= FAST_PLAY_RATE_THRESHOLD
+        or fast_until > now_ts
+    ):
+        return TIER_FAST
+
+    if (
+        pub_age <= ACTIVE_NEW_PUB_WINDOW_SEC
+        or online >= 1
+        or hot_until > now_ts
+        or play_rate >= ACTIVE_PLAY_RATE_THRESHOLD
+    ):
+        return TIER_ACTIVE
+
+    if (
+        pub_age <= WARM_NEW_PUB_WINDOW_SEC
+        or play_rate >= WARM_PLAY_RATE_THRESHOLD
+        or (newest_floor_bvids is not None and video["bvid"] in newest_floor_bvids)
+        or zero_streak < SLEEP_ZERO_STREAK
+    ):
+        return TIER_WARM
+
+    if zero_streak < FROZEN_ZERO_STREAK or play_rate >= SLEEP_PLAY_RATE_THRESHOLD:
+        return TIER_SLEEP
+
+    return TIER_FROZEN
+
+
+def is_video_online_due(
+    video: dict[str, Any],
+    tier: int,
+    now_ts: float,
+    *,
+    base_interval_sec: int = 300,
+) -> bool:
+    """Return True if a video's online viewer count is due for polling under its tier TTL."""
+    checked_ts = _parse_iso_ts(video.get("last_checked_at"))
+    if checked_ts is None:
+        return True
+
+    age = now_ts - checked_ts
+    if tier == TIER_FAST:
+        ttl = min(ONLINE_TTL_BY_TIER[TIER_FAST], max(45, int(base_interval_sec) - 15))
+    elif tier == TIER_ACTIVE:
+        ttl = max(45, int(base_interval_sec) - min(30, max(10, int(base_interval_sec) // 10)))
+    else:
+        ttl = ONLINE_TTL_BY_TIER.get(tier, ONLINE_TTL_BY_TIER[TIER_FROZEN])
+    return age >= ttl
+
+
+def summarize_video_tiers(
+    videos: list[dict[str, Any]], now_ts: float
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Return (tier_by_bvid, tier_counts_dict) for all videos of an account."""
+    newest_floor = _get_newest_floor_bvids(videos)
+    tier_by_bvid: dict[str, int] = {}
+    counts = {"t0": 0, "t1": 0, "t2": 0, "t3": 0, "t4": 0}
+    for v in videos:
+        tier = classify_video_tier(v, now_ts, newest_floor)
+        tier_by_bvid[v["bvid"]] = tier
+        counts[f"t{tier}"] += 1
+    return tier_by_bvid, counts
+
+
+def select_polled_videos(
+    videos: list[dict[str, Any]],
+    now_ts: float,
+    *,
+    base_interval_sec: int = 300,
+    cold_batch_size: int = COLD_POLL_BATCH_SIZE,
+    max_total: int = MAX_ONLINE_POLL_PER_ACCOUNT,
+    force_active: bool = False,
+) -> tuple[list[dict[str, Any]], set[str], bool]:
+    """Select due videos to poll for online viewers using 5-tier adaptive scheduling."""
+    if not videos:
+        return [], set(), False
+
+    tier_by_bvid, _ = summarize_video_tiers(videos, now_ts)
+    priority_bvids = {bvid for bvid, tier in tier_by_bvid.items() if tier <= TIER_ACTIVE}
+
+    active_due: list[dict[str, Any]] = []
+    background_due: list[dict[str, Any]] = []
+
+    for v in videos:
+        bvid = v["bvid"]
+        tier = tier_by_bvid[bvid]
+        if tier <= TIER_ACTIVE:
+            if force_active or is_video_online_due(
+                v, tier, now_ts, base_interval_sec=base_interval_sec
+            ):
+                active_due.append(v)
+        else:
+            if is_video_online_due(v, tier, now_ts, base_interval_sec=base_interval_sec):
+                background_due.append(v)
+
+    active_due.sort(
         key=lambda x: (
-            int(x.get("last_online_count") or 0),
-            int(x.get("play_count") or 0),
-            int(x.get("pubdate") or 0),
-        ),
-        reverse=True,
+            tier_by_bvid[x["bvid"]],
+            -int(x.get("last_online_count") or 0),
+            -float(x.get("play_rate_per_hour") or 0.0),
+            -int(x.get("pubdate") or 0),
+            x["bvid"],
+        )
     )
-    cold_candidates = sorted(
-        (v for v in videos if v["bvid"] not in hot_bvids),
+    background_due.sort(
         key=lambda x: (
             0 if _parse_iso_ts(x.get("last_checked_at")) is None else 1,
+            tier_by_bvid[x["bvid"]],
             _parse_iso_ts(x.get("last_checked_at")) or 0.0,
             -int(x.get("play_count") or 0),
             -int(x.get("pubdate") or 0),
             x["bvid"],
-        ),
+        )
     )
-    polled = hot_videos + cold_candidates[:COLD_POLL_BATCH_SIZE]
-    return polled, hot_bvids, True
+
+    limited_bg = background_due[: max(0, int(cold_batch_size))]
+    polled = (active_due + limited_bg)[: max(0, int(max_total))]
+    is_tiered = len(polled) < len(videos)
+    return polled, priority_bvids, is_tiered
+
+
+def select_fast_pulse_videos(
+    videos: list[dict[str, Any]],
+    now_ts: float,
+    *,
+    max_videos: int = FAST_PULSE_MAX_VIDEOS,
+) -> list[dict[str, Any]]:
+    """Select due T0 (fast-tier) videos for the high-frequency 2-minute pulse."""
+    if not videos or max_videos <= 0:
+        return []
+    tier_by_bvid, _ = summarize_video_tiers(videos, now_ts)
+    due_fast = [
+        v
+        for v in videos
+        if tier_by_bvid[v["bvid"]] == TIER_FAST
+        and is_video_online_due(v, TIER_FAST, now_ts, base_interval_sec=120)
+    ]
+    due_fast.sort(
+        key=lambda x: (
+            -int(x.get("last_online_count") or 0),
+            -float(x.get("play_rate_per_hour") or 0.0),
+            -int(x.get("pubdate") or 0),
+            x["bvid"],
+        )
+    )
+    return due_fast[:max_videos]
 
 
 def select_stats_refresh_bvids(
@@ -117,10 +283,14 @@ def select_stats_refresh_bvids(
     hot_bvids: set[str],
     now_ts: float,
     quota: int = STATS_REFRESH_QUOTA,
+    *,
+    tiers_filter: Optional[set[int]] = None,
 ) -> list[str]:
     """Select up to `quota` BVids to refresh play/like/coin stats via /x/web-interface/view."""
     if quota <= 0 or not videos:
         return []
+
+    tier_by_bvid, _ = summarize_video_tiers(videos, now_ts)
 
     top_online = {
         v["bvid"]
@@ -140,41 +310,63 @@ def select_stats_refresh_bvids(
     }
     showcase_bvids = hot_bvids | top_online | top_plays
 
-    unsynced_showcase: list[dict[str, Any]] = []
+    unsynced_priority: list[dict[str, Any]] = []
     unsynced_cold: list[dict[str, Any]] = []
-    stale_active: list[tuple[int, int, int, float, dict[str, Any]]] = []
-    stale_showcase: list[tuple[float, dict[str, Any]]] = []
-    stale_cold: list[tuple[float, dict[str, Any]]] = []
+    stale_fast: list[tuple[int, int, float, int, float, dict[str, Any]]] = []
+    stale_active: list[tuple[int, int, float, int, float, dict[str, Any]]] = []
+    stale_warm: list[tuple[int, float, dict[str, Any]]] = []
+    stale_dormant: list[tuple[int, int, float, dict[str, Any]]] = []
 
     for v in videos:
         bvid = v["bvid"]
+        tier = tier_by_bvid[bvid]
+        if tiers_filter is not None and tier not in tiers_filter:
+            continue
+        if int(v.get("stats_backoff_until_ts") or 0) > now_ts:
+            continue
+
         in_showcase = bvid in showcase_bvids
         online_val = int(v.get("last_online_count") or 0)
         pubdate_val = int(v.get("pubdate") or 0)
-        is_live_active = (
-            online_val > 0
-            or int(v.get("hot_until_ts") or 0) > now_ts
-            or (pubdate_val > 0 and (now_ts - pubdate_val) <= STATS_RECENT_PUB_WINDOW_SEC)
-        )
+        play_rate = float(v.get("play_rate_per_hour") or 0.0)
         synced_ts = _parse_iso_ts(v.get("stats_synced_at"))
+
         if synced_ts is None:
-            if in_showcase or is_live_active:
-                unsynced_showcase.append(v)
+            if tier <= TIER_ACTIVE or in_showcase:
+                unsynced_priority.append(v)
             else:
                 unsynced_cold.append(v)
-        else:
-            age = now_ts - synced_ts
-            if is_live_active and age >= STATS_ACTIVE_TTL_SEC:
-                stale_active.append(
-                    (1 if online_val > 0 else 0, online_val, pubdate_val, -synced_ts, v)
-                )
-            elif in_showcase and age >= STATS_HOT_TTL_SEC:
-                stale_showcase.append((synced_ts, v))
-            elif not in_showcase and age >= STATS_COLD_TTL_SEC:
-                stale_cold.append((synced_ts, v))
+            continue
 
-    unsynced_showcase.sort(
+        age = now_ts - synced_ts
+        if tier == TIER_FAST:
+            if age >= STATS_TTL_BY_TIER[TIER_FAST]:
+                stale_fast.append(
+                    (1 if online_val > 0 else 0, online_val, play_rate, pubdate_val, -synced_ts, v)
+                )
+        elif tier == TIER_ACTIVE:
+            if age >= STATS_TTL_BY_TIER[TIER_ACTIVE]:
+                stale_active.append(
+                    (1 if online_val > 0 else 0, online_val, play_rate, pubdate_val, -synced_ts, v)
+                )
+        else:
+            stats_play = v.get("stats_play_count")
+            cur_play = int(v.get("play_count") or 0)
+            play_changed = stats_play is None or cur_play != int(stats_play)
+            effective_ttl = (
+                STATS_TTL_BY_TIER[tier]
+                if play_changed
+                else STATS_UNCHANGED_TTL_BY_TIER[tier]
+            )
+            if age >= effective_ttl:
+                if tier == TIER_WARM:
+                    stale_warm.append((0 if play_changed else 1, synced_ts, v))
+                else:
+                    stale_dormant.append((0 if play_changed else 1, tier, synced_ts, v))
+
+    unsynced_priority.sort(
         key=lambda x: (
+            -tier_by_bvid[x["bvid"]],
             1 if int(x.get("last_online_count") or 0) > 0 else 0,
             int(x.get("last_online_count") or 0),
             int(x.get("play_count") or 0),
@@ -186,19 +378,24 @@ def select_stats_refresh_bvids(
         key=lambda x: (int(x.get("play_count") or 0), int(x.get("pubdate") or 0)),
         reverse=True,
     )
-    stale_active.sort(
-        key=lambda item: (item[0], item[1], item[2], item[3]),
+    stale_fast.sort(
+        key=lambda item: (item[0], item[1], item[2], item[3], item[4]),
         reverse=True,
     )
-    stale_showcase.sort(key=lambda pair: pair[0])
-    stale_cold.sort(key=lambda pair: pair[0])
+    stale_active.sort(
+        key=lambda item: (item[0], item[1], item[2], item[3], item[4]),
+        reverse=True,
+    )
+    stale_warm.sort(key=lambda item: (item[0], item[1]))
+    stale_dormant.sort(key=lambda item: (item[0], item[1], item[2]))
 
     ordered = (
-        [v["bvid"] for v in unsynced_showcase]
-        + [v["bvid"] for v in unsynced_cold]
+        [v["bvid"] for v in unsynced_priority]
+        + [v["bvid"] for *_, v in stale_fast]
         + [v["bvid"] for *_, v in stale_active]
-        + [v["bvid"] for _, v in stale_showcase]
-        + [v["bvid"] for _, v in stale_cold]
+        + [v["bvid"] for v in unsynced_cold]
+        + [v["bvid"] for _, _, v in stale_warm]
+        + [v["bvid"] for _, _, _, v in stale_dormant]
     )
     return ordered[:quota]
 
@@ -206,6 +403,157 @@ def select_stats_refresh_bvids(
 def adjust_online_count(raw_count: int) -> int:
     """Subtract 1 baseline viewer reported by Bilibili /x/player/online/total per CID."""
     return max(0, int(raw_count) - 1)
+
+
+async def _fetch_video_batch(
+    *,
+    client: BilibiliClient,
+    db: Database,
+    work_videos: list[dict[str, Any]],
+    online_set: set[str],
+    stat_set: set[str],
+    delay_sec: float,
+    abort_412: Optional[asyncio.Event] = None,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[str],
+    list[str],
+    list[str],
+    bool,
+]:
+    """Fetch stats (/view) and real-time online counts for a batch of videos with concurrency control."""
+    if not work_videos:
+        return [], [], [], [], [], False
+
+    semaphore = asyncio.Semaphore(4)
+    local_abort = abort_412 if abort_412 is not None else asyncio.Event()
+    stat_updates: list[dict[str, Any]] = []
+    stats_backoff_bvids: list[str] = []
+    online_backoff_bvids: list[str] = []
+    errors: list[str] = []
+
+    async def fetch_single_video(video: dict[str, Any]) -> Optional[dict[str, Any]]:
+        if local_abort.is_set():
+            return None
+        async with semaphore:
+            if local_abort.is_set():
+                return None
+            bvid = video["bvid"]
+
+            if bvid in stat_set:
+                try:
+                    stat = await client.get_video_stat(bvid)
+                    if _is_valid_stat_payload(stat):
+                        play_val = max(
+                            0, int(stat.get("play_count", video.get("play_count", 0)))
+                        )
+                        like_val = max(0, int(stat["like_count"]))
+                        coin_val = max(0, int(stat["coin_count"]))
+                        video["play_count"] = max(int(video.get("play_count") or 0), play_val)
+                        video["like_count"] = like_val
+                        video["coin_count"] = coin_val
+                        video["stats_synced_at"] = "synced"
+                        stat_updates.append(
+                            {
+                                "bvid": bvid,
+                                "play_count": video["play_count"],
+                                "like_count": like_val,
+                                "coin_count": coin_val,
+                            }
+                        )
+                        view_cids = stat.get("cids")
+                        if not video.get("cids") and isinstance(view_cids, list) and view_cids:
+                            video["cids"] = view_cids
+                            await asyncio.to_thread(db.update_video_cids, bvid, view_cids)
+                        await asyncio.sleep(delay_sec)
+                except BilibiliAPIError as exc:
+                    errors.append(f"{bvid} 获取点赞投币失败: {exc}")
+                    if exc.code == 412:
+                        local_abort.set()
+                        return None
+                    if exc.code in STATS_BACKOFF_ERROR_CODES:
+                        stats_backoff_bvids.append(bvid)
+                except Exception as exc:
+                    errors.append(f"{bvid} 获取点赞投币失败: {exc}")
+
+            if bvid not in online_set:
+                return None
+
+            cids = video.get("cids") or []
+            if not cids:
+                try:
+                    cids = await client.get_video_cids(bvid)
+                    if cids:
+                        await asyncio.to_thread(db.update_video_cids, bvid, cids)
+                    await asyncio.sleep(delay_sec)
+                except BilibiliAPIError as exc:
+                    errors.append(f"{bvid} 获取CID失败: {exc}")
+                    if exc.code == 412:
+                        local_abort.set()
+                    elif exc.code in ONLINE_BACKOFF_ERROR_CODES:
+                        online_backoff_bvids.append(bvid)
+                    return None
+                except Exception as exc:
+                    errors.append(f"{bvid} 获取CID失败: {exc}")
+                    return None
+
+            if not cids:
+                return None
+
+            video_online = 0
+            raw_parts: list[str] = []
+            succeeded_parts = 0
+            hit_missing_code = False
+            for part in cids:
+                if local_abort.is_set():
+                    return None
+                try:
+                    count, raw = await client.get_video_online_total(bvid, int(part["cid"]))
+                    video_online += adjust_online_count(count)
+                    raw_parts.append(raw)
+                    succeeded_parts += 1
+                    await asyncio.sleep(delay_sec)
+                except BilibiliAPIError as exc:
+                    errors.append(f"{bvid}(cid={part['cid']}) 在线人数失败: {exc}")
+                    if exc.code == 412:
+                        local_abort.set()
+                        return None
+                    if exc.code in ONLINE_BACKOFF_ERROR_CODES:
+                        hit_missing_code = True
+                    continue
+                except Exception as exc:
+                    errors.append(f"{bvid}(cid={part['cid']}) 在线人数失败: {exc}")
+                    continue
+
+            if succeeded_parts == 0:
+                if hit_missing_code:
+                    online_backoff_bvids.append(bvid)
+                return None
+
+            online_raw = raw_parts[0] if len(raw_parts) == 1 else "+".join(raw_parts)
+            raw_like = video.get("like_count")
+            has_like_stat = bool(video.get("stats_synced_at")) or (
+                raw_like is not None and int(raw_like) > 0
+            )
+            return {
+                "bvid": bvid,
+                "online_count": video_online,
+                "online_raw": online_raw,
+                "play_count": int(video.get("play_count", 0)),
+                "like_count": int(raw_like or 0) if has_like_stat else None,
+            }
+
+    results = await asyncio.gather(*(fetch_single_video(v) for v in work_videos))
+    succeeded_items = [item for item in results if item is not None]
+    return (
+        succeeded_items,
+        stat_updates,
+        stats_backoff_bvids,
+        online_backoff_bvids,
+        errors,
+        local_abort.is_set(),
+    )
 
 
 @dataclass
@@ -221,6 +569,7 @@ class CrawlContext:
     video_count: int = 0
     videos_polled: int = 0
     videos_succeeded: int = 0
+    online_poll_planned: bool = False
     video_online_items: list[dict[str, Any]] = field(default_factory=list)
     extra_metrics: dict[str, Any] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
@@ -261,12 +610,15 @@ class AccountFollowerCollector(BaseCollector):
 
 
 class AllVideosOnlineCollector(BaseCollector):
-    """Syncs user's uploaded videos and sums real-time concurrent viewers across all videos."""
+    """Syncs user's uploaded videos and polls real-time concurrent viewers via 5-tier adaptive scheduling."""
 
     name = "all_videos_online"
 
     async def collect(self, ctx: CrawlContext) -> None:
         delay_sec = max(0.05, int(ctx.settings.get("request_delay_ms", "200") or 200) / 1000.0)
+        base_interval_sec = max(
+            60, int(ctx.settings.get("interval_minutes", "5") or 5) * 60
+        )
         sync_interval_sec = (
             max(5, int(ctx.settings.get("video_sync_interval_minutes", "30") or 30)) * 60
         )
@@ -354,6 +706,7 @@ class AllVideosOnlineCollector(BaseCollector):
                     raise
 
         ctx.video_count = len(cached_videos)
+        ctx.online_poll_planned = True
         if not cached_videos:
             ctx.online_viewers_total = 0
             ctx.videos_polled = 0
@@ -362,9 +715,15 @@ class AllVideosOnlineCollector(BaseCollector):
             return
 
         poll_now_ts = time.time()
-        polled_videos, hot_bvids, is_tiered = select_polled_videos(cached_videos, poll_now_ts)
+        _, tier_counts = summarize_video_tiers(cached_videos, poll_now_ts)
+        polled_videos, priority_bvids, is_tiered = select_polled_videos(
+            cached_videos,
+            poll_now_ts,
+            base_interval_sec=base_interval_sec,
+            force_active=ctx.force_sync_videos,
+        )
         stats_target_order = select_stats_refresh_bvids(
-            cached_videos, hot_bvids, poll_now_ts, quota=STATS_REFRESH_QUOTA
+            cached_videos, priority_bvids, poll_now_ts, quota=STATS_REFRESH_QUOTA
         )
 
         online_set = {v["bvid"] for v in polled_videos}
@@ -379,124 +738,42 @@ class AllVideosOnlineCollector(BaseCollector):
         ctx.videos_polled = len(polled_videos)
         ctx.extra_metrics["videos_polled"] = len(polled_videos)
         ctx.extra_metrics["tiered_polling"] = is_tiered
+        ctx.extra_metrics["tier_counts"] = tier_counts
         ctx.extra_metrics["total_video_plays"] = sum(
             int(v.get("play_count", 0)) for v in cached_videos
         )
 
-        semaphore = asyncio.Semaphore(4)
-        abort_412 = asyncio.Event()
-        stat_updates: list[dict[str, Any]] = []
+        (
+            succeeded_items,
+            stat_updates,
+            stats_backoff_bvids,
+            online_backoff_bvids,
+            batch_errors,
+            _,
+        ) = await _fetch_video_batch(
+            client=ctx.client,
+            db=ctx.db,
+            work_videos=work_videos,
+            online_set=online_set,
+            stat_set=stat_set,
+            delay_sec=delay_sec,
+        )
+        ctx.errors.extend(batch_errors)
 
-        async def fetch_single_video(video: dict[str, Any]) -> Optional[dict[str, Any]]:
-            if abort_412.is_set():
-                return None
-            async with semaphore:
-                if abort_412.is_set():
-                    return None
-                bvid = video["bvid"]
-
-                if bvid in stat_set:
-                    try:
-                        stat = await ctx.client.get_video_stat(bvid)
-                        if _is_valid_stat_payload(stat):
-                            play_val = max(
-                                0, int(stat.get("play_count", video.get("play_count", 0)))
-                            )
-                            like_val = max(0, int(stat["like_count"]))
-                            coin_val = max(0, int(stat["coin_count"]))
-                            video["play_count"] = play_val
-                            video["like_count"] = like_val
-                            video["coin_count"] = coin_val
-                            video["stats_synced_at"] = "synced"
-                            stat_updates.append(
-                                {
-                                    "bvid": bvid,
-                                    "play_count": play_val,
-                                    "like_count": like_val,
-                                    "coin_count": coin_val,
-                                }
-                            )
-                            view_cids = stat.get("cids")
-                            if not video.get("cids") and isinstance(view_cids, list) and view_cids:
-                                video["cids"] = view_cids
-                                await asyncio.to_thread(ctx.db.update_video_cids, bvid, view_cids)
-                            await asyncio.sleep(delay_sec)
-                    except BilibiliAPIError as exc:
-                        ctx.errors.append(f"{bvid} 获取点赞投币失败: {exc}")
-                        if exc.code == 412:
-                            abort_412.set()
-                            return None
-                    except Exception as exc:
-                        ctx.errors.append(f"{bvid} 获取点赞投币失败: {exc}")
-
-                if bvid not in online_set:
-                    return None
-
-                cids = video.get("cids") or []
-                if not cids:
-                    try:
-                        cids = await ctx.client.get_video_cids(bvid)
-                        if cids:
-                            await asyncio.to_thread(ctx.db.update_video_cids, bvid, cids)
-                        await asyncio.sleep(delay_sec)
-                    except BilibiliAPIError as exc:
-                        ctx.errors.append(f"{bvid} 获取CID失败: {exc}")
-                        if exc.code == 412:
-                            abort_412.set()
-                        return None
-                    except Exception as exc:
-                        ctx.errors.append(f"{bvid} 获取CID失败: {exc}")
-                        return None
-
-                if not cids:
-                    return None
-
-                video_online = 0
-                raw_parts: list[str] = []
-                succeeded_parts = 0
-                for part in cids:
-                    if abort_412.is_set():
-                        return None
-                    try:
-                        count, raw = await ctx.client.get_video_online_total(bvid, int(part["cid"]))
-                        video_online += adjust_online_count(count)
-                        raw_parts.append(raw)
-                        succeeded_parts += 1
-                        await asyncio.sleep(delay_sec)
-                    except BilibiliAPIError as exc:
-                        ctx.errors.append(f"{bvid}(cid={part['cid']}) 在线人数失败: {exc}")
-                        if exc.code == 412:
-                            abort_412.set()
-                            return None
-                        continue
-                    except Exception as exc:
-                        ctx.errors.append(f"{bvid}(cid={part['cid']}) 在线人数失败: {exc}")
-                        continue
-
-                if succeeded_parts == 0:
-                    return None
-
-                online_raw = raw_parts[0] if len(raw_parts) == 1 else "+".join(raw_parts)
-                raw_like = video.get("like_count")
-                has_like_stat = bool(video.get("stats_synced_at")) or (
-                    raw_like is not None and int(raw_like) > 0
-                )
-                return {
-                    "bvid": bvid,
-                    "online_count": video_online,
-                    "online_raw": online_raw,
-                    "play_count": int(video.get("play_count", 0)),
-                    "like_count": int(raw_like or 0) if has_like_stat else None,
-                }
-
-        results = await asyncio.gather(*(fetch_single_video(v) for v in work_videos))
         if stat_updates:
             await asyncio.to_thread(ctx.db.update_video_stats_batch, stat_updates)
             ctx.extra_metrics["stats_refreshed"] = len(stat_updates)
             ctx.extra_metrics["total_video_plays"] = sum(
                 int(v.get("play_count", 0)) for v in cached_videos
             )
-        succeeded_items = [item for item in results if item is not None]
+        if stats_backoff_bvids:
+            backoff_until = int(time.time()) + STATS_BACKOFF_SECONDS
+            await asyncio.to_thread(
+                ctx.db.set_video_stats_backoff_batch, stats_backoff_bvids, backoff_until
+            )
+        if online_backoff_bvids:
+            await asyncio.to_thread(ctx.db.set_video_online_backoff_batch, online_backoff_bvids)
+
         unpolled_carryover = sum(
             max(0, int(v.get("last_online_count") or 0))
             for v in cached_videos
@@ -510,7 +787,7 @@ class AllVideosOnlineCollector(BaseCollector):
 
 
 class CrawlService:
-    """Coordinates modular collectors and persists snapshots safely."""
+    """Coordinates modular collectors, fast-tier pulses, and persists snapshots safely."""
 
     def __init__(self, database: Database, collectors: Optional[list[BaseCollector]] = None) -> None:
         self.db = database
@@ -564,7 +841,9 @@ class CrawlService:
 
             duration_ms = int((time.perf_counter() - started) * 1000)
 
-            expected_online = ctx.videos_polled if ctx.videos_polled > 0 else ctx.video_count
+            expected_online = (
+                ctx.videos_polled if ctx.online_poll_planned else ctx.video_count
+            )
             if ctx.follower_count is None and ctx.online_viewers_total is None:
                 status = "error"
             elif ctx.errors or (expected_online > 0 and ctx.videos_succeeded < expected_online):
@@ -672,4 +951,149 @@ class CrawlService:
                 "skipped": False,
                 "total": len(accounts),
                 "results": results,
+            }
+
+    async def run_fast_pulse(
+        self,
+        *,
+        max_videos: int = FAST_PULSE_MAX_VIDEOS,
+        stats_quota: int = FAST_PULSE_STATS_QUOTA,
+    ) -> dict[str, Any]:
+        """Run a lightweight 2-minute high-frequency pulse for due T0 videos across enabled accounts."""
+        if self._lock.locked():
+            return {"skipped": True, "reason": "已有采集任务正在进行中"}
+
+        async with self._lock:
+            accounts = await asyncio.to_thread(self.db.get_enabled_accounts)
+            if not accounts:
+                return {"skipped": True, "reason": "没有启用的监控账号"}
+
+            settings = await asyncio.to_thread(self.db.get_all_settings)
+            delay_sec = max(
+                0.05, int(settings.get("request_delay_ms", "200") or 200) / 1000.0
+            )
+            started = time.perf_counter()
+            now_ts = time.time()
+
+            remaining_online = max(0, int(max_videos))
+            remaining_stats = max(0, int(stats_quota))
+            accounts_touched = 0
+            total_polled = 0
+            total_succeeded = 0
+            total_stats = 0
+            aborted_412 = False
+            global_abort = asyncio.Event()
+
+            try:
+                for acc in accounts:
+                    if remaining_online <= 0 or global_abort.is_set():
+                        break
+
+                    uid = acc["uid"]
+                    cached_videos = await asyncio.to_thread(self.db.get_videos, uid)
+                    if not cached_videos:
+                        continue
+
+                    polled_videos = select_fast_pulse_videos(
+                        cached_videos, now_ts, max_videos=remaining_online
+                    )
+                    if not polled_videos:
+                        continue
+
+                    fast_bvids = {v["bvid"] for v in polled_videos}
+                    stats_bvids = (
+                        select_stats_refresh_bvids(
+                            cached_videos,
+                            fast_bvids,
+                            now_ts,
+                            quota=remaining_stats,
+                            tiers_filter={TIER_FAST},
+                        )
+                        if remaining_stats > 0
+                        else []
+                    )
+                    stat_set = set(stats_bvids)
+                    by_bvid = {v["bvid"]: v for v in cached_videos}
+                    work_videos: list[dict[str, Any]] = list(polled_videos)
+                    for bvid in stats_bvids:
+                        if bvid not in fast_bvids and bvid in by_bvid:
+                            work_videos.append(by_bvid[bvid])
+
+                    cookie = await asyncio.to_thread(self.db.get_effective_cookie, uid)
+                    self.crawling_uid = uid
+                    async with BilibiliClient(cookie=cookie) as client:
+                        (
+                            succeeded_items,
+                            stat_updates,
+                            stats_backoff_bvids,
+                            online_backoff_bvids,
+                            batch_errors,
+                            hit_412,
+                        ) = await _fetch_video_batch(
+                            client=client,
+                            db=self.db,
+                            work_videos=work_videos,
+                            online_set=fast_bvids,
+                            stat_set=stat_set,
+                            delay_sec=delay_sec,
+                            abort_412=global_abort,
+                        )
+
+                    if stat_updates:
+                        await asyncio.to_thread(self.db.update_video_stats_batch, stat_updates)
+                        total_stats += len(stat_updates)
+                        remaining_stats = max(0, remaining_stats - len(stat_updates))
+                    if stats_backoff_bvids:
+                        backoff_until = int(time.time()) + STATS_BACKOFF_SECONDS
+                        await asyncio.to_thread(
+                            self.db.set_video_stats_backoff_batch,
+                            stats_backoff_bvids,
+                            backoff_until,
+                        )
+                    if online_backoff_bvids:
+                        await asyncio.to_thread(
+                            self.db.set_video_online_backoff_batch, online_backoff_bvids
+                        )
+                    if succeeded_items:
+                        await asyncio.to_thread(
+                            self.db.insert_video_pulse, uid, succeeded_items
+                        )
+
+                    if batch_errors:
+                        logger.warning(
+                            "Fast pulse for UID %s had %d error(s): %s",
+                            uid,
+                            len(batch_errors),
+                            batch_errors[0],
+                        )
+
+                    accounts_touched += 1
+                    total_polled += len(polled_videos)
+                    total_succeeded += len(succeeded_items)
+                    remaining_online = max(0, remaining_online - len(polled_videos))
+                    if hit_412:
+                        aborted_412 = True
+                        break
+            finally:
+                self.crawling_uid = None
+
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            if total_polled > 0:
+                logger.info(
+                    "Fast pulse finished: accounts=%d videos=%d/%d stats=%d duration=%dms aborted_412=%s",
+                    accounts_touched,
+                    total_succeeded,
+                    total_polled,
+                    total_stats,
+                    duration_ms,
+                    aborted_412,
+                )
+            return {
+                "skipped": False,
+                "accounts_touched": accounts_touched,
+                "videos_polled": total_polled,
+                "videos_succeeded": total_succeeded,
+                "stats_refreshed": total_stats,
+                "aborted_412": aborted_412,
+                "duration_ms": duration_ms,
             }

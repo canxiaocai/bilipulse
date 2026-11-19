@@ -13,8 +13,70 @@ from app.config import DB_PATH, DEFAULT_SETTINGS, get_default_admin_password
 
 ONLINE_COUNT_RULE = "minus_1_per_cid_v1"
 HOT_STICKY_SECONDS = 900
+FAST_STICKY_SECONDS = 900
+FAST_ONLINE_THRESHOLD = 3
+FAST_PLAY_RATE_THRESHOLD = 80.0
+ACTIVE_PLAY_RATE_THRESHOLD = 25.0
+PLAY_RATE_MIN_INTERVAL_SEC = 180
+PLAY_RATE_SETTLE_INTERVAL_SEC = 600
 BJT_TZ = timezone(timedelta(hours=8))
 _SQLITE_CHUNK_SIZE = 500
+
+
+def _compute_play_rate_update(
+    *,
+    old_play: int,
+    new_play: int,
+    old_play_ts: int,
+    now_ts: int,
+    old_rate: float,
+    old_fast_until: int,
+    old_hot_until: int,
+    old_zero_streak: int,
+) -> tuple[int, float, int, int, int, int]:
+    """Compute monotonic play_count, smoothed play_rate_per_hour, and surge wake-up state."""
+    effective_play = max(max(0, int(old_play)), max(0, int(new_play)))
+    if old_play_ts <= 0:
+        return (
+            effective_play,
+            max(0.0, float(old_rate or 0.0)),
+            int(now_ts),
+            int(old_fast_until or 0),
+            int(old_hot_until or 0),
+            max(0, int(old_zero_streak or 0)),
+        )
+
+    dt = int(now_ts) - int(old_play_ts)
+    delta = max(0, effective_play - max(0, int(old_play)))
+    if dt < PLAY_RATE_MIN_INTERVAL_SEC or (delta < 15 and dt < PLAY_RATE_SETTLE_INTERVAL_SEC):
+        return (
+            effective_play,
+            max(0.0, float(old_rate or 0.0)),
+            int(old_play_ts),
+            int(old_fast_until or 0),
+            int(old_hot_until or 0),
+            max(0, int(old_zero_streak or 0)),
+        )
+
+    instant_rate = round(delta * 3600.0 / dt, 2)
+    prev_rate = max(0.0, float(old_rate or 0.0))
+    if instant_rate >= prev_rate or dt >= 900:
+        new_rate = instant_rate
+    else:
+        new_rate = round(prev_rate * 0.5 + instant_rate * 0.5, 2)
+
+    new_fast = int(old_fast_until or 0)
+    new_hot = int(old_hot_until or 0)
+    new_streak = max(0, int(old_zero_streak or 0))
+    if delta >= 20 and instant_rate >= FAST_PLAY_RATE_THRESHOLD:
+        new_fast = max(new_fast, int(now_ts) + FAST_STICKY_SECONDS)
+        new_hot = max(new_hot, int(now_ts) + HOT_STICKY_SECONDS)
+        new_streak = 0
+    elif delta >= 15 and instant_rate >= ACTIVE_PLAY_RATE_THRESHOLD:
+        new_hot = max(new_hot, int(now_ts) + HOT_STICKY_SECONDS)
+        new_streak = 0
+
+    return (effective_play, new_rate, int(now_ts), new_fast, new_hot, new_streak)
 
 
 def _adjusted_online_from_raw(raw: str, fallback_count: int) -> int:
@@ -112,11 +174,17 @@ class Database:
                     like_count INTEGER NOT NULL DEFAULT 0,
                     coin_count INTEGER NOT NULL DEFAULT 0,
                     stats_synced_at TEXT,
+                    stats_play_count INTEGER,
+                    stats_backoff_until_ts INTEGER NOT NULL DEFAULT 0,
                     cids_json TEXT NOT NULL DEFAULT '[]',
                     last_online_count INTEGER NOT NULL DEFAULT 0,
                     last_online_raw TEXT NOT NULL DEFAULT '',
                     last_checked_at TEXT,
                     hot_until_ts INTEGER NOT NULL DEFAULT 0,
+                    fast_until_ts INTEGER NOT NULL DEFAULT 0,
+                    zero_online_streak INTEGER NOT NULL DEFAULT 0,
+                    play_rate_per_hour REAL NOT NULL DEFAULT 0.0,
+                    last_play_ts INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
                 );
 
@@ -140,6 +208,23 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_video_snapshots_bvid
                     ON video_online_snapshots (bvid, id DESC);
 
+                CREATE TABLE IF NOT EXISTS video_pulse_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    uid TEXT NOT NULL,
+                    bvid TEXT NOT NULL,
+                    collected_at TEXT NOT NULL,
+                    collected_at_ts INTEGER NOT NULL,
+                    online_count INTEGER NOT NULL,
+                    online_raw TEXT NOT NULL DEFAULT '',
+                    play_count INTEGER,
+                    like_count INTEGER
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_video_pulse_bvid_ts
+                    ON video_pulse_snapshots (bvid, collected_at_ts DESC, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_video_pulse_uid_ts
+                    ON video_pulse_snapshots (uid, collected_at_ts DESC);
+
                 CREATE TABLE IF NOT EXISTS monitored_accounts (
                     uid TEXT PRIMARY KEY,
                     account_name TEXT NOT NULL DEFAULT '',
@@ -162,8 +247,47 @@ class Database:
                 conn.execute("ALTER TABLE videos ADD COLUMN coin_count INTEGER NOT NULL DEFAULT 0")
             if "stats_synced_at" not in video_cols:
                 conn.execute("ALTER TABLE videos ADD COLUMN stats_synced_at TEXT")
+            if "stats_play_count" not in video_cols:
+                conn.execute("ALTER TABLE videos ADD COLUMN stats_play_count INTEGER")
+                conn.execute(
+                    "UPDATE videos SET stats_play_count = play_count WHERE stats_synced_at IS NOT NULL"
+                )
+            if "stats_backoff_until_ts" not in video_cols:
+                conn.execute(
+                    "ALTER TABLE videos ADD COLUMN stats_backoff_until_ts INTEGER NOT NULL DEFAULT 0"
+                )
             if "hot_until_ts" not in video_cols:
                 conn.execute("ALTER TABLE videos ADD COLUMN hot_until_ts INTEGER NOT NULL DEFAULT 0")
+            if "fast_until_ts" not in video_cols:
+                conn.execute("ALTER TABLE videos ADD COLUMN fast_until_ts INTEGER NOT NULL DEFAULT 0")
+            if "zero_online_streak" not in video_cols:
+                conn.execute(
+                    "ALTER TABLE videos ADD COLUMN zero_online_streak INTEGER NOT NULL DEFAULT 0"
+                )
+                dormant_cutoff = int(time.time()) - 14 * 86400
+                conn.execute(
+                    """
+                    UPDATE videos
+                    SET zero_online_streak = 2
+                    WHERE last_checked_at IS NOT NULL
+                      AND last_online_count = 0
+                      AND hot_until_ts = 0
+                      AND pubdate > 0
+                      AND pubdate < ?
+                    """,
+                    (dormant_cutoff,),
+                )
+            if "play_rate_per_hour" not in video_cols:
+                conn.execute(
+                    "ALTER TABLE videos ADD COLUMN play_rate_per_hour REAL NOT NULL DEFAULT 0.0"
+                )
+            if "last_play_ts" not in video_cols:
+                conn.execute("ALTER TABLE videos ADD COLUMN last_play_ts INTEGER NOT NULL DEFAULT 0")
+                now_epoch = int(time.time())
+                conn.execute(
+                    "UPDATE videos SET last_play_ts = ? WHERE last_play_ts = 0 AND play_count > 0",
+                    (now_epoch,),
+                )
             video_snap_cols = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(video_online_snapshots)").fetchall()
@@ -788,6 +912,10 @@ class Database:
                 f"DELETE FROM video_online_snapshots WHERE bvid IN ({placeholders})",
                 chunk,
             )
+            conn.execute(
+                f"DELETE FROM video_pulse_snapshots WHERE bvid IN ({placeholders})",
+                chunk,
+            )
 
     def reorder_accounts(
         self, ordered_uids: list[str], crawling_uid: Optional[str] = None
@@ -840,6 +968,7 @@ class Database:
                 ).fetchall()
                 bvids = [r["bvid"] for r in video_rows]
                 conn.execute("DELETE FROM account_snapshots WHERE uid = ?", (clean_uid,))
+                conn.execute("DELETE FROM video_pulse_snapshots WHERE uid = ?", (clean_uid,))
                 if bvids:
                     self._delete_video_snapshots_by_bvids(conn, bvids)
                 conn.execute("DELETE FROM videos WHERE uid = ?", (clean_uid,))
@@ -877,43 +1006,107 @@ class Database:
 
         return {"deleted": True, "uid": clean_uid, "active_uid": new_active}
 
-    def upsert_videos(self, uid: str, videos: list[dict[str, Any]]) -> None:
+    def upsert_videos(
+        self, uid: str, videos: list[dict[str, Any]], now_ts: Optional[int] = None
+    ) -> None:
         if not videos:
             return
-        now = datetime.now(timezone.utc).astimezone().isoformat()
-        params = []
-        for v in videos:
-            has_stats = (
-                ("like_count" in v and v["like_count"] is not None)
-                or ("coin_count" in v and v["coin_count"] is not None)
-            )
-            like_val = max(0, int(v.get("like_count") or 0)) if has_stats else 0
-            coin_val = max(0, int(v.get("coin_count") or 0)) if has_stats else 0
-            synced_val = v.get("stats_synced_at") or (now if has_stats else None)
-            params.append(
-                (
-                    v["bvid"],
-                    uid,
-                    int(v["aid"]),
-                    v["title"],
-                    v.get("pic", ""),
-                    int(v.get("pubdate", 0)),
-                    int(v.get("duration", 0)),
-                    int(v.get("play_count", 0)),
-                    like_val,
-                    coin_val,
-                    synced_val,
-                    json.dumps(v.get("cids", []), ensure_ascii=False),
-                    now,
-                )
-            )
+        now_dt = (
+            datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone()
+            if now_ts is not None
+            else datetime.now(timezone.utc).astimezone()
+        )
+        now = now_dt.isoformat()
+        effective_now_ts = int(now_ts if now_ts is not None else now_dt.timestamp())
+
+        bvids = list(dict.fromkeys(v["bvid"] for v in videos))
+        existing_map: dict[str, sqlite3.Row] = {}
         with self.connection() as conn:
+            for i in range(0, len(bvids), _SQLITE_CHUNK_SIZE):
+                chunk = bvids[i : i + _SQLITE_CHUNK_SIZE]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT bvid, play_count, last_play_ts, play_rate_per_hour,
+                           fast_until_ts, hot_until_ts, zero_online_streak
+                    FROM videos WHERE bvid IN ({placeholders})
+                    """,
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    existing_map[row["bvid"]] = row
+
+            params = []
+            for v in videos:
+                has_stats = (
+                    ("like_count" in v and v["like_count"] is not None)
+                    or ("coin_count" in v and v["coin_count"] is not None)
+                )
+                like_val = max(0, int(v.get("like_count") or 0)) if has_stats else 0
+                coin_val = max(0, int(v.get("coin_count") or 0)) if has_stats else 0
+                synced_val = v.get("stats_synced_at") or (now if has_stats else None)
+                incoming_play = max(0, int(v.get("play_count", 0)))
+
+                existing = existing_map.get(v["bvid"])
+                if existing is not None:
+                    (
+                        eff_play,
+                        play_rate,
+                        play_ts,
+                        fast_until,
+                        hot_until,
+                        zero_streak,
+                    ) = _compute_play_rate_update(
+                        old_play=int(existing["play_count"] or 0),
+                        new_play=incoming_play,
+                        old_play_ts=int(existing["last_play_ts"] or 0),
+                        now_ts=effective_now_ts,
+                        old_rate=float(existing["play_rate_per_hour"] or 0.0),
+                        old_fast_until=int(existing["fast_until_ts"] or 0),
+                        old_hot_until=int(existing["hot_until_ts"] or 0),
+                        old_zero_streak=int(existing["zero_online_streak"] or 0),
+                    )
+                else:
+                    eff_play = incoming_play
+                    play_rate = max(0.0, float(v.get("play_rate_per_hour") or 0.0))
+                    play_ts = int(v.get("last_play_ts") or effective_now_ts)
+                    fast_until = int(v.get("fast_until_ts") or 0)
+                    hot_until = int(v.get("hot_until_ts") or 0)
+                    zero_streak = max(0, int(v.get("zero_online_streak") or 0))
+
+                stats_play_val = eff_play if synced_val is not None else None
+                params.append(
+                    (
+                        v["bvid"],
+                        uid,
+                        int(v["aid"]),
+                        v["title"],
+                        v.get("pic", ""),
+                        int(v.get("pubdate", 0)),
+                        int(v.get("duration", 0)),
+                        eff_play,
+                        like_val,
+                        coin_val,
+                        synced_val,
+                        stats_play_val,
+                        json.dumps(v.get("cids", []), ensure_ascii=False),
+                        hot_until,
+                        fast_until,
+                        zero_streak,
+                        play_rate,
+                        play_ts,
+                        now,
+                    )
+                )
+
             conn.executemany(
                 """
                 INSERT INTO videos (
                     bvid, uid, aid, title, pic, pubdate, duration, play_count,
-                    like_count, coin_count, stats_synced_at, cids_json, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    like_count, coin_count, stats_synced_at, stats_play_count, cids_json,
+                    hot_until_ts, fast_until_ts, zero_online_streak, play_rate_per_hour,
+                    last_play_ts, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(bvid) DO UPDATE SET
                     uid=excluded.uid,
                     aid=excluded.aid,
@@ -924,7 +1117,7 @@ class Database:
                         WHEN excluded.duration > 0 THEN excluded.duration
                         ELSE videos.duration
                     END,
-                    play_count=excluded.play_count,
+                    play_count=MAX(videos.play_count, excluded.play_count),
                     like_count=CASE
                         WHEN excluded.stats_synced_at IS NOT NULL THEN excluded.like_count
                         ELSE videos.like_count
@@ -934,32 +1127,101 @@ class Database:
                         ELSE videos.coin_count
                     END,
                     stats_synced_at=COALESCE(excluded.stats_synced_at, videos.stats_synced_at),
+                    stats_play_count=COALESCE(excluded.stats_play_count, videos.stats_play_count),
                     cids_json=CASE
                         WHEN excluded.cids_json != '[]' THEN excluded.cids_json
                         ELSE videos.cids_json
                     END,
+                    hot_until_ts=MAX(videos.hot_until_ts, excluded.hot_until_ts),
+                    fast_until_ts=MAX(videos.fast_until_ts, excluded.fast_until_ts),
+                    zero_online_streak=excluded.zero_online_streak,
+                    play_rate_per_hour=excluded.play_rate_per_hour,
+                    last_play_ts=excluded.last_play_ts,
                     updated_at=excluded.updated_at
                 """,
                 params,
             )
 
-    def update_video_stats_batch(self, items: list[dict[str, Any]]) -> None:
-        """Persist refreshed play, like, and coin counts for a batch of videos."""
+    def update_video_stats_batch(
+        self, items: list[dict[str, Any]], now_ts: Optional[int] = None
+    ) -> None:
+        """Persist refreshed play, like, and coin counts and update play velocity."""
         if not items:
             return
-        now = datetime.now(timezone.utc).astimezone().isoformat()
-        params = [
-            (
-                max(0, int(item["play_count"])),
-                max(0, int(item["like_count"])),
-                max(0, int(item["coin_count"])),
-                now,
-                now,
-                item["bvid"],
-            )
-            for item in items
-        ]
+        now_dt = (
+            datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone()
+            if now_ts is not None
+            else datetime.now(timezone.utc).astimezone()
+        )
+        now = now_dt.isoformat()
+        effective_now_ts = int(now_ts if now_ts is not None else now_dt.timestamp())
+
+        bvids = list(dict.fromkeys(item["bvid"] for item in items))
+        existing_map: dict[str, sqlite3.Row] = {}
         with self.connection() as conn:
+            for i in range(0, len(bvids), _SQLITE_CHUNK_SIZE):
+                chunk = bvids[i : i + _SQLITE_CHUNK_SIZE]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT bvid, play_count, last_play_ts, play_rate_per_hour,
+                           fast_until_ts, hot_until_ts, zero_online_streak
+                    FROM videos WHERE bvid IN ({placeholders})
+                    """,
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    existing_map[row["bvid"]] = row
+
+            params = []
+            for item in items:
+                bvid = item["bvid"]
+                incoming_play = max(0, int(item["play_count"]))
+                existing = existing_map.get(bvid)
+                if existing is not None:
+                    (
+                        eff_play,
+                        play_rate,
+                        play_ts,
+                        fast_until,
+                        hot_until,
+                        zero_streak,
+                    ) = _compute_play_rate_update(
+                        old_play=int(existing["play_count"] or 0),
+                        new_play=incoming_play,
+                        old_play_ts=int(existing["last_play_ts"] or 0),
+                        now_ts=effective_now_ts,
+                        old_rate=float(existing["play_rate_per_hour"] or 0.0),
+                        old_fast_until=int(existing["fast_until_ts"] or 0),
+                        old_hot_until=int(existing["hot_until_ts"] or 0),
+                        old_zero_streak=int(existing["zero_online_streak"] or 0),
+                    )
+                else:
+                    eff_play = incoming_play
+                    play_rate = 0.0
+                    play_ts = effective_now_ts
+                    fast_until = 0
+                    hot_until = 0
+                    zero_streak = 0
+
+                params.append(
+                    (
+                        eff_play,
+                        max(0, int(item["like_count"])),
+                        max(0, int(item["coin_count"])),
+                        now,
+                        eff_play,
+                        0,
+                        play_rate,
+                        play_ts,
+                        fast_until,
+                        hot_until,
+                        zero_streak,
+                        now,
+                        bvid,
+                    )
+                )
+
             conn.executemany(
                 """
                 UPDATE videos
@@ -967,10 +1229,57 @@ class Database:
                     like_count = ?,
                     coin_count = ?,
                     stats_synced_at = ?,
+                    stats_play_count = ?,
+                    stats_backoff_until_ts = ?,
+                    play_rate_per_hour = ?,
+                    last_play_ts = ?,
+                    fast_until_ts = MAX(fast_until_ts, ?),
+                    hot_until_ts = MAX(hot_until_ts, ?),
+                    zero_online_streak = ?,
                     updated_at = ?
                 WHERE bvid = ?
                 """,
                 params,
+            )
+
+    def set_video_stats_backoff_batch(self, bvids: list[str], backoff_until_ts: int) -> None:
+        """Record a stats-refresh backoff window for permanently failing or missing videos."""
+        if not bvids:
+            return
+        unique_bvids = list(dict.fromkeys(bvids))
+        now = datetime.now(timezone.utc).astimezone().isoformat()
+        with self.connection() as conn:
+            conn.executemany(
+                """
+                UPDATE videos
+                SET stats_backoff_until_ts = MAX(stats_backoff_until_ts, ?),
+                    updated_at = ?
+                WHERE bvid = ?
+                """,
+                [(int(backoff_until_ts), now, bvid) for bvid in unique_bvids],
+            )
+
+    def set_video_online_backoff_batch(
+        self, bvids: list[str], checked_at: Optional[datetime] = None
+    ) -> None:
+        """Advance last_checked_at and zero_online_streak for missing videos so they settle into T4."""
+        if not bvids:
+            return
+        unique_bvids = list(dict.fromkeys(bvids))
+        dt = checked_at or datetime.now(timezone.utc).astimezone()
+        checked_iso = dt.isoformat()
+        with self.connection() as conn:
+            conn.executemany(
+                """
+                UPDATE videos
+                SET last_checked_at = ?,
+                    zero_online_streak = MAX(zero_online_streak, 6),
+                    hot_until_ts = 0,
+                    fast_until_ts = 0,
+                    updated_at = ?
+                WHERE bvid = ?
+                """,
+                [(checked_iso, checked_iso, bvid) for bvid in unique_bvids],
             )
 
     def delete_stale_videos(
@@ -1000,9 +1309,10 @@ class Database:
             rows = conn.execute(
                 """
                 SELECT bvid, uid, aid, title, pic, pubdate, duration, play_count,
-                       like_count, coin_count, stats_synced_at,
-                       cids_json, last_online_count, last_online_raw, last_checked_at,
-                       hot_until_ts, updated_at
+                       like_count, coin_count, stats_synced_at, stats_play_count,
+                       stats_backoff_until_ts, cids_json, last_online_count,
+                       last_online_raw, last_checked_at, hot_until_ts, fast_until_ts,
+                       zero_online_streak, play_rate_per_hour, last_play_ts, updated_at
                 FROM videos
                 WHERE uid = ?
                 ORDER BY last_online_count DESC, pubdate DESC
@@ -1025,12 +1335,18 @@ class Database:
                     "like_count": r["like_count"],
                     "coin_count": r["coin_count"],
                     "stats_synced_at": r["stats_synced_at"],
+                    "stats_play_count": r["stats_play_count"],
+                    "stats_backoff_until_ts": int(r["stats_backoff_until_ts"] or 0),
                     "cids": cids,
                     "cid_count": max(1, len(cids)),
                     "last_online_count": r["last_online_count"],
                     "last_online_raw": r["last_online_raw"],
                     "last_checked_at": r["last_checked_at"],
                     "hot_until_ts": int(r["hot_until_ts"] or 0),
+                    "fast_until_ts": int(r["fast_until_ts"] or 0),
+                    "zero_online_streak": int(r["zero_online_streak"] or 0),
+                    "play_rate_per_hour": float(r["play_rate_per_hour"] or 0.0),
+                    "last_play_ts": int(r["last_play_ts"] or 0),
                     "updated_at": r["updated_at"],
                 }
             )
@@ -1043,6 +1359,93 @@ class Database:
                 "UPDATE videos SET cids_json = ?, updated_at = ? WHERE bvid = ?",
                 (json.dumps(cids, ensure_ascii=False), now, bvid),
             )
+
+    @staticmethod
+    def _resolve_video_snapshot_rows(
+        conn: sqlite3.Connection,
+        video_online_items: list[dict[str, Any]],
+    ) -> tuple[dict[str, int], dict[str, Optional[int]]]:
+        """Batch-fetch fallback play_count and like_count for snapshot items missing them."""
+        missing_bvids = list(
+            dict.fromkeys(
+                item["bvid"]
+                for item in video_online_items
+                if item.get("play_count") is None or "like_count" not in item
+            )
+        )
+        fallback_plays: dict[str, int] = {}
+        fallback_likes: dict[str, Optional[int]] = {}
+        for i in range(0, len(missing_bvids), _SQLITE_CHUNK_SIZE):
+            chunk = missing_bvids[i : i + _SQLITE_CHUNK_SIZE]
+            placeholders = ",".join("?" for _ in chunk)
+            v_rows = conn.execute(
+                f"SELECT bvid, play_count, like_count, stats_synced_at FROM videos WHERE bvid IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for v_row in v_rows:
+                bvid_key = v_row["bvid"]
+                if v_row["play_count"] is not None:
+                    fallback_plays[bvid_key] = int(v_row["play_count"])
+                raw_like = v_row["like_count"]
+                has_like_stat = bool(v_row["stats_synced_at"]) or (
+                    raw_like is not None and int(raw_like) > 0
+                )
+                fallback_likes[bvid_key] = (
+                    int(raw_like) if (has_like_stat and raw_like is not None) else None
+                )
+        return fallback_plays, fallback_likes
+
+    @staticmethod
+    def _apply_video_online_updates(
+        conn: sqlite3.Connection,
+        video_online_items: list[dict[str, Any]],
+        collected_iso: str,
+        collected_ts: int,
+    ) -> None:
+        """Update videos table online state, zero_online_streak, hot_until_ts, and fast_until_ts."""
+        hot_until_ts = collected_ts + HOT_STICKY_SECONDS
+        fast_until_ts = collected_ts + FAST_STICKY_SECONDS
+        video_updates: list[tuple[Any, ...]] = []
+        for item in video_online_items:
+            bvid = item["bvid"]
+            online_count = int(item["online_count"])
+            online_raw = item.get("online_raw", "")
+            video_updates.append(
+                (
+                    online_count,
+                    online_raw,
+                    collected_iso,
+                    online_count,
+                    online_count,
+                    hot_until_ts,
+                    online_count,
+                    FAST_ONLINE_THRESHOLD,
+                    fast_until_ts,
+                    bvid,
+                )
+            )
+        conn.executemany(
+            """
+            UPDATE videos
+            SET last_online_count = ?,
+                last_online_raw = ?,
+                last_checked_at = ?,
+                zero_online_streak = CASE
+                    WHEN ? > 0 THEN 0
+                    ELSE MIN(zero_online_streak + 1, 10000)
+                END,
+                hot_until_ts = CASE
+                    WHEN ? > 0 THEN MAX(hot_until_ts, ?)
+                    ELSE hot_until_ts
+                END,
+                fast_until_ts = CASE
+                    WHEN ? >= ? THEN MAX(fast_until_ts, ?)
+                    ELSE fast_until_ts
+                END
+            WHERE bvid = ?
+            """,
+            video_updates,
+        )
 
     def insert_snapshot(
         self,
@@ -1090,39 +1493,12 @@ class Database:
             snapshot_id = int(cur.lastrowid)
 
             if video_online_items:
-                missing_bvids = list(
-                    dict.fromkeys(
-                        item["bvid"]
-                        for item in video_online_items
-                        if item.get("play_count") is None or "like_count" not in item
-                    )
+                fallback_plays, fallback_likes = self._resolve_video_snapshot_rows(
+                    conn, video_online_items
                 )
-                fallback_plays: dict[str, int] = {}
-                fallback_likes: dict[str, Optional[int]] = {}
-                for i in range(0, len(missing_bvids), _SQLITE_CHUNK_SIZE):
-                    chunk = missing_bvids[i : i + _SQLITE_CHUNK_SIZE]
-                    placeholders = ",".join("?" for _ in chunk)
-                    v_rows = conn.execute(
-                        f"SELECT bvid, play_count, like_count, stats_synced_at FROM videos WHERE bvid IN ({placeholders})",
-                        chunk,
-                    ).fetchall()
-                    for v_row in v_rows:
-                        bvid_key = v_row["bvid"]
-                        if v_row["play_count"] is not None:
-                            fallback_plays[bvid_key] = int(v_row["play_count"])
-                        raw_like = v_row["like_count"]
-                        has_like_stat = bool(v_row["stats_synced_at"]) or (
-                            raw_like is not None and int(raw_like) > 0
-                        )
-                        fallback_likes[bvid_key] = (
-                            int(raw_like) if (has_like_stat and raw_like is not None) else None
-                        )
-
                 snapshot_rows: list[
                     tuple[int, str, int, str, Optional[int], Optional[int]]
                 ] = []
-                video_updates: list[tuple[int, str, str, int, int, str]] = []
-                sticky_until_ts = collected_ts + HOT_STICKY_SECONDS
                 for item in video_online_items:
                     bvid = item["bvid"]
                     online_count = int(item["online_count"])
@@ -1150,16 +1526,6 @@ class Database:
                             like_count_val,
                         )
                     )
-                    video_updates.append(
-                        (
-                            online_count,
-                            online_raw,
-                            collected_iso,
-                            online_count,
-                            sticky_until_ts,
-                            bvid,
-                        )
-                    )
 
                 conn.executemany(
                     """
@@ -1169,18 +1535,74 @@ class Database:
                     """,
                     snapshot_rows,
                 )
-                conn.executemany(
-                    """
-                    UPDATE videos
-                    SET last_online_count = ?,
-                        last_online_raw = ?,
-                        last_checked_at = ?,
-                        hot_until_ts = CASE WHEN ? > 0 THEN ? ELSE hot_until_ts END
-                    WHERE bvid = ?
-                    """,
-                    video_updates,
+                self._apply_video_online_updates(
+                    conn, video_online_items, collected_iso, collected_ts
                 )
         return snapshot_id
+
+    def insert_video_pulse(
+        self,
+        uid: str,
+        video_online_items: list[dict[str, Any]],
+        collected_at: Optional[datetime] = None,
+    ) -> int:
+        """Persist high-frequency video-only pulse samples without creating an account_snapshot."""
+        if not video_online_items:
+            return 0
+        dt = collected_at or datetime.now(timezone.utc).astimezone()
+        collected_iso = dt.isoformat()
+        collected_ts = int(dt.timestamp())
+
+        with self.connection() as conn:
+            fallback_plays, fallback_likes = self._resolve_video_snapshot_rows(
+                conn, video_online_items
+            )
+            pulse_rows: list[
+                tuple[str, str, str, int, int, str, Optional[int], Optional[int]]
+            ] = []
+            for item in video_online_items:
+                bvid = item["bvid"]
+                online_count = int(item["online_count"])
+                online_raw = item.get("online_raw", "")
+                raw_play_count = item.get("play_count")
+                play_count_val = (
+                    fallback_plays.get(bvid)
+                    if raw_play_count is None
+                    else int(raw_play_count)
+                )
+                if "like_count" in item:
+                    raw_like_count = item["like_count"]
+                    like_count_val = (
+                        None if raw_like_count is None else int(raw_like_count)
+                    )
+                else:
+                    like_count_val = fallback_likes.get(bvid)
+                pulse_rows.append(
+                    (
+                        uid,
+                        bvid,
+                        collected_iso,
+                        collected_ts,
+                        online_count,
+                        online_raw,
+                        play_count_val,
+                        like_count_val,
+                    )
+                )
+
+            conn.executemany(
+                """
+                INSERT INTO video_pulse_snapshots (
+                    uid, bvid, collected_at, collected_at_ts, online_count,
+                    online_raw, play_count, like_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                pulse_rows,
+            )
+            self._apply_video_online_updates(
+                conn, video_online_items, collected_iso, collected_ts
+            )
+        return len(pulse_rows)
 
     @staticmethod
     def _row_to_snapshot(row: sqlite3.Row) -> dict[str, Any]:
@@ -1427,20 +1849,46 @@ class Database:
         since_hours: Optional[int] = None,
         max_points: Optional[int] = None,
     ) -> list[dict[str, Any]]:
-        params: list[Any] = [bvid]
-        where = "WHERE v.bvid = ?"
+        snap_where = "WHERE v.bvid = ?"
+        pulse_where = "WHERE p.bvid = ?"
+        snap_params: list[Any] = [bvid]
+        pulse_params: list[Any] = [bvid]
         if since_hours is not None and since_hours > 0:
             cutoff = int(time.time()) - since_hours * 3600
-            where += " AND s.collected_at_ts >= ?"
-            params.append(cutoff)
+            snap_where += " AND s.collected_at_ts >= ?"
+            pulse_where += " AND p.collected_at_ts >= ?"
+            snap_params.append(cutoff)
+            pulse_params.append(cutoff)
 
+        params: list[Any] = [*snap_params, *pulse_params]
         sql = f"""
-            SELECT s.collected_at, s.collected_at_ts, v.online_count, v.online_raw,
-                   v.play_count, v.like_count
-            FROM video_online_snapshots v
-            JOIN account_snapshots s ON s.id = v.snapshot_id
-            {where}
-            ORDER BY s.collected_at_ts DESC, s.id DESC
+            SELECT collected_at, collected_at_ts, online_count, online_raw,
+                   play_count, like_count
+            FROM (
+                SELECT s.collected_at AS collected_at,
+                       s.collected_at_ts AS collected_at_ts,
+                       v.online_count AS online_count,
+                       v.online_raw AS online_raw,
+                       v.play_count AS play_count,
+                       v.like_count AS like_count,
+                       0 AS src_rank,
+                       s.id AS sort_id
+                FROM video_online_snapshots v
+                JOIN account_snapshots s ON s.id = v.snapshot_id
+                {snap_where}
+                UNION ALL
+                SELECT p.collected_at AS collected_at,
+                       p.collected_at_ts AS collected_at_ts,
+                       p.online_count AS online_count,
+                       p.online_raw AS online_raw,
+                       p.play_count AS play_count,
+                       p.like_count AS like_count,
+                       1 AS src_rank,
+                       p.id AS sort_id
+                FROM video_pulse_snapshots p
+                {pulse_where}
+            )
+            ORDER BY collected_at_ts DESC, src_rank DESC, sort_id DESC
         """
         if limit is not None:
             sql += " LIMIT ?"
@@ -1454,7 +1902,7 @@ class Database:
         return items
 
     def prune_old_snapshots(self, retention_days: Optional[int] = None) -> dict[str, int]:
-        """Delete account snapshots older than retention_days while keeping the newest 2 per UID."""
+        """Delete account and pulse snapshots older than retention_days while keeping newest 2 account snapshots per UID."""
         with self.connection() as conn:
             if retention_days is None:
                 row = conn.execute(
@@ -1491,6 +1939,10 @@ class Database:
                 (cutoff_ts,),
             )
             deleted_count = max(0, int(cur.rowcount or 0))
+            conn.execute(
+                "DELETE FROM video_pulse_snapshots WHERE collected_at_ts < ?",
+                (cutoff_ts,),
+            )
             conn.execute("PRAGMA optimize;")
         return {"deleted_snapshots": deleted_count, "retention_days": resolved_days}
 

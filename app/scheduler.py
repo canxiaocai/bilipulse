@@ -6,12 +6,13 @@ from typing import Any, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from app.bilibili.collectors import CrawlService
+from app.bilibili.collectors import FAST_PULSE_INTERVAL_MINUTES, CrawlService
 from app.database import Database
 
 logger = logging.getLogger(__name__)
 
 JOB_ID = "bilibili_monitor_crawl"
+FAST_PULSE_JOB_ID = "bilibili_monitor_fast_pulse"
 RETENTION_JOB_ID = "bilibili_monitor_retention"
 RETENTION_INTERVAL_HOURS = 6
 _UNSET = object()
@@ -89,6 +90,12 @@ class SchedulerManager:
         except Exception:
             logger.exception("Scheduled crawl task failed")
 
+    async def _safe_fast_pulse(self) -> None:
+        try:
+            await self.crawl_service.run_fast_pulse()
+        except Exception:
+            logger.exception("Scheduled fast pulse task failed")
+
     async def _safe_crawl_missing(self, uids: list[str]) -> None:
         for uid in uids:
             try:
@@ -128,6 +135,37 @@ class SchedulerManager:
                 coalesce=True,
             )
 
+    def _sync_fast_pulse_job(self, interval_minutes: int, enabled_count: int) -> None:
+        existing_fast = self.scheduler.get_job(FAST_PULSE_JOB_ID)
+        if enabled_count <= 0 or interval_minutes <= FAST_PULSE_INTERVAL_MINUTES:
+            if existing_fast:
+                self.scheduler.remove_job(FAST_PULSE_JOB_ID)
+            return
+
+        if existing_fast and isinstance(existing_fast.trigger, IntervalTrigger):
+            if (
+                int(existing_fast.trigger.interval.total_seconds())
+                == FAST_PULSE_INTERVAL_MINUTES * 60
+            ):
+                return
+
+        if existing_fast:
+            self.scheduler.remove_job(FAST_PULSE_JOB_ID)
+
+        self.scheduler.add_job(
+            self._safe_fast_pulse,
+            trigger=IntervalTrigger(minutes=FAST_PULSE_INTERVAL_MINUTES),
+            id=FAST_PULSE_JOB_ID,
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+        logger.info(
+            "Scheduled fast-tier video pulse every %d minute(s) for %d account(s)",
+            FAST_PULSE_INTERVAL_MINUTES,
+            enabled_count,
+        )
+
     def reschedule(self) -> None:
         if not self._started:
             return
@@ -139,10 +177,12 @@ class SchedulerManager:
         if not enabled_accounts:
             if existing:
                 self.scheduler.remove_job(JOB_ID)
+            self._sync_fast_pulse_job(0, 0)
             logger.info("Crawl scheduler paused (no enabled accounts)")
             return
 
         interval = max(1, int(pub["interval_minutes"]))
+        self._sync_fast_pulse_job(interval, len(enabled_accounts))
         if existing and isinstance(existing.trigger, IntervalTrigger):
             if int(existing.trigger.interval.total_seconds()) == interval * 60:
                 logger.info(

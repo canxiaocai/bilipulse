@@ -3099,11 +3099,13 @@ def test_video_engagement_stats_client_db_collector_and_api(tmp_path: Path):
 
 
 def test_tiered_hot_cold_polling_stats_quota_and_cid_reuse(tmp_path: Path):
+    from datetime import datetime, timedelta, timezone
     from app.bilibili.collectors import COLD_POLL_BATCH_SIZE, STATS_REFRESH_QUOTA
 
     uid = "888000111"
     db = Database(db_path=tmp_path / "tiered.db")
-    now_epoch = int(time.time())
+    now_dt = datetime.now(timezone.utc).astimezone()
+    now_epoch = int(now_dt.timestamp())
     db.update_settings(
         {
             "uid": uid,
@@ -3115,7 +3117,7 @@ def test_tiered_hot_cold_polling_stats_quota_and_cid_reuse(tmp_path: Path):
         }
     )
 
-    # Seed 150 videos (> 80 threshold); BV_000..BV_004 are old low-play long-tail videos with online > 0
+    # Seed 150 old videos; BV_000..BV_004 are old low-play long-tail videos with online = 5 (T0)
     seeded = []
     for idx in range(150):
         bvid = f"BV_{idx:03d}"
@@ -3132,7 +3134,7 @@ def test_tiered_hot_cold_polling_stats_quota_and_cid_reuse(tmp_path: Path):
         )
     db.upsert_videos(uid, seeded)
 
-    # Mark 5 oldest low-play videos (BV_000..BV_004) as currently having active online viewers
+    # Mark 5 oldest low-play videos (BV_000..BV_004) as having active online viewers checked 3 min ago (due in T0)
     db.insert_snapshot(
         uid=uid,
         follower_count=5000,
@@ -3148,6 +3150,7 @@ def test_tiered_hot_cold_polling_stats_quota_and_cid_reuse(tmp_path: Path):
             {"bvid": f"BV_{idx:03d}", "online_count": 5, "online_raw": "6"}
             for idx in range(5)
         ],
+        collected_at=now_dt - timedelta(minutes=3),
     )
 
     fake_client = AsyncMock()
@@ -3199,18 +3202,17 @@ def test_tiered_hot_cold_polling_stats_quota_and_cid_reuse(tmp_path: Path):
 
             assert res1["status"] == "success"
             assert res1["video_count"] == 150
-            # Hot pool: BV_000..BV_004 (5 active) + BV_110..BV_149 (top 40 plays, contains newest 25) = 45
-            # Cold batch: 30 (BV_005..BV_034 never checked first, highest play among never checked: BV_109..BV_080)
-            assert res1["videos_succeeded"] == 45 + COLD_POLL_BATCH_SIZE
-            # All 5 long-tail active videos were kept in Hot Pool
+            # T0 due: BV_000..BV_004 (5 active) + background due cap (COLD_POLL_BATCH_SIZE = 30, including BV_149)
+            assert res1["videos_succeeded"] == 5 + COLD_POLL_BATCH_SIZE
+            # All 5 long-tail active videos were prioritized into T0
             for idx in range(5):
                 assert f"BV_{idx:03d}" in online_polled_bvids
-            # Stats refresh strictly capped at STATS_REFRESH_QUOTA (30) and prioritized showcase/active
+            # Stats refresh strictly capped at STATS_REFRESH_QUOTA (30) and prioritized T0/showcase
             assert len(stat_called_bvids) == STATS_REFRESH_QUOTA
             assert "BV_149" in stat_called_bvids
             assert "BV_000" in stat_called_bvids
 
-            # Crawl 2: cold round-robin advances to next unchecked batch & stats backfills next 30 videos
+            # Crawl 2 (immediately after crawl 1): T0 videos just checked -> skipped; background rotates to next 30 unchecked
             stat_called_round1 = set(stat_called_bvids)
             polled_round1 = set(online_polled_bvids)
             stat_called_bvids.clear()
@@ -3224,6 +3226,8 @@ def test_tiered_hot_cold_polling_stats_quota_and_cid_reuse(tmp_path: Path):
             # Cold pool rotated to previously unchecked videos
             newly_polled_cold = set(online_polled_bvids) - polled_round1
             assert len(newly_polled_cold) == COLD_POLL_BATCH_SIZE
+            # Carryover preserved online total of unpolled T0 videos (5 * 5 = 25)
+            assert res2["online_viewers_total"] == 25
 
 
 def test_incremental_first_page_sync_vs_full_pagination_on_delete(tmp_path: Path):
@@ -3522,3 +3526,498 @@ def test_video_history_like_count_snapshots_active_ttl_and_modal_markup(tmp_path
         assert 'id="modalLikeDelta"' in html
         assert "每小时播放增量" in html
         assert "每小时点赞增量" in html
+
+
+def test_adaptive_five_tier_classification_ttls_and_dormant_stats_skip():
+    from datetime import datetime, timedelta, timezone
+    from app.bilibili.collectors import (
+        TIER_ACTIVE,
+        TIER_FAST,
+        TIER_FROZEN,
+        TIER_SLEEP,
+        TIER_WARM,
+        classify_video_tier,
+        is_video_online_due,
+        select_stats_refresh_bvids,
+    )
+
+    now = datetime.now(timezone.utc).astimezone()
+    now_ts = now.timestamp()
+
+    def iso_ago(seconds: float) -> str:
+        return (now - timedelta(seconds=seconds)).isoformat()
+
+    # 1) T0 Fast: newly published (<=24h), high online (>=3), surging play rate (>=80/h), or fast_until sticky
+    assert classify_video_tier({"bvid": "BV_new", "pubdate": int(now_ts - 3600)}, now_ts) == TIER_FAST
+    assert (
+        classify_video_tier(
+            {"bvid": "BV_high", "pubdate": int(now_ts - 60 * 86400), "last_online_count": 3},
+            now_ts,
+        )
+        == TIER_FAST
+    )
+    assert (
+        classify_video_tier(
+            {"bvid": "BV_surge", "pubdate": int(now_ts - 60 * 86400), "play_rate_per_hour": 120.0},
+            now_ts,
+        )
+        == TIER_FAST
+    )
+    assert (
+        classify_video_tier(
+            {"bvid": "BV_sticky", "pubdate": int(now_ts - 60 * 86400), "fast_until_ts": int(now_ts + 300)},
+            now_ts,
+        )
+        == TIER_FAST
+    )
+
+    # 2) T1 Active: 24-72h pub, 1-2 online, hot_until sticky, or moderate play velocity (25-79/h)
+    assert (
+        classify_video_tier({"bvid": "BV_2d", "pubdate": int(now_ts - 48 * 3600)}, now_ts)
+        == TIER_ACTIVE
+    )
+    assert (
+        classify_video_tier(
+            {"bvid": "BV_1on", "pubdate": int(now_ts - 60 * 86400), "last_online_count": 2},
+            now_ts,
+        )
+        == TIER_ACTIVE
+    )
+    assert (
+        classify_video_tier(
+            {"bvid": "BV_mod", "pubdate": int(now_ts - 60 * 86400), "play_rate_per_hour": 30.0},
+            now_ts,
+        )
+        == TIER_ACTIVE
+    )
+
+    # 3) T2 Warm: 3-14d pub, newest floor, play_rate 5-24/h, or zero_streak < 2
+    assert (
+        classify_video_tier(
+            {"bvid": "BV_7d", "pubdate": int(now_ts - 7 * 86400), "zero_online_streak": 10},
+            now_ts,
+        )
+        == TIER_WARM
+    )
+    assert (
+        classify_video_tier(
+            {"bvid": "BV_floor", "pubdate": int(now_ts - 90 * 86400), "zero_online_streak": 10},
+            now_ts,
+            newest_floor_bvids={"BV_floor"},
+        )
+        == TIER_WARM
+    )
+
+    # 4) T3 Sleep (6h): >14d, zero_streak 2..5 or tiny trickle plays (1..4/h)
+    assert (
+        classify_video_tier(
+            {"bvid": "BV_sleep", "pubdate": int(now_ts - 60 * 86400), "zero_online_streak": 3},
+            now_ts,
+        )
+        == TIER_SLEEP
+    )
+    assert (
+        classify_video_tier(
+            {
+                "bvid": "BV_trickle",
+                "pubdate": int(now_ts - 60 * 86400),
+                "zero_online_streak": 12,
+                "play_rate_per_hour": 2.0,
+            },
+            now_ts,
+        )
+        == TIER_SLEEP
+    )
+
+    # 5) T4 Frozen (24h): >14d, zero_streak >= 6, play_rate < 1/h
+    assert (
+        classify_video_tier(
+            {
+                "bvid": "BV_frozen",
+                "pubdate": int(now_ts - 60 * 86400),
+                "zero_online_streak": 6,
+                "play_rate_per_hour": 0.2,
+            },
+            now_ts,
+        )
+        == TIER_FROZEN
+    )
+
+    # 6) TTL due boundaries: T0 ~2m, T1 ~5m, T2 ~30m, T3 ~6h, T4 ~24h
+    assert is_video_online_due({"last_checked_at": iso_ago(60)}, TIER_FAST, now_ts) is False
+    assert is_video_online_due({"last_checked_at": iso_ago(115)}, TIER_FAST, now_ts) is True
+    assert is_video_online_due({"last_checked_at": iso_ago(200)}, TIER_ACTIVE, now_ts) is False
+    assert is_video_online_due({"last_checked_at": iso_ago(280)}, TIER_ACTIVE, now_ts) is True
+    assert is_video_online_due({"last_checked_at": iso_ago(1200)}, TIER_WARM, now_ts) is False
+    assert is_video_online_due({"last_checked_at": iso_ago(1800)}, TIER_WARM, now_ts) is True
+    assert is_video_online_due({"last_checked_at": iso_ago(4 * 3600)}, TIER_SLEEP, now_ts) is False
+    assert is_video_online_due({"last_checked_at": iso_ago(6 * 3600)}, TIER_SLEEP, now_ts) is True
+    assert is_video_online_due({"last_checked_at": iso_ago(18 * 3600)}, TIER_FROZEN, now_ts) is False
+    assert is_video_online_due({"last_checked_at": iso_ago(24 * 3600)}, TIER_FROZEN, now_ts) is True
+
+    # 7) T4 frozen videos skip /view when play_count unchanged (until 7d floor), refresh after 12h when changed
+    # Include 5 dummy newer videos so test subjects are outside the WARM_NEWEST_FLOOR=5 window
+    filler = [
+        {
+            "bvid": f"BV_fill_{i}",
+            "pubdate": int(now_ts - (20 + i) * 86400),
+            "play_count": 100,
+            "stats_play_count": 100,
+            "stats_synced_at": iso_ago(60),
+            "zero_online_streak": 10,
+        }
+        for i in range(5)
+    ]
+    frozen_unchanged = {
+        "bvid": "BV_frz_same",
+        "pubdate": int(now_ts - 90 * 86400),
+        "play_count": 500,
+        "stats_play_count": 500,
+        "stats_synced_at": iso_ago(48 * 3600),  # 48h < 7d unchanged floor
+        "zero_online_streak": 10,
+    }
+    frozen_changed = {
+        "bvid": "BV_frz_diff",
+        "pubdate": int(now_ts - 90 * 86400),
+        "play_count": 520,
+        "stats_play_count": 500,
+        "stats_synced_at": iso_ago(13 * 3600),  # 13h > 12h changed TTL
+        "zero_online_streak": 10,
+    }
+    frozen_7d_floor = {
+        "bvid": "BV_frz_7d",
+        "pubdate": int(now_ts - 90 * 86400),
+        "play_count": 500,
+        "stats_play_count": 500,
+        "stats_synced_at": iso_ago(8 * 86400),  # 8d > 7d floor
+        "zero_online_streak": 10,
+    }
+    refreshed = select_stats_refresh_bvids(
+        [*filler, frozen_unchanged, frozen_changed, frozen_7d_floor],
+        set(),
+        now_ts,
+        quota=10,
+    )
+    assert "BV_frz_same" not in refreshed
+    assert "BV_frz_diff" in refreshed
+    assert "BV_frz_7d" in refreshed
+
+
+def test_play_surge_radar_wakes_frozen_video_404_backoff_and_zero_due_success(tmp_path: Path):
+    from datetime import datetime, timedelta, timezone
+    from app.bilibili.collectors import TIER_FAST, TIER_FROZEN, classify_video_tier
+
+    uid = "444555666"
+    db = Database(db_path=tmp_path / "radar_backoff.db")
+    now_dt = datetime.now(timezone.utc).astimezone()
+    now_ts = int(now_dt.timestamp())
+    old_pub = now_ts - 90 * 86400
+    db.update_settings(
+        {
+            "uid": uid,
+            "request_delay_ms": "50",
+            f"last_video_sync_ts_{uid}": str(now_ts),
+            f"last_full_video_sync_ts_{uid}": str(now_ts),
+            f"video_sync_rule_{uid}": VIDEO_SYNC_RULE,
+            f"last_archive_count_{uid}": "7",
+        }
+    )
+
+    # Seed 7 old videos (5 newest floor + 2 deep-frozen candidates)
+    seeded = [
+        {
+            "bvid": f"BV_old_{i}",
+            "aid": 100 + i,
+            "title": f"Old {i}",
+            "pubdate": old_pub + i * 100,
+            "play_count": 1000,
+            "like_count": 50,
+            "coin_count": 10,
+            "cids": [{"cid": 9000 + i, "page": 1, "part": "P1"}],
+        }
+        for i in range(7)
+    ]
+    # Insert with timestamp 30 minutes ago
+    db.upsert_videos(uid, seeded, now_ts=now_ts - 1800)
+
+    # Mark all 7 videos as recently checked (10 min ago) with 0 online and streak=8
+    with db.connection() as conn:
+        conn.execute(
+            """
+            UPDATE videos
+            SET last_checked_at = ?, last_online_count = 0, zero_online_streak = 8,
+                hot_until_ts = 0, fast_until_ts = 0
+            WHERE uid = ?
+            """,
+            ((now_dt - timedelta(minutes=10)).isoformat(), uid),
+        )
+
+    vids_before = {v["bvid"]: v for v in db.get_videos(uid)}
+    assert classify_video_tier(vids_before["BV_old_0"], now_ts) == TIER_FROZEN
+
+    # 1) Zero-due sleeping account crawl MUST succeed with 0 online/stats API calls (NOT 'partial'!)
+    fake_client = AsyncMock()
+    fake_client.__aenter__.return_value = fake_client
+    fake_client.__aexit__.return_value = None
+    fake_client.get_relation_stat.return_value = {"follower": 300, "following": 5}
+    fake_client.get_account_card.return_value = {
+        "name": "SleepUP",
+        "face": "",
+        "follower": 300,
+        "archive_count": 7,
+    }
+    fake_client.get_video_online_total.side_effect = AssertionError("No video should be due")
+    fake_client.get_video_stat.side_effect = AssertionError("No stats should be due")
+
+    svc = CrawlService(db)
+    with patch("app.bilibili.collectors.BilibiliClient", return_value=fake_client):
+        res_idle = asyncio.run(svc.run_crawl(force_sync_videos=False))
+    assert res_idle["status"] == "success"
+    assert res_idle["videos_succeeded"] == 0
+    assert res_idle["online_viewers_total"] == 0
+
+    # 2) Play-surge radar via list upsert wakes frozen BV_old_0 (+250 plays in 30 min = 500/h -> T0!)
+    #    Also verify stale lower play_count on BV_old_1 is ignored monotonically.
+    db.upsert_videos(
+        uid,
+        [
+            {"bvid": "BV_old_0", "aid": 100, "title": "Old 0", "pubdate": old_pub, "play_count": 1250},
+            {"bvid": "BV_old_1", "aid": 101, "title": "Old 1", "pubdate": old_pub + 100, "play_count": 900},
+        ],
+        now_ts=now_ts,
+    )
+    vids_after = {v["bvid"]: v for v in db.get_videos(uid)}
+    assert vids_after["BV_old_0"]["play_count"] == 1250
+    assert vids_after["BV_old_0"]["play_rate_per_hour"] >= 400.0
+    assert vids_after["BV_old_0"]["zero_online_streak"] == 0
+    assert vids_after["BV_old_0"]["fast_until_ts"] > now_ts
+    assert classify_video_tier(vids_after["BV_old_0"], now_ts) == TIER_FAST
+    assert vids_after["BV_old_1"]["play_count"] == 1000  # monotonic guard
+
+    # 3) /view returning -404 sets stats_backoff_until_ts so subsequent crawl skips it cleanly
+    with db.connection() as conn:
+        conn.execute(
+            "UPDATE videos SET stats_synced_at = NULL WHERE bvid = 'BV_old_0'"
+        )
+    stat_calls = []
+
+    async def fake_stat_404(bvid: str):
+        stat_calls.append(bvid)
+        raise BilibiliAPIError("web-interface/view error -404: 啥都木有", code=-404)
+
+    fake_client.get_video_stat.side_effect = fake_stat_404
+    fake_client.get_video_online_total.side_effect = None
+    fake_client.get_video_online_total.return_value = (1, "1")  # adjusted -> 0
+
+    with patch("app.bilibili.collectors.BilibiliClient", return_value=fake_client):
+        with patch("app.bilibili.collectors.asyncio.sleep", new=AsyncMock()):
+            res_err = asyncio.run(svc.run_crawl(force_sync_videos=False))
+            assert res_err["status"] == "partial"
+            assert stat_calls == ["BV_old_0"]
+
+            v_backed = {v["bvid"]: v for v in db.get_videos(uid)}["BV_old_0"]
+            assert v_backed["stats_backoff_until_ts"] > now_ts
+
+            # Next crawl skips BV_old_0's /view call cleanly instead of looping errors
+            stat_calls.clear()
+            res_clean = asyncio.run(svc.run_crawl(force_sync_videos=False))
+            assert res_clean["status"] == "success"
+            assert stat_calls == []
+
+
+def test_fast_pulse_two_minute_channel_history_merge_retention_and_scheduler(tmp_path: Path):
+    from datetime import datetime, timedelta, timezone
+    from app.scheduler import FAST_PULSE_JOB_ID, JOB_ID, SchedulerManager
+
+    db = Database(db_path=tmp_path / "fast_pulse.db")
+    now_dt = datetime.now(timezone.utc).astimezone()
+    now_ts = int(now_dt.timestamp())
+
+    db.create_account("1001", enabled=True, set_active=True)
+    db.create_account("2002", enabled=True, set_active=False)
+    db.update_settings({"interval_minutes": "5", "request_delay_ms": "50"})
+
+    # Account 1001: BV_t0_due (online=12, checked 3m ago -> DUE in T0),
+    #               BV_t0_fresh (online=8, checked 30s ago -> NOT due),
+    #               BV_t1 (online=1, checked 4m ago -> T1, NOT fast pulse),
+    #               BV_t4 (old 0 online streak=8 -> T4)
+    db.upsert_videos(
+        "1001",
+        [
+            {
+                "bvid": "BV_t0_due",
+                "aid": 1,
+                "title": "Hot Due",
+                "pubdate": now_ts - 3600,
+                "play_count": 5000,
+                "like_count": 200,
+                "coin_count": 50,
+                "cids": [{"cid": 11, "page": 1, "part": "P1"}],
+            },
+            {
+                "bvid": "BV_t0_fresh",
+                "aid": 2,
+                "title": "Hot Fresh",
+                "pubdate": now_ts - 3600,
+                "play_count": 4000,
+                "like_count": 150,
+                "coin_count": 30,
+                "cids": [{"cid": 12, "page": 1, "part": "P1"}],
+            },
+            {
+                "bvid": "BV_t1",
+                "aid": 3,
+                "title": "Active T1",
+                "pubdate": now_ts - 30 * 86400,
+                "play_count": 3000,
+                "like_count": 100,
+                "coin_count": 20,
+                "cids": [{"cid": 13, "page": 1, "part": "P1"}],
+            },
+            {
+                "bvid": "BV_t4",
+                "aid": 4,
+                "title": "Frozen T4",
+                "pubdate": now_ts - 90 * 86400,
+                "play_count": 200,
+                "like_count": 5,
+                "coin_count": 1,
+                "cids": [{"cid": 14, "page": 1, "part": "P1"}],
+            },
+        ],
+    )
+    # Seed baseline snapshot 5 minutes ago
+    db.insert_snapshot(
+        uid="1001",
+        follower_count=1000,
+        following_count=5,
+        online_viewers_total=21,
+        video_count=4,
+        videos_succeeded=4,
+        extra_metrics={},
+        status="success",
+        error_message=None,
+        duration_ms=50,
+        video_online_items=[
+            {"bvid": "BV_t0_due", "online_count": 12, "online_raw": "13", "play_count": 5000, "like_count": 200},
+            {"bvid": "BV_t0_fresh", "online_count": 8, "online_raw": "9", "play_count": 4000, "like_count": 150},
+            {"bvid": "BV_t1", "online_count": 1, "online_raw": "2", "play_count": 3000, "like_count": 100},
+            {"bvid": "BV_t4", "online_count": 0, "online_raw": "1", "play_count": 200, "like_count": 5},
+        ],
+        collected_at=now_dt - timedelta(minutes=5),
+    )
+    with db.connection() as conn:
+        conn.execute(
+            "UPDATE videos SET last_checked_at = ?, stats_synced_at = ? WHERE bvid = 'BV_t0_due'",
+            ((now_dt - timedelta(minutes=3)).isoformat(), (now_dt - timedelta(minutes=5)).isoformat()),
+        )
+        conn.execute(
+            "UPDATE videos SET last_checked_at = ? WHERE bvid = 'BV_t0_fresh'",
+            ((now_dt - timedelta(seconds=30)).isoformat(),),
+        )
+        conn.execute(
+            "UPDATE videos SET zero_online_streak = 8 WHERE bvid = 'BV_t4'",
+        )
+
+    # Account 2002: completely dormant (1 old video, 0 online, streak=8, checked 10m ago)
+    db.upsert_videos(
+        "2002",
+        [
+            {
+                "bvid": "BV_silent",
+                "aid": 20,
+                "title": "Silent",
+                "pubdate": now_ts - 90 * 86400,
+                "play_count": 100,
+                "like_count": 2,
+                "coin_count": 0,
+                "cids": [{"cid": 201, "page": 1, "part": "P1"}],
+            }
+        ],
+    )
+    with db.connection() as conn:
+        conn.execute(
+            "UPDATE videos SET last_checked_at = ?, zero_online_streak = 8 WHERE bvid = 'BV_silent'",
+            ((now_dt - timedelta(minutes=10)).isoformat(),),
+        )
+
+    polled_bvids: list[str] = []
+    stat_bvids: list[str] = []
+    fake_client = AsyncMock()
+    fake_client.__aenter__.return_value = fake_client
+    fake_client.__aexit__.return_value = None
+
+    async def fake_online(bvid: str, cid: int):
+        polled_bvids.append(bvid)
+        return (19, "19")  # adjusted -> 18
+
+    async def fake_stat(bvid: str):
+        stat_bvids.append(bvid)
+        return {"play_count": 5180, "like_count": 215, "coin_count": 55}
+
+    fake_client.get_video_online_total.side_effect = fake_online
+    fake_client.get_video_stat.side_effect = fake_stat
+
+    svc = CrawlService(db)
+    with patch("app.bilibili.collectors.BilibiliClient", return_value=fake_client):
+        with patch("app.bilibili.collectors.asyncio.sleep", new=AsyncMock()):
+            pulse_res = asyncio.run(svc.run_fast_pulse())
+
+    assert pulse_res["skipped"] is False
+    assert pulse_res["accounts_touched"] == 1  # Silent account 2002 skipped completely!
+    assert pulse_res["videos_polled"] == 1
+    assert pulse_res["videos_succeeded"] == 1
+    assert pulse_res["stats_refreshed"] == 1
+    assert polled_bvids == ["BV_t0_due"]
+    assert stat_bvids == ["BV_t0_due"]
+
+    # Fast pulse MUST NOT add extra account_snapshots rows, but MUST update videos + merged history
+    assert db.count_snapshots("1001") == 1
+    updated_v = {v["bvid"]: v for v in db.get_videos("1001")}["BV_t0_due"]
+    assert updated_v["last_online_count"] == 18
+    assert updated_v["play_count"] == 5180
+    assert updated_v["like_count"] == 215
+
+    history = db.get_video_history("BV_t0_due", limit=10)
+    assert len(history) == 2
+    assert [h["online_count"] for h in history] == [12, 18]
+    assert [h["play_count"] for h in history] == [5000, 5180]
+    assert [h["like_count"] for h in history] == [200, 215]
+
+    # Retention pruning & account deletion also clean up video_pulse_snapshots
+    db.insert_video_pulse(
+        "1001",
+        [{"bvid": "BV_t0_due", "online_count": 5, "online_raw": "6", "play_count": 4000, "like_count": 100}],
+        collected_at=now_dt - timedelta(days=120),
+    )
+    assert len(db.get_video_history("BV_t0_due", limit=10)) == 3
+    db.prune_old_snapshots(retention_days=30)
+    assert len(db.get_video_history("BV_t0_due", limit=10)) == 2
+
+    # SchedulerManager registers 2-min fast pulse when interval > 2 and removes it when interval <= 2
+    async def check_scheduler():
+        mgr = SchedulerManager(db, svc)
+        mgr.start()
+        try:
+            assert mgr.scheduler.get_job(JOB_ID) is not None
+            fast_job = mgr.scheduler.get_job(FAST_PULSE_JOB_ID)
+            assert fast_job is not None
+            assert int(fast_job.trigger.interval.total_seconds()) == 120
+
+            # Lowering interval_minutes to 2 removes redundant fast pulse job
+            db.update_settings({"interval_minutes": "2"})
+            mgr.reschedule()
+            assert mgr.scheduler.get_job(FAST_PULSE_JOB_ID) is None
+
+            # Raising back to 5 restores fast pulse job
+            db.update_settings({"interval_minutes": "5"})
+            mgr.reschedule()
+            assert mgr.scheduler.get_job(FAST_PULSE_JOB_ID) is not None
+        finally:
+            mgr.shutdown()
+
+    asyncio.run(check_scheduler())
+
+    # Deleting account with delete_data=True purges pulse rows too
+    db.delete_account("1001", delete_data=True)
+    assert db.get_video_history("BV_t0_due", limit=10) == []
