@@ -4380,3 +4380,92 @@ def test_video_play_count_7d_backfill_migration_and_api(tmp_path: Path):
         assert api_videos["BV1backfill_ok"]["play_count_7d"] == 61000
 
 
+def test_db_connection_pragmas_and_httpx_log_level(tmp_path: Path):
+    import logging
+
+    import app.main  # noqa: F401
+
+    assert logging.getLogger("httpx").level == logging.WARNING
+    assert logging.getLogger("httpcore").level == logging.WARNING
+
+    db = Database(db_path=tmp_path / "pragmas.db")
+    with db.connection() as conn:
+        sync_mode = conn.execute("PRAGMA synchronous;").fetchone()[0]
+        temp_store = conn.execute("PRAGMA temp_store;").fetchone()[0]
+    assert sync_mode == 1  # NORMAL
+    assert temp_store == 2  # MEMORY
+
+
+def test_batch_crawl_skips_deleted_and_mid_crawl_deleted_accounts(tmp_path: Path):
+    db = Database(db_path=tmp_path / "delete_race.db")
+    db.create_account("10001", account_name="KeepMe", enabled=True)
+    db.create_account("20002", account_name="DeleteMidCrawl", enabled=True)
+    db.create_account("30003", account_name="DeleteBeforeTurn", enabled=True)
+
+    crawled_uids: list[str] = []
+
+    class FakeClient:
+        def __init__(self, cookie: str = "") -> None:
+            self.cookie = cookie
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get_relation_stat(self, uid: str):
+            crawled_uids.append(uid)
+            if uid == "10001":
+                # Delete 30003 before run_crawl_all even reaches it
+                db.delete_account("30003", delete_data=True)
+            return {"follower": 100, "following": 5}
+
+        async def get_account_card(self, uid: str):
+            return {"name": f"UP_{uid}", "face": "", "archive_count": 1}
+
+        async def get_all_videos(self, uid: str, max_pages=None):
+            if uid == "20002":
+                # Delete 20002 mid-crawl right before videos/snapshot would be persisted
+                db.delete_account("20002", delete_data=True)
+            return [
+                {
+                    "bvid": f"BV1race{uid}",
+                    "aid": int(uid),
+                    "title": f"Video {uid}",
+                    "pic": "",
+                    "pubdate": int(time.time()) - 3600,
+                    "duration": 120,
+                    "play_count": 500,
+                    "cids": [{"cid": int(uid) + 10, "page": 1, "part": "P1"}],
+                    "up_mid": int(uid),
+                }
+            ]
+
+        async def get_video_stat(self, bvid: str):
+            return {"play_count": 500, "like_count": 10, "coin_count": 2}
+
+        async def get_video_online_total(self, bvid: str, cid: int):
+            return 3, "3"
+
+    service = CrawlService(db)
+    with (
+        patch("app.bilibili.collectors.BilibiliClient", FakeClient),
+        patch("app.bilibili.collectors.asyncio.sleep", new=AsyncMock()),
+    ):
+        res = asyncio.run(service.run_crawl_all(force_sync_videos=True))
+
+    assert res["skipped"] is False
+    # 30003 was never even contacted; 20002 was aborted before saving anything
+    assert crawled_uids == ["10001", "20002"]
+    assert res["total"] == 1
+    assert db.count_snapshots("10001") == 1
+    assert db.count_snapshots("20002") == 0
+    assert db.count_snapshots("30003") == 0
+    assert db.get_videos("20002") == []
+    assert db.get_videos("30003") == []
+    assert db.get_setting("last_video_sync_ts_20002", "") == ""
+    assert db.get_setting("last_video_sync_ts_30003", "") == ""
+
+
+

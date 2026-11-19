@@ -564,6 +564,8 @@ class CrawlContext:
     db: Database
     settings: dict[str, str]
     force_sync_videos: bool = False
+    track_deletion: bool = False
+    aborted_deleted: bool = False
     follower_count: Optional[int] = None
     following_count: Optional[int] = None
     online_viewers_total: Optional[int] = None
@@ -574,6 +576,18 @@ class CrawlContext:
     video_online_items: list[dict[str, Any]] = field(default_factory=list)
     extra_metrics: dict[str, Any] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+
+    async def check_deleted(self) -> bool:
+        """Return True if this monitored account was deleted while the crawl is in flight."""
+        if not self.track_deletion:
+            return False
+        if self.aborted_deleted:
+            return True
+        acc = await asyncio.to_thread(self.db.get_account, self.uid)
+        if acc is None:
+            self.aborted_deleted = True
+            return True
+        return False
 
 
 class BaseCollector(ABC):
@@ -598,6 +612,8 @@ class AccountFollowerCollector(BaseCollector):
 
         try:
             card = await ctx.client.get_account_card(ctx.uid)
+            if await ctx.check_deleted():
+                return
             if card.get("name") or card.get("face"):
                 await asyncio.to_thread(
                     ctx.db.update_account_profile,
@@ -677,6 +693,8 @@ class AllVideosOnlineCollector(BaseCollector):
                     for v in fetched_videos
                     if not (v.get("up_mid") and str(v["up_mid"]).strip() != target_uid)
                 ]
+                if await ctx.check_deleted():
+                    return
                 if owned_videos:
                     await asyncio.to_thread(ctx.db.upsert_videos, ctx.uid, owned_videos)
                 if needs_full_sync:
@@ -761,6 +779,8 @@ class AllVideosOnlineCollector(BaseCollector):
         )
         ctx.errors.extend(batch_errors)
 
+        if await ctx.check_deleted():
+            return
         if stat_updates:
             await asyncio.to_thread(ctx.db.update_video_stats_batch, stat_updates)
             ctx.extra_metrics["stats_refreshed"] = len(stat_updates)
@@ -817,6 +837,14 @@ class CrawlService:
         """Register an additional collector for future metric extensions."""
         self.collectors.append(collector)
 
+    async def _is_uid_still_enabled(self, uid: str) -> bool:
+        """Verify that a scheduled UID has not been deleted or disabled while a batch crawl is running."""
+        clean_uid = str(uid or "").strip()
+        if not clean_uid:
+            return False
+        enabled_accounts = await asyncio.to_thread(self.db.get_enabled_accounts)
+        return any(acc["uid"] == clean_uid for acc in enabled_accounts)
+
     async def _crawl_single_uid(
         self, uid: str, force_sync_videos: bool = False
     ) -> dict[str, Any]:
@@ -826,6 +854,7 @@ class CrawlService:
 
         settings = await asyncio.to_thread(self.db.get_all_settings)
         cookie = await asyncio.to_thread(self.db.get_effective_cookie, target_uid)
+        was_monitored = (await asyncio.to_thread(self.db.get_account, target_uid)) is not None
 
         started = time.perf_counter()
         self.crawling_uid = target_uid
@@ -839,8 +868,11 @@ class CrawlService:
                     db=self.db,
                     settings=settings,
                     force_sync_videos=force_sync_videos,
+                    track_deletion=was_monitored,
                 )
                 for collector in self.collectors:
+                    if await ctx.check_deleted():
+                        break
                     try:
                         await collector.collect(ctx)
                     except BilibiliAPIError as exc:
@@ -851,6 +883,10 @@ class CrawlService:
                         err = f"[{collector.name}] 未预期异常: {exc}"
                         logger.exception(err)
                         ctx.errors.append(err)
+
+            if await ctx.check_deleted():
+                logger.info("Skipping snapshot persistence for deleted UID %s", target_uid)
+                return {"skipped": True, "uid": target_uid, "reason": "账号已被删除"}
 
             duration_ms = int((time.perf_counter() - started) * 1000)
 
@@ -965,16 +1001,23 @@ class CrawlService:
 
             results: list[dict[str, Any]] = []
             for idx, acc in enumerate(accounts):
+                if not await self._is_uid_still_enabled(acc["uid"]):
+                    logger.info(
+                        "Skipping UID %s during batch crawl (deleted or paused)",
+                        acc["uid"],
+                    )
+                    continue
                 res = await self._crawl_single_uid(
                     acc["uid"], force_sync_videos=force_sync_videos
                 )
-                results.append(res)
+                if not res.get("skipped"):
+                    results.append(res)
                 if idx < len(accounts) - 1:
                     await asyncio.sleep(0.5)
 
             return {
                 "skipped": False,
-                "total": len(accounts),
+                "total": len(results),
                 "results": results,
             }
 
@@ -1015,6 +1058,9 @@ class CrawlService:
                         break
 
                     uid = acc["uid"]
+                    if not await self._is_uid_still_enabled(uid):
+                        continue
+                    was_monitored = (await asyncio.to_thread(self.db.get_account, uid)) is not None
                     cached_videos = await asyncio.to_thread(self.db.get_videos, uid)
                     if not cached_videos:
                         continue
@@ -1064,6 +1110,12 @@ class CrawlService:
                             delay_sec=delay_sec,
                             abort_412=global_abort,
                         )
+
+                    if was_monitored and await asyncio.to_thread(self.db.get_account, uid) is None:
+                        logger.info("Skipping fast pulse persistence for deleted UID %s", uid)
+                        self.crawling_uid = None
+                        self._emit("crawl_finished", uid=uid, pulse=True)
+                        continue
 
                     if stat_updates:
                         await asyncio.to_thread(self.db.update_video_stats_batch, stat_updates)

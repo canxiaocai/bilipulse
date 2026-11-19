@@ -4010,11 +4010,33 @@ function connectLiveEventStream() {
       return;
     }
 
+    const eventUid = String(payload.uid || "").trim();
+    const currentUid = String(state.activeUid || state.backendUid || "").trim();
+
+    if (
+      (payload.kind === "fast_pulse" || (payload.kind === "crawl_finished" && payload.pulse)) &&
+      eventUid &&
+      currentUid &&
+      eventUid !== currentUid
+    ) {
+      if (state.dashboard?.scheduler) {
+        if (state.dashboard.scheduler.crawling_uid === eventUid) {
+          state.dashboard.scheduler.crawling_uid = null;
+        }
+        renderAccountSidebar();
+      }
+      return;
+    }
+
     if (document.hidden) {
       state.liveSyncDirty = true;
       return;
     }
-    scheduleLiveRefresh(LIVE_SYNC_DEBOUNCE_MS);
+    const refreshDelay =
+      payload.kind === "snapshot" && eventUid && currentUid && eventUid !== currentUid
+        ? Math.max(LIVE_SYNC_DEBOUNCE_MS, 1200)
+        : LIVE_SYNC_DEBOUNCE_MS;
+    scheduleLiveRefresh(refreshDelay);
   });
 
   es.onerror = () => {
