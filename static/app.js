@@ -30,6 +30,9 @@ import {
 const THEME_STORAGE_KEY = "bilipulse_theme";
 const DEMO_PULSE_INTERVAL_MS = 3500;
 const REAL_POLL_INTERVAL_MS = 30000;
+const FALLBACK_POLL_INTERVAL_MS = 10000;
+const LIVE_SYNC_DEBOUNCE_MS = 220;
+const FOCUS_SYNC_MIN_GAP_MS = 3000;
 const LEADERBOARD_PAGE_SIZE = 50;
 
 const state = {
@@ -67,6 +70,16 @@ const state = {
   clockTimer: null,
   demoTimer: null,
   pollTimer: null,
+  pollIntervalMs: 0,
+  liveEventSource: null,
+  liveEventConnected: false,
+  liveEventWasDisconnected: false,
+  liveEventRev: 0,
+  liveRefreshTimer: null,
+  liveRefreshInFlight: false,
+  liveRefreshPending: false,
+  liveSyncDirty: false,
+  lastDashboardSyncMs: 0,
   onlineRowCache: new Map(),
   playsRowCache: new Map(),
   compareFollowersCache: new Map(),
@@ -217,11 +230,42 @@ function showToast(message, type = "ok") {
 
 /* ---------- Network Client ---------- */
 
+function buildFetchSignal(userSignal, timeoutMs) {
+  const hasTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0;
+  if (!hasTimeout) return userSignal;
+  if (typeof AbortSignal === "undefined" || typeof AbortSignal.timeout !== "function") {
+    return userSignal;
+  }
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  if (userSignal && typeof AbortSignal.any === "function") {
+    return AbortSignal.any([userSignal, timeoutSignal]);
+  }
+  return userSignal || timeoutSignal;
+}
+
 async function apiFetch(url, options = {}) {
-  const resp = await fetch(url, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-    ...options,
-  });
+  const { timeoutMs, signal: userSignal, ...fetchOptions } = options;
+  const signal = buildFetchSignal(userSignal, timeoutMs);
+  let resp;
+  try {
+    resp = await fetch(url, {
+      cache: "no-store",
+      headers: { "Content-Type": "application/json", ...(fetchOptions.headers || {}) },
+      ...fetchOptions,
+      ...(signal ? { signal } : {}),
+    });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "TimeoutError") {
+      throw new Error(`请求超时 (${timeoutMs}ms)`, { cause: err });
+    }
+    throw err;
+  }
+
+  const revHeader = Number(resp.headers?.get("X-Data-Revision") || 0);
+  if (Number.isFinite(revHeader) && revHeader > state.liveEventRev) {
+    state.liveEventRev = revHeader;
+  }
+
   const text = await resp.text();
   let data = {};
   try {
@@ -545,6 +589,7 @@ function clearRankCaches({ resetLimits = false } = {}) {
 }
 
 function activateDemoMode({ showNotification = true } = {}) {
+  disconnectLiveEventStream();
   state.demoMode = true;
   state.demoLivePulse = true;
   state.demoDataset = createDemoDataset();
@@ -579,6 +624,7 @@ async function exitDemoMode() {
 
   syncBannersAndDemoControls();
   await loadDashboard({ animateCharts: true });
+  connectLiveEventStream();
   showToast(
     state.backendUid
       ? "已退出示例流，切换回真实监控总线"
@@ -2940,7 +2986,7 @@ function refreshOpenDemoModal(bvid) {
   renderModalCharts(series, false);
 }
 
-async function loadVideoModalSeries(bvid, hours, { animate = true } = {}) {
+async function loadVideoModalSeries(bvid, hours, { animate = true, silent = false } = {}) {
   const chartEl = document.getElementById("modalVideoChart");
   const playChartEl = document.getElementById("modalVideoPlayChart");
   if (!bvid || !chartEl || !playChartEl) return;
@@ -2965,15 +3011,24 @@ async function loadVideoModalSeries(bvid, hours, { animate = true } = {}) {
     return;
   }
 
-  clearChartsInGroup("video-modal");
-  updateModalStatsFromVideoAndPoints(bvid, null);
-  setModalChartsPlaceholder("正在拉取视频趋势与每小时增量采样序列...");
+  if (!silent) {
+    clearChartsInGroup("video-modal");
+    updateModalStatsFromVideoAndPoints(bvid, null);
+    setModalChartsPlaceholder("正在拉取视频趋势与每小时增量采样序列...");
+  }
 
   try {
+    const params = new URLSearchParams({
+      hours: String(targetHours),
+      max_points: String(MODAL_HISTORY_MAX_POINTS),
+    });
     const res = await apiFetch(
-      `/api/videos/${encodeURIComponent(bvid)}/history?hours=${encodeURIComponent(targetHours)}&max_points=${MODAL_HISTORY_MAX_POINTS}`
+      `/api/videos/${encodeURIComponent(bvid)}/history?${params.toString()}`,
+      { timeoutMs: 15000 }
     );
+    const modal = document.getElementById("videoModal");
     if (state.modalBvid !== bvid || reqId !== state.modalReqSeq) return;
+    if (silent && (!modal || !modal.open)) return;
     const series = buildModalSeriesFromHistory(res.history || []);
     state.modalPoints = series;
     updateModalStatsFromVideoAndPoints(bvid, series);
@@ -2983,7 +3038,7 @@ async function loadVideoModalSeries(bvid, hours, { animate = true } = {}) {
       }
     });
   } catch (err) {
-    if (state.modalBvid !== bvid || reqId !== state.modalReqSeq) return;
+    if (silent || state.modalBvid !== bvid || reqId !== state.modalReqSeq) return;
     setModalChartsPlaceholder(`波形拉取失败: ${err.message}`);
   }
 }
@@ -3671,7 +3726,12 @@ function wireAccessibleAccountForm() {
 
 /* ---------- Data Loaders & Mutations ---------- */
 
-async function loadDashboard({ animateCharts = false, uid = null, reqId = null } = {}) {
+async function loadDashboard({
+  animateCharts = false,
+  uid = null,
+  reqId = null,
+  silent = false,
+} = {}) {
   if (state.demoMode) {
     const demoData = getDemoDashboard(state, state.hours);
     renderDashboard(demoData, { animateCharts, isLiveTick: false });
@@ -3680,11 +3740,19 @@ async function loadDashboard({ animateCharts = false, uid = null, reqId = null }
 
   const targetUid = uid !== null ? uid : state.activeUid;
   const activeReqId = reqId !== null ? reqId : ++state.dashboardReqSeq;
-  const uidQuery = targetUid ? `&uid=${encodeURIComponent(targetUid)}` : "";
+  const params = new URLSearchParams({ hours: String(state.hours) });
+  if (targetUid) {
+    params.set("uid", targetUid);
+  }
 
   try {
-    const data = await apiFetch(`/api/dashboard?hours=${state.hours}${uidQuery}`);
+    const data = await apiFetch(`/api/dashboard?${params.toString()}`, {
+      timeoutMs: 15000,
+    });
     if (activeReqId !== state.dashboardReqSeq) return null;
+
+    state.lastDashboardSyncMs = Date.now();
+    state.liveSyncDirty = false;
 
     if (data?.admin_auth) {
       syncAdminAuthState(data.admin_auth);
@@ -3697,11 +3765,246 @@ async function loadDashboard({ animateCharts = false, uid = null, reqId = null }
       }
     }
     renderDashboard(data, { animateCharts, isLiveTick: false });
+    if (!state.demoMode && !document.hidden && !state.liveEventSource) {
+      connectLiveEventStream();
+    }
     return data;
   } catch (err) {
-    showToast(`加载遥测面板失败: ${err.message}`, "err");
+    if (!silent) {
+      showToast(`加载遥测面板失败: ${err.message}`, "err");
+    }
     return null;
   }
+}
+
+/* ---------- Real-Time Live Sync (SSE + Visibility Resume + Fallback Poll) ---------- */
+
+function clearLiveRefreshTimer() {
+  if (state.liveRefreshTimer) {
+    clearTimeout(state.liveRefreshTimer);
+    state.liveRefreshTimer = null;
+  }
+}
+
+async function refreshLiveData({ force = false } = {}) {
+  if (state.demoMode) return;
+  if (document.hidden && !force) {
+    state.liveSyncDirty = true;
+    return;
+  }
+  if (state.liveRefreshInFlight) {
+    state.liveRefreshPending = true;
+    return;
+  }
+
+  clearLiveRefreshTimer();
+  state.liveRefreshInFlight = true;
+  state.liveRefreshPending = false;
+  try {
+    await loadDashboard({ animateCharts: false, silent: true });
+    const modal = document.getElementById("videoModal");
+    if (!state.demoMode && state.modalBvid && modal?.open) {
+      await loadVideoModalSeries(state.modalBvid, state.modalHours, {
+        animate: false,
+        silent: true,
+      });
+    }
+  } finally {
+    state.liveRefreshInFlight = false;
+    if (state.liveRefreshPending && !state.demoMode && !document.hidden) {
+      state.liveRefreshPending = false;
+      scheduleLiveRefresh(LIVE_SYNC_DEBOUNCE_MS);
+    }
+  }
+}
+
+function scheduleLiveRefresh(delayMs = LIVE_SYNC_DEBOUNCE_MS) {
+  if (state.demoMode) return;
+  if (document.hidden) {
+    state.liveSyncDirty = true;
+    return;
+  }
+  clearLiveRefreshTimer();
+  state.liveRefreshTimer = setTimeout(() => {
+    state.liveRefreshTimer = null;
+    refreshLiveData();
+  }, Math.max(0, Number(delayMs) || 0));
+}
+
+function syncFallbackPollInterval() {
+  const targetMs = state.liveEventConnected
+    ? REAL_POLL_INTERVAL_MS
+    : FALLBACK_POLL_INTERVAL_MS;
+  if (state.pollTimer && state.pollIntervalMs === targetMs) {
+    return;
+  }
+  if (state.pollTimer) {
+    clearInterval(state.pollTimer);
+    state.pollTimer = null;
+  }
+  state.pollIntervalMs = targetMs;
+  state.pollTimer = setInterval(() => {
+    if (state.demoMode || document.hidden) return;
+    if (!state.liveEventConnected) {
+      connectLiveEventStream();
+    }
+    refreshLiveData();
+  }, targetMs);
+}
+
+function disconnectLiveEventStream() {
+  clearLiveRefreshTimer();
+  if (state.liveEventSource) {
+    try {
+      state.liveEventSource.close();
+    } catch {
+      // Ignore close errors
+    }
+    state.liveEventSource = null;
+  }
+  state.liveEventConnected = false;
+  state.liveEventWasDisconnected = false;
+  syncFallbackPollInterval();
+}
+
+function connectLiveEventStream() {
+  if (state.demoMode || typeof EventSource === "undefined") {
+    return;
+  }
+  if (state.liveEventSource && state.liveEventSource.readyState !== EventSource.CLOSED) {
+    return;
+  }
+  if (state.liveEventSource) {
+    try {
+      state.liveEventSource.close();
+    } catch {
+      // Ignore close errors
+    }
+    state.liveEventSource = null;
+  }
+
+  let es;
+  try {
+    es = new EventSource("/api/events");
+  } catch {
+    state.liveEventConnected = false;
+    syncFallbackPollInterval();
+    return;
+  }
+  state.liveEventSource = es;
+
+  es.addEventListener("ready", (ev) => {
+    if (state.liveEventSource !== es) return;
+    let payload = {};
+    try {
+      payload = ev.data ? JSON.parse(ev.data) : {};
+    } catch {
+      payload = {};
+    }
+
+    const wasDisconnected = state.liveEventWasDisconnected;
+    state.liveEventConnected = true;
+    state.liveEventWasDisconnected = false;
+    syncFallbackPollInterval();
+
+    if (state.dashboard?.scheduler && typeof payload.is_crawling === "boolean") {
+      state.dashboard.scheduler.is_crawling = payload.is_crawling;
+      state.dashboard.scheduler.crawling_uid = payload.crawling_uid || null;
+      updateLiveClockAndLaser();
+      renderAccountSidebar();
+    }
+
+    const serverRev = Number(payload.rev || 0);
+    const missedUpdate =
+      Number.isFinite(serverRev) &&
+      serverRev > 0 &&
+      state.liveEventRev > 0 &&
+      serverRev > state.liveEventRev;
+    if (Number.isFinite(serverRev) && serverRev > state.liveEventRev) {
+      state.liveEventRev = serverRev;
+    }
+
+    if (wasDisconnected || missedUpdate || state.liveSyncDirty) {
+      scheduleLiveRefresh(80);
+    }
+  });
+
+  es.addEventListener("update", (ev) => {
+    if (state.liveEventSource !== es || state.demoMode) return;
+    let payload = {};
+    try {
+      payload = ev.data ? JSON.parse(ev.data) : {};
+    } catch {
+      payload = {};
+    }
+
+    const serverRev = Number(payload.rev || 0);
+    if (Number.isFinite(serverRev) && serverRev > state.liveEventRev) {
+      state.liveEventRev = serverRev;
+    }
+
+    if (payload.kind === "crawl_started") {
+      if (state.dashboard?.scheduler) {
+        state.dashboard.scheduler.is_crawling = true;
+        state.dashboard.scheduler.crawling_uid = payload.uid || null;
+        updateLiveClockAndLaser();
+        renderAccountSidebar();
+      }
+      return;
+    }
+
+    if (document.hidden) {
+      state.liveSyncDirty = true;
+      return;
+    }
+    scheduleLiveRefresh(LIVE_SYNC_DEBOUNCE_MS);
+  });
+
+  es.onerror = () => {
+    if (state.liveEventSource !== es) return;
+    state.liveEventConnected = false;
+    state.liveEventWasDisconnected = true;
+    if (es.readyState === EventSource.CLOSED) {
+      state.liveEventSource = null;
+    }
+    syncFallbackPollInterval();
+  };
+}
+
+function bindLiveSyncLifecycle() {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible" || state.demoMode) return;
+    connectLiveEventStream();
+    refreshLiveData();
+  });
+
+  window.addEventListener("focus", () => {
+    if (state.demoMode || document.hidden) return;
+    connectLiveEventStream();
+    if (
+      state.liveSyncDirty ||
+      !state.liveEventConnected ||
+      Date.now() - state.lastDashboardSyncMs >= FOCUS_SYNC_MIN_GAP_MS
+    ) {
+      refreshLiveData();
+    }
+  });
+
+  window.addEventListener("online", () => {
+    if (state.demoMode) return;
+    connectLiveEventStream();
+    refreshLiveData();
+  });
+
+  window.addEventListener("pageshow", (ev) => {
+    if (!ev.persisted || state.demoMode) return;
+    connectLiveEventStream();
+    refreshLiveData();
+  });
+
+  window.addEventListener("beforeunload", () => {
+    disconnectLiveEventStream();
+  });
 }
 
 async function loadSettings() {
@@ -4479,7 +4782,11 @@ async function init() {
   // Fetch initial backend state
   let initialData = null;
   try {
-    initialData = await apiFetch(`/api/dashboard?hours=${state.hours}`);
+    const initParams = new URLSearchParams({ hours: String(state.hours) });
+    initialData = await apiFetch(`/api/dashboard?${initParams.toString()}`, {
+      timeoutMs: 15000,
+    });
+    state.lastDashboardSyncMs = Date.now();
   } catch (err) {
     showToast(`后端连接异常，已启动本地示例数据: ${err.message}`, "warn");
   }
@@ -4498,11 +4805,11 @@ async function init() {
     renderDashboard(initialData, { animateCharts: true, isLiveTick: false });
   }
 
-  state.pollTimer = setInterval(() => {
-    if (!state.demoMode && !document.hidden) {
-      loadDashboard({ animateCharts: false });
-    }
-  }, REAL_POLL_INTERVAL_MS);
+  bindLiveSyncLifecycle();
+  if (!state.demoMode) {
+    connectLiveEventStream();
+  }
+  syncFallbackPollInterval();
 }
 
 init();

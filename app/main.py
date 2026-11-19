@@ -10,6 +10,7 @@ from app.auth import AdminVerifyRateLimiter
 from app.bilibili.collectors import CrawlService
 from app.config import STATIC_DIR
 from app.database import Database, db as default_db
+from app.events import LiveEventBus
 from app.routers.accounts import router as accounts_router
 from app.routers.admin import router as admin_router
 from app.routers.dashboard import router as dashboard_router
@@ -27,7 +28,8 @@ def create_app(
     enable_scheduler: bool = True,
 ) -> FastAPI:
     active_db = database or default_db
-    crawl_service = CrawlService(active_db)
+    event_bus = LiveEventBus()
+    crawl_service = CrawlService(active_db, event_bus=event_bus)
     scheduler_mgr = SchedulerManager(active_db, crawl_service)
 
     @asynccontextmanager
@@ -37,6 +39,7 @@ def create_app(
         try:
             yield
         finally:
+            event_bus.close_all()
             scheduler_mgr.shutdown()
 
     application = FastAPI(
@@ -46,6 +49,7 @@ def create_app(
         lifespan=lifespan,
     )
     application.state.db = active_db
+    application.state.event_bus = event_bus
     application.state.crawl_service = crawl_service
     application.state.scheduler = scheduler_mgr
     application.state.enable_scheduler = enable_scheduler

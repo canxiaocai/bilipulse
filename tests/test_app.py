@@ -4021,3 +4021,133 @@ def test_fast_pulse_two_minute_channel_history_merge_retention_and_scheduler(tmp
     # Deleting account with delete_data=True purges pulse rows too
     db.delete_account("1001", delete_data=True)
     assert db.get_video_history("BV_t0_due", limit=10) == []
+
+
+def test_live_event_bus_and_sse_stream(tmp_path: Path):
+    import json
+    from app.events import LiveEventBus
+
+    # 1. Unit test LiveEventBus pub/sub, bounded overflow, and clean shutdown
+    async def verify_bus():
+        bus = LiveEventBus(max_queue_size=2)
+        assert bus.revision == 1
+        async with bus.subscribe() as q:
+            assert bus.subscriber_count == 1
+            bus.publish("crawl_started", uid="123")
+            bus.publish("snapshot", uid="123", snapshot_id=1)
+            bus.publish("fast_pulse", uid="123", videos_succeeded=2)
+            # Queue size is 2, so oldest event (crawl_started) was dropped to keep newest
+            first = q.get_nowait()
+            second = q.get_nowait()
+            assert first is not None and first["kind"] == "snapshot"
+            assert second is not None and second["kind"] == "fast_pulse"
+            assert bus.revision == 4
+            bus.close_all()
+            assert q.get_nowait() is None
+        assert bus.subscriber_count == 0
+
+    asyncio.run(verify_bus())
+
+    # 2. Verify /api/dashboard no-store + X-Data-Revision and /api/events SSE stream
+    db = Database(db_path=tmp_path / "sse_test.db")
+    application = create_app(database=db, enable_scheduler=False)
+    with TestClient(application) as client:
+        resp1 = client.get("/api/dashboard")
+        assert resp1.status_code == 200
+        assert resp1.headers.get("cache-control") == "no-store"
+        rev1 = int(resp1.headers["x-data-revision"])
+        assert rev1 >= 1
+
+        # Mutating accounts publishes an event and bumps revision
+        create_resp = client.post("/api/accounts", json={"uid": "998877", "enabled": True})
+        assert create_resp.status_code == 200
+        resp2 = client.get("/api/dashboard")
+        rev2 = int(resp2.headers["x-data-revision"])
+        assert rev2 > rev1
+
+        # Test SSE endpoint directly via ASGI app generator (publish + close_all for instant termination)
+        async def consume_sse():
+            bus = application.state.event_bus
+            received_chunks: list[str] = []
+
+            async def send_events_later():
+                while bus.subscriber_count == 0:
+                    await asyncio.sleep(0.01)
+                bus.publish("snapshot", uid="998877", snapshot_id=42, status="success")
+                await asyncio.sleep(0.01)
+                bus.close_all()
+
+            from app.routers.dashboard import stream_events
+
+            class _FakeRequest:
+                def __init__(self, app_obj):
+                    self.app = app_obj
+
+                async def is_disconnected(self) -> bool:
+                    return False
+
+            streaming = await stream_events(_FakeRequest(application))
+            assert streaming.media_type == "text/event-stream"
+            assert streaming.headers.get("x-accel-buffering") == "no"
+            assert "no-cache" in (streaming.headers.get("cache-control") or "")
+
+            driver = asyncio.create_task(send_events_later())
+            async for chunk in streaming.body_iterator:
+                received_chunks.append(chunk if isinstance(chunk, str) else chunk.decode("utf-8"))
+            await driver
+            return "".join(received_chunks)
+
+        raw_sse = asyncio.run(consume_sse())
+        assert "event: ready\n" in raw_sse
+        assert "event: update\n" in raw_sse
+        update_lines = [
+            line[len("data: "):]
+            for line in raw_sse.splitlines()
+            if line.startswith("data: ")
+        ]
+        assert len(update_lines) >= 2
+        ready_obj = json.loads(update_lines[0])
+        update_obj = json.loads(update_lines[1])
+        assert ready_obj["rev"] == rev2
+        assert update_obj["kind"] == "snapshot"
+        assert update_obj["uid"] == "998877"
+        assert update_obj["snapshot_id"] == 42
+
+
+def test_crawl_service_emits_live_events(tmp_path: Path):
+    from app.events import LiveEventBus
+
+    db = Database(db_path=tmp_path / "crawl_events.db")
+    db.create_account(uid="445566", enabled=True, set_active=True)
+    bus = LiveEventBus()
+
+    class _FakeCollector:
+        name = "fake"
+
+        async def collect(self, ctx: CrawlContext) -> None:
+            ctx.follower_count = 1234
+            ctx.following_count = 12
+            ctx.online_viewers_total = 56
+            ctx.video_count = 1
+            ctx.videos_succeeded = 1
+
+    svc = CrawlService(db, collectors=[_FakeCollector()], event_bus=bus)
+
+    async def run_and_capture():
+        captured: list[dict] = []
+        async with bus.subscribe() as q:
+            res = await svc.run_crawl(uid="445566")
+            assert res["skipped"] is False
+            while not q.empty():
+                item = q.get_nowait()
+                if item is not None:
+                    captured.append(item)
+        return captured
+
+    events = asyncio.run(run_and_capture())
+    kinds = [ev["kind"] for ev in events]
+    assert kinds == ["crawl_started", "snapshot"]
+    assert events[1]["uid"] == "445566"
+    assert events[1]["status"] == "success"
+    assert svc.crawling_uid is None
+

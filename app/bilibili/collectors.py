@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 from app.bilibili.client import BilibiliAPIError, BilibiliClient
 from app.database import Database
+from app.events import LiveEventBus
 
 logger = logging.getLogger(__name__)
 
@@ -789,14 +790,24 @@ class AllVideosOnlineCollector(BaseCollector):
 class CrawlService:
     """Coordinates modular collectors, fast-tier pulses, and persists snapshots safely."""
 
-    def __init__(self, database: Database, collectors: Optional[list[BaseCollector]] = None) -> None:
+    def __init__(
+        self,
+        database: Database,
+        collectors: Optional[list[BaseCollector]] = None,
+        event_bus: Optional[LiveEventBus] = None,
+    ) -> None:
         self.db = database
         self.collectors: list[BaseCollector] = collectors or [
             AccountFollowerCollector(),
             AllVideosOnlineCollector(),
         ]
+        self.event_bus = event_bus
         self._lock = asyncio.Lock()
         self.crawling_uid: Optional[str] = None
+
+    def _emit(self, kind: str, *, uid: Optional[str] = None, **extra: Any) -> None:
+        if self.event_bus is not None:
+            self.event_bus.publish(kind, uid=uid, **extra)
 
     @property
     def is_crawling(self) -> bool:
@@ -818,6 +829,8 @@ class CrawlService:
 
         started = time.perf_counter()
         self.crawling_uid = target_uid
+        self._emit("crawl_started", uid=target_uid)
+        snapshot_emitted = False
         try:
             async with BilibiliClient(cookie=cookie) as client:
                 ctx = CrawlContext(
@@ -870,6 +883,15 @@ class CrawlService:
                 video_online_items=ctx.video_online_items,
             )
 
+            self.crawling_uid = None
+            snapshot_emitted = True
+            self._emit(
+                "snapshot",
+                uid=target_uid,
+                snapshot_id=snapshot_id,
+                status=status,
+            )
+
             return {
                 "skipped": False,
                 "snapshot_id": snapshot_id,
@@ -884,6 +906,8 @@ class CrawlService:
             }
         finally:
             self.crawling_uid = None
+            if not snapshot_emitted:
+                self._emit("crawl_finished", uid=target_uid)
 
     async def fetch_account_profile(self, uid: str, cookie: Optional[str] = None) -> None:
         """Best-effort fetch of account name and avatar without blocking on the crawl lock."""
@@ -903,6 +927,7 @@ class CrawlService:
                     account_name=card.get("name") or None,
                     account_face=card.get("face") or None,
                 )
+                self._emit("account_profile", uid=target_uid)
         except Exception as exc:
             logger.warning("Failed to prefetch account profile for %s: %s", target_uid, exc)
 
@@ -1021,6 +1046,7 @@ class CrawlService:
 
                     cookie = await asyncio.to_thread(self.db.get_effective_cookie, uid)
                     self.crawling_uid = uid
+                    self._emit("crawl_started", uid=uid, pulse=True)
                     async with BilibiliClient(cookie=cookie) as client:
                         (
                             succeeded_items,
@@ -1067,6 +1093,17 @@ class CrawlService:
                             batch_errors[0],
                         )
 
+                    self.crawling_uid = None
+                    if succeeded_items or stat_updates:
+                        self._emit(
+                            "fast_pulse",
+                            uid=uid,
+                            videos_succeeded=len(succeeded_items),
+                            stats_refreshed=len(stat_updates),
+                        )
+                    else:
+                        self._emit("crawl_finished", uid=uid, pulse=True)
+
                     accounts_touched += 1
                     total_polled += len(polled_videos)
                     total_succeeded += len(succeeded_items)
@@ -1075,7 +1112,10 @@ class CrawlService:
                         aborted_412 = True
                         break
             finally:
-                self.crawling_uid = None
+                if self.crawling_uid is not None:
+                    finished_uid = self.crawling_uid
+                    self.crawling_uid = None
+                    self._emit("crawl_finished", uid=finished_uid, pulse=True)
 
             duration_ms = int((time.perf_counter() - started) * 1000)
             if total_polled > 0:

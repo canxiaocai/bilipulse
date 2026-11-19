@@ -119,6 +119,9 @@ async def update_settings(
         pub["admin_auth"] = AdminAuthStatus(**status_payload)
 
     new_uid = pub["uid"]
+    event_bus = getattr(request.app.state, "event_bus", None)
+    if event_bus is not None:
+        event_bus.publish("settings_changed", uid=new_uid)
     if (
         new_uid
         and new_uid != old_uid

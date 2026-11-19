@@ -1,11 +1,22 @@
 import asyncio
-from typing import Any, Optional
-from fastapi import APIRouter, Query, Request
+import json
+from typing import Any, AsyncIterator, Optional
+from fastapi import APIRouter, Query, Request, Response
+from fastapi.responses import StreamingResponse
 
 from app.auth import get_admin_status_payload
 from app.models import AdminAuthStatus, DashboardSummary, FollowerDailyChange
 
 router = APIRouter(prefix="/api", tags=["dashboard"])
+
+SSE_HEARTBEAT_SECONDS = 20.0
+
+
+def _apply_no_store_headers(request: Request, response: Response) -> None:
+    response.headers["Cache-Control"] = "no-store"
+    event_bus = getattr(request.app.state, "event_bus", None)
+    if event_bus is not None:
+        response.headers["X-Data-Revision"] = str(event_bus.revision)
 
 
 @router.get("/health")
@@ -13,9 +24,60 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@router.get("/events")
+async def stream_events(request: Request) -> StreamingResponse:
+    """Server-Sent Events stream notifying browsers immediately when new data is persisted."""
+    event_bus = request.app.state.event_bus
+    crawl_service = request.app.state.crawl_service
+
+    async def _event_stream() -> AsyncIterator[str]:
+        async with event_bus.subscribe() as queue:
+            ready_payload = {
+                "rev": event_bus.revision,
+                "is_crawling": crawl_service.is_crawling,
+                "crawling_uid": crawl_service.crawling_uid or "",
+            }
+            yield (
+                "retry: 3000\n"
+                "event: ready\n"
+                f"data: {json.dumps(ready_payload, ensure_ascii=False)}\n\n"
+            )
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        event = await asyncio.wait_for(
+                            queue.get(), timeout=SSE_HEARTBEAT_SECONDS
+                        )
+                    except asyncio.TimeoutError:
+                        yield ": keepalive\n\n"
+                        continue
+                    if event is None:
+                        break
+                    yield (
+                        f"id: {event['rev']}\n"
+                        "event: update\n"
+                        f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    )
+            except asyncio.CancelledError:
+                return
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.get("/dashboard", response_model=DashboardSummary)
 async def get_dashboard(
     request: Request,
+    response: Response,
     hours: int = Query(default=24, ge=0, le=8760, description="Time window in hours; 0 for all"),
     uid: Optional[str] = Query(default=None, description="Optional account UID to inspect"),
 ) -> DashboardSummary:
@@ -23,6 +85,8 @@ async def get_dashboard(
     scheduler_mgr = request.app.state.scheduler
     crawl_service = request.app.state.crawl_service
     target_uid = uid.strip() if uid is not None else None
+
+    _apply_no_store_headers(request, response)
 
     def _assemble_dashboard() -> DashboardSummary:
         pub_settings = db.get_public_settings(uid=target_uid)
@@ -95,8 +159,10 @@ async def get_dashboard(
 @router.get("/videos")
 async def get_videos(
     request: Request,
+    response: Response,
     uid: Optional[str] = Query(default=None, description="Optional account UID"),
 ) -> dict[str, Any]:
+    _apply_no_store_headers(request, response)
     db = request.app.state.db
 
     def _load() -> dict[str, Any]:
@@ -111,6 +177,7 @@ async def get_videos(
 @router.get("/videos/{bvid}/history")
 async def get_video_history(
     request: Request,
+    response: Response,
     bvid: str,
     hours: Optional[int] = Query(
         default=None, ge=0, le=8760, description="Time window in hours; 0 for all"
@@ -118,6 +185,7 @@ async def get_video_history(
     limit: Optional[int] = Query(default=None, ge=1, le=20000),
     max_points: Optional[int] = Query(default=None, ge=8, le=5000),
 ) -> dict[str, Any]:
+    _apply_no_store_headers(request, response)
     db = request.app.state.db
 
     def _load() -> list[dict[str, Any]]:
@@ -146,9 +214,11 @@ async def get_video_history(
 @router.get("/crawl-logs")
 async def get_crawl_logs(
     request: Request,
+    response: Response,
     limit: int = Query(default=30, ge=1, le=200),
     uid: Optional[str] = Query(default=None, description="Optional account UID"),
 ) -> dict[str, Any]:
+    _apply_no_store_headers(request, response)
     db = request.app.state.db
 
     def _load() -> dict[str, Any]:
