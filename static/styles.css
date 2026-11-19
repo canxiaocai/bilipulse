@@ -1839,6 +1839,9 @@ img.rank-thumb {
 
   .rank-side-metrics {
     margin-inline-start: 0;
+    flex: 1 1 100%;
+    min-inline-size: 0;
+    max-inline-size: 100%;
     flex-wrap: wrap;
     align-items: center;
     gap: 4px 10px;
@@ -1847,15 +1850,32 @@ img.rank-thumb {
   .rank-play7d {
     flex-direction: row;
     align-items: baseline;
+    flex-wrap: wrap;
     min-inline-size: 0;
     gap: 5px;
     padding-inline-end: 10px;
   }
 
   .rank-rates {
+    flex: 0 1 auto;
+    min-inline-size: 0;
     flex-direction: row;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 10px;
+    gap: 4px 10px;
+  }
+}
+
+@container rank-info (inline-size < 320px) {
+  .rank-side-metrics {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 3px;
+  }
+
+  .rank-play7d {
+    padding-inline-end: 0;
+    border-inline-end: 0;
   }
 }
 
@@ -1875,28 +1895,36 @@ img.rank-thumb {
   }
 
   .rank-info-main {
-    flex: 1 1 180px;
+    flex: 1 1 100%;
   }
 
   .rank-side-metrics {
     margin-inline-start: 0;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 4px 10px;
+    flex: 1 1 100%;
+    min-inline-size: 0;
+    max-inline-size: 100%;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 3px;
   }
 
   .rank-play7d {
     flex-direction: row;
     align-items: baseline;
+    flex-wrap: wrap;
     min-inline-size: 0;
     gap: 5px;
-    padding-inline-end: 10px;
+    padding-inline-end: 0;
+    border-inline-end: 0;
   }
 
   .rank-rates {
+    flex: 0 1 auto;
+    min-inline-size: 0;
     flex-direction: row;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 10px;
+    gap: 4px 10px;
   }
 
   .rank-online {
