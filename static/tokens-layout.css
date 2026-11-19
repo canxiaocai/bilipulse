@@ -718,7 +718,7 @@ svg {
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 12px 20px;
+  gap: 10px 14px;
 }
 
 .scope-kpi-main {
@@ -732,9 +732,9 @@ svg {
 .follower-daily-panel {
   display: flex;
   flex-direction: column;
-  flex: 1 1 236px;
+  flex: 1 1 204px;
   min-inline-size: 0;
-  max-inline-size: 380px;
+  max-inline-size: 360px;
   margin-inline-start: auto;
 }
 
@@ -749,7 +749,7 @@ svg {
   flex-direction: column;
   gap: 4px;
   min-inline-size: 0;
-  padding: 9px 14px;
+  padding: 8px 11px;
 }
 
 .follower-daily-head {
@@ -760,11 +760,26 @@ svg {
   min-inline-size: 0;
 }
 
-@container scope-head (inline-size < 440px) {
+@container scope-head (inline-size < 420px) {
   .follower-daily-panel {
     flex-basis: 100%;
     max-inline-size: none;
     margin-inline-start: 0;
+  }
+}
+
+@media (min-width: 1100px) {
+  .oscilloscope-grid {
+    grid-template-rows: auto 1fr;
+  }
+
+  .scope-cell {
+    grid-row: span 2;
+    display: grid;
+    /* Same-cascade fallback before subgrid */
+    grid-template-rows: auto 1fr;
+    grid-template-rows: subgrid;
+    row-gap: 0;
   }
 }
 

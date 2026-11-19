@@ -160,18 +160,36 @@ function normalizePoints(points) {
 }
 
 /**
- * Computes a monotone cubic Hermite spline SVG path (Fritsch-Carlson) so curves
- * stay silky smooth and never overshoot real sample extrema.
+ * Computes a monotone cubic Hermite spline (Fritsch-Carlson) returning both the
+ * SVG path string and exact cubic Bezier segments for O(log k) Y evaluation.
+ * Because cp1x = x0 + dx/3 and cp2x = x1 - dx/3, x(t) is strictly linear in t.
  *
  * @param {number[]} xs Strictly increasing X coordinates
  * @param {number[]} ys Corresponding Y coordinates
- * @returns {string}
+ * @returns {{ path: string, segments: Array<{x0: number, y0: number, cp1y: number, cp2y: number, x1: number, y1: number}> }}
  */
-function buildMonotoneHermitePath(xs, ys) {
+function buildMonotoneHermiteSpline(xs, ys) {
   const n = xs.length;
-  if (n === 0) return '';
-  if (n === 1) return `M ${f2(xs[0])} ${f2(ys[0])}`;
-  if (n === 2) return `M ${f2(xs[0])} ${f2(ys[0])} L ${f2(xs[1])} ${f2(ys[1])}`;
+  if (n === 0) return { path: '', segments: [] };
+  if (n === 1) {
+    return { path: `M ${f2(xs[0])} ${f2(ys[0])}`, segments: [] };
+  }
+  if (n === 2) {
+    const dy = ys[1] - ys[0];
+    return {
+      path: `M ${f2(xs[0])} ${f2(ys[0])} L ${f2(xs[1])} ${f2(ys[1])}`,
+      segments: [
+        {
+          x0: xs[0],
+          y0: ys[0],
+          cp1y: ys[0] + dy / 3,
+          cp2y: ys[1] - dy / 3,
+          x1: xs[1],
+          y1: ys[1],
+        },
+      ],
+    };
+  }
 
   const dxs = new Array(n - 1);
   const slopes = new Array(n - 1);
@@ -215,6 +233,7 @@ function buildMonotoneHermitePath(xs, ys) {
     }
   }
 
+  const segments = new Array(n - 1);
   let path = `M ${f2(xs[0])} ${f2(ys[0])}`;
   for (let i = 0; i < n - 1; i += 1) {
     const dx = dxs[i];
@@ -222,10 +241,308 @@ function buildMonotoneHermitePath(xs, ys) {
     const cp1y = ys[i] + (tangents[i] * dx) / 3;
     const cp2x = xs[i + 1] - dx / 3;
     const cp2y = ys[i + 1] - (tangents[i + 1] * dx) / 3;
+    segments[i] = {
+      x0: xs[i],
+      y0: ys[i],
+      cp1y,
+      cp2y,
+      x1: xs[i + 1],
+      y1: ys[i + 1],
+    };
     path += ` C ${f2(cp1x)} ${f2(cp1y)}, ${f2(cp2x)} ${f2(cp2y)}, ${f2(xs[i + 1])} ${f2(ys[i + 1])}`;
   }
 
-  return path;
+  return { path, segments };
+}
+
+/**
+ * Evaluates exact rendered Y coordinate on a monotone Hermite spline at targetX.
+ * @param {Array<{x0: number, y0: number, cp1y: number, cp2y: number, x1: number, y1: number}>} segments
+ * @param {number} targetX
+ * @param {number} fallbackY
+ * @returns {number}
+ */
+function evalHermiteY(segments, targetX, fallbackY) {
+  const m = segments.length;
+  if (m === 0) return fallbackY;
+  if (targetX <= segments[0].x0) return segments[0].y0;
+  if (targetX >= segments[m - 1].x1) return segments[m - 1].y1;
+
+  let lo = 0;
+  let hi = m - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (targetX < segments[mid].x0) {
+      hi = mid - 1;
+    } else if (targetX > segments[mid].x1) {
+      lo = mid + 1;
+    } else {
+      lo = mid;
+      hi = mid;
+    }
+  }
+  const seg = segments[lo];
+  const dx = seg.x1 - seg.x0;
+  if (dx <= 1e-6) return seg.y0;
+  const t = Math.max(0, Math.min(1, (targetX - seg.x0) / dx));
+  const u = 1 - t;
+  return (
+    u * u * u * seg.y0 +
+    3 * u * u * t * seg.cp1y +
+    3 * u * t * t * seg.cp2y +
+    t * t * t * seg.y1
+  );
+}
+
+/**
+ * Builds an adaptively smoothed visual series (zero-phase pixel-space local-linear
+ * Gaussian filter + knot resampling) while preserving real extrema, monotonicity,
+ * sparse/impulse signals, and keeping raw samples untouched for HUD readouts.
+ *
+ * @param {number[]} xs
+ * @param {number[]} rawValues
+ * @param {{ rawMin: number, rawMax: number, plotW: number, maxIdx: number, minIdx: number }} meta
+ * @returns {{ knotXs: number[], knotVals: number[] }}
+ */
+function buildVisualSmoothSeries(xs, rawValues, meta) {
+  const n = xs.length;
+  const { rawMin, rawMax, plotW, maxIdx, minIdx } = meta;
+  const span = rawMax - rawMin;
+
+  if (n <= 6 || span <= 0) {
+    return { knotXs: xs, knotVals: rawValues };
+  }
+
+  const avgStepPx = plotW / Math.max(1, n - 1);
+  if (avgStepPx >= 18) {
+    return { knotXs: xs, knotVals: rawValues };
+  }
+
+  let transitions = 0;
+  let isNonDecreasing = true;
+  let isNonIncreasing = true;
+  for (let i = 1; i < n; i += 1) {
+    const diff = rawValues[i] - rawValues[i - 1];
+    if (diff !== 0) transitions += 1;
+    if (diff < 0) isNonDecreasing = false;
+    if (diff > 0) isNonIncreasing = false;
+  }
+
+  // Preserve discrete tiny-span impulse / flat-plateau series (e.g., 0..1 viewer blips)
+  if (
+    (span <= 2 && transitions / (n - 1) < 0.3) ||
+    (span <= 4 && transitions <= 10)
+  ) {
+    return { knotXs: xs, knotVals: rawValues };
+  }
+
+  const isMonotonic = isNonDecreasing || isNonIncreasing;
+  const densityFactor = Math.max(0, Math.min(1, (18 - avgStepPx) / 14));
+  const sigmaPx = isMonotonic
+    ? 2.0 + densityFactor * 4.4
+    : 2.4 + densityFactor * 5.2;
+  const radiusPx = sigmaPx * 3.0;
+  const invTwoSigmaSq = 1 / (2 * sigmaPx * sigmaPx);
+
+  // Zero-phase local-linear Gaussian regression in pixel space (sliding window)
+  const smoothVals = new Array(n);
+  let winStart = 0;
+  let winEnd = 0;
+  for (let i = 0; i < n; i += 1) {
+    const xi = xs[i];
+    while (winStart < i && xi - xs[winStart] > radiusPx) {
+      winStart += 1;
+    }
+    if (winEnd < i) winEnd = i;
+    while (winEnd + 1 < n && xs[winEnd + 1] - xi <= radiusPx) {
+      winEnd += 1;
+    }
+
+    let sw = 0;
+    let swx = 0;
+    let swy = 0;
+    let swxx = 0;
+    let swxy = 0;
+    let winMin = Infinity;
+    let winMax = -Infinity;
+    const count = winEnd - winStart + 1;
+
+    for (let j = winStart; j <= winEnd; j += 1) {
+      const dx = xs[j] - xi;
+      const v = rawValues[j];
+      const w = Math.exp(-(dx * dx) * invTwoSigmaSq);
+      sw += w;
+      swx += w * dx;
+      swy += w * v;
+      swxx += w * dx * dx;
+      swxy += w * dx * v;
+      if (v < winMin) winMin = v;
+      if (v > winMax) winMax = v;
+    }
+
+    let est = rawValues[i];
+    if (sw > 1e-12) {
+      const meanX = swx / sw;
+      const meanY = swy / sw;
+      const varX = swxx / sw - meanX * meanX;
+      if (count >= 3 && varX > 1e-4) {
+        const covXY = swxy / sw - meanX * meanY;
+        est = meanY - (covXY / varX) * meanX;
+      } else {
+        est = meanY;
+      }
+    }
+
+    // Clamp to both local window bounds and global raw bounds (zero overshoot)
+    const loBound = Math.max(rawMin, winMin);
+    const hiBound = Math.min(rawMax, winMax);
+    smoothVals[i] = Math.max(loBound, Math.min(hiBound, est));
+  }
+
+  if (isNonDecreasing) {
+    smoothVals[0] = rawValues[0];
+    smoothVals[n - 1] = rawValues[n - 1];
+    for (let i = 1; i < n; i += 1) {
+      if (smoothVals[i] < smoothVals[i - 1]) {
+        smoothVals[i] = smoothVals[i - 1];
+      }
+    }
+  } else if (isNonIncreasing) {
+    smoothVals[0] = rawValues[0];
+    smoothVals[n - 1] = rawValues[n - 1];
+    for (let i = 1; i < n; i += 1) {
+      if (smoothVals[i] > smoothVals[i - 1]) {
+        smoothVals[i] = smoothVals[i - 1];
+      }
+    }
+  } else {
+    // Smooth C-infinity Gaussian bell anchoring so true peak, trough, and live
+    // endpoint align visually with Y-axis ticks & pins without adding sharp spikes
+    const bumpSigma = Math.max(4.5, sigmaPx * 0.9);
+    const bumpCutoff = bumpSigma * 3.0;
+    const invTwoBumpSq = 1 / (2 * bumpSigma * bumpSigma);
+
+    const applySmoothAnchor = (targetIdx, weight) => {
+      if (targetIdx < 0 || targetIdx >= n) return;
+      const delta = (rawValues[targetIdx] - smoothVals[targetIdx]) * weight;
+      if (Math.abs(delta) < 1e-6) return;
+      const tx = xs[targetIdx];
+      for (let j = targetIdx; j >= 0 && tx - xs[j] <= bumpCutoff; j -= 1) {
+        const d = xs[j] - tx;
+        smoothVals[j] = Math.max(
+          rawMin,
+          Math.min(rawMax, smoothVals[j] + delta * Math.exp(-(d * d) * invTwoBumpSq))
+        );
+      }
+      for (let j = targetIdx + 1; j < n && xs[j] - tx <= bumpCutoff; j += 1) {
+        const d = xs[j] - tx;
+        smoothVals[j] = Math.max(
+          rawMin,
+          Math.min(rawMax, smoothVals[j] + delta * Math.exp(-(d * d) * invTwoBumpSq))
+        );
+      }
+    };
+
+    const extremaGap = Math.abs(xs[maxIdx] - xs[minIdx]);
+    if (extremaGap > bumpSigma * 2.2) {
+      applySmoothAnchor(maxIdx, 0.92);
+      applySmoothAnchor(minIdx, 0.92);
+    } else if (extremaGap > bumpSigma * 1.1) {
+      applySmoothAnchor(maxIdx, 0.65);
+      applySmoothAnchor(minIdx, 0.65);
+    }
+
+    const lastIdx = n - 1;
+    if (
+      lastIdx !== maxIdx &&
+      lastIdx !== minIdx &&
+      Math.abs(xs[lastIdx] - xs[maxIdx]) > bumpSigma * 1.4 &&
+      Math.abs(xs[lastIdx] - xs[minIdx]) > bumpSigma * 1.4
+    ) {
+      applySmoothAnchor(lastIdx, 0.85);
+    }
+  }
+
+  // Resample to clean visual knots so cubic Bezier segments stay uncluttered
+  const minKnotStepPx = Math.max(7.0, Math.min(10.5, sigmaPx * 1.3));
+  const required = new Set([0, n - 1, maxIdx, minIdx]);
+  for (let i = 1; i < n; i += 1) {
+    if (xs[i] - xs[i - 1] > minKnotStepPx * 2.5) {
+      required.add(i - 1);
+      required.add(i);
+    }
+  }
+  const requiredSorted = Array.from(required).sort((a, b) => a - b);
+
+  const knotXs = [];
+  const knotVals = [];
+  let reqCursor = 0;
+  let lastKnotX = -Infinity;
+
+  for (let i = 0; i < n; i += 1) {
+    while (reqCursor < requiredSorted.length && requiredSorted[reqCursor] < i) {
+      reqCursor += 1;
+    }
+    const isReq = required.has(i);
+    if (isReq) {
+      knotXs.push(xs[i]);
+      knotVals.push(smoothVals[i]);
+      lastKnotX = xs[i];
+      continue;
+    }
+    if (xs[i] - lastKnotX < minKnotStepPx) {
+      continue;
+    }
+    const nextReqIdx =
+      reqCursor < requiredSorted.length ? requiredSorted[reqCursor] : -1;
+    if (
+      nextReqIdx >= 0 &&
+      xs[nextReqIdx] - xs[i] < minKnotStepPx * 0.55
+    ) {
+      continue;
+    }
+    knotXs.push(xs[i]);
+    knotVals.push(smoothVals[i]);
+    lastKnotX = xs[i];
+  }
+
+  if (knotXs.length < 3) {
+    return { knotXs: xs, knotVals: smoothVals };
+  }
+
+  return { knotXs, knotVals };
+}
+
+/**
+ * Estimates rendered pixel width of a compact SVG label string (CJK + tabular digits).
+ * @param {string} str
+ * @param {number} [fontSize=10]
+ * @returns {number}
+ */
+function estimateSvgTextWidth(str, fontSize = 10) {
+  let w = 0;
+  for (const ch of String(str ?? '')) {
+    if (/[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]/.test(ch)) {
+      w += fontSize * 1.04;
+    } else if (/[.,:;!|'\s]/.test(ch)) {
+      w += fontSize * 0.36;
+    } else {
+      w += fontSize * 0.64;
+    }
+  }
+  return Math.ceil(w);
+}
+
+/**
+ * Checks axis-aligned rectangle overlap with optional margin.
+ */
+function rectsOverlap(a, b, margin = 0) {
+  return !(
+    a.x1 + margin <= b.x0 ||
+    b.x1 + margin <= a.x0 ||
+    a.y1 + margin <= b.y0 ||
+    b.y1 + margin <= a.y0
+  );
 }
 
 /**
@@ -564,9 +881,9 @@ export function renderTelemetryChart(container, points, options = {}) {
       88,
       Math.max(48, Math.round(maxTickLen * 6.8 + 14))
     );
-    const padRight = 18;
-    const padTop = 26;
-    const padBottom = 26;
+    const padRight = 22;
+    const padTop = 28;
+    const padBottom = 28;
 
     const plotX0 = padLeft;
     const plotX1 = Math.max(plotX0 + 48, width - padRight);
@@ -593,10 +910,12 @@ export function renderTelemetryChart(container, points, options = {}) {
 
     const xs = new Array(n);
     const ys = new Array(n);
+    const rawValues = new Array(n);
 
     if (n === 1) {
       xs[0] = plotX0 + plotW / 2;
-      ys[0] = valueToY(normalized[0].value);
+      rawValues[0] = normalized[0].value;
+      ys[0] = valueToY(rawValues[0]);
     } else {
       const useTimeScale =
         normalized[0].hasValidTime &&
@@ -608,7 +927,8 @@ export function renderTelemetryChart(container, points, options = {}) {
           : plotX0 + (i / (n - 1)) * plotW;
         // Enforce strict monotonic X (+0.02px epsilon) so vertical segments never divide by 0
         xs[i] = i > 0 ? Math.max(rawX, xs[i - 1] + 0.02) : rawX;
-        ys[i] = valueToY(normalized[i].value);
+        rawValues[i] = normalized[i].value;
+        ys[i] = valueToY(rawValues[i]);
       }
       // Re-clamp right edge if epsilon nudged past plotX1
       if (xs[n - 1] > plotX1) {
@@ -620,8 +940,51 @@ export function renderTelemetryChart(container, points, options = {}) {
       }
     }
 
+    let maxIdx = 0;
+    let minIdx = 0;
+    for (let i = 0; i < n; i += 1) {
+      if (rawValues[i] >= rawValues[maxIdx]) maxIdx = i;
+      if (rawValues[i] < rawValues[minIdx]) minIdx = i;
+    }
+
+    // Build adaptively smoothed visual spline while keeping raw samples intact for HUD
+    let curvePath = '';
+    let areaPath = '';
+    let curveSegments = [];
+    const displayYs = new Array(n);
+
+    if (n === 1) {
+      const refY = ys[0];
+      displayYs[0] = refY;
+      curvePath = `M ${f2(plotX0)} ${f2(refY)} L ${f2(plotX1)} ${f2(refY)}`;
+      areaPath = `${curvePath} L ${f2(plotX1)} ${f2(plotY1)} L ${f2(plotX0)} ${f2(plotY1)} Z`;
+    } else if (n === 2) {
+      displayYs[0] = ys[0];
+      displayYs[1] = ys[1];
+      const spline = buildMonotoneHermiteSpline(xs, ys);
+      curvePath = spline.path;
+      curveSegments = spline.segments;
+      areaPath = `${curvePath} L ${f2(xs[1])} ${f2(plotY1)} L ${f2(xs[0])} ${f2(plotY1)} Z`;
+    } else {
+      const { knotXs, knotVals } = buildVisualSmoothSeries(xs, rawValues, {
+        rawMin,
+        rawMax,
+        plotW,
+        maxIdx,
+        minIdx,
+      });
+      const knotYs = knotVals.map(valueToY);
+      const spline = buildMonotoneHermiteSpline(knotXs, knotYs);
+      curvePath = spline.path;
+      curveSegments = spline.segments;
+      areaPath = `${curvePath} L ${f2(knotXs[knotXs.length - 1])} ${f2(plotY1)} L ${f2(knotXs[0])} ${f2(plotY1)} Z`;
+      for (let i = 0; i < n; i += 1) {
+        displayYs[i] = evalHermiteY(curveSegments, xs[i], ys[i]);
+      }
+    }
+
     instance.xs = xs;
-    instance.ys = ys;
+    instance.ys = displayYs;
 
     // Build technical millimeter grid + Y/X tick labels
     let gridSvg = '';
@@ -688,60 +1051,143 @@ export function renderTelemetryChart(container, points, options = {}) {
     gridSvg += `<line x1="${f2(plotX0)}" y1="${f2(plotY0)}" x2="${f2(plotX0)}" y2="${f2(plotY1)}" stroke="var(--line-strong)" stroke-width="1" />`;
     gridSvg += `<line x1="${f2(plotX0)}" y1="${f2(plotY1)}" x2="${f2(plotX1)}" y2="${f2(plotY1)}" stroke="var(--line-strong)" stroke-width="1" />`;
 
-    // Waveform path & area path
-    let curvePath = '';
-    let areaPath = '';
-    if (n === 1) {
-      const refY = ys[0];
-      curvePath = `M ${f2(plotX0)} ${f2(refY)} L ${f2(plotX1)} ${f2(refY)}`;
-      areaPath = `${curvePath} L ${f2(plotX1)} ${f2(plotY1)} L ${f2(plotX0)} ${f2(plotY1)} Z`;
-    } else if (n === 2) {
-      curvePath = `M ${f2(xs[0])} ${f2(ys[0])} L ${f2(xs[1])} ${f2(ys[1])}`;
-      areaPath = `${curvePath} L ${f2(xs[1])} ${f2(plotY1)} L ${f2(xs[0])} ${f2(plotY1)} Z`;
-    } else {
-      curvePath = buildMonotoneHermitePath(xs, ys);
-      areaPath = `${curvePath} L ${f2(xs[n - 1])} ${f2(plotY1)} L ${f2(xs[0])} ${f2(plotY1)} Z`;
+    const lastX = xs[n - 1];
+    const lastY = displayYs[n - 1];
+
+    // Sample rendered curve densely for exact pin-to-curve collision avoidance
+    const denseCurvePts = [];
+    if (n >= 2 && curveSegments.length > 0) {
+      const sampleCount = Math.max(48, Math.min(240, Math.round(plotW / 3.5)));
+      const xStart = xs[0];
+      const xSpan = Math.max(1e-4, xs[n - 1] - xStart);
+      for (let s = 0; s <= sampleCount; s += 1) {
+        const cx = xStart + (s / sampleCount) * xSpan;
+        denseCurvePts.push({ x: cx, y: evalHermiteY(curveSegments, cx, plotY1) });
+      }
     }
 
-    // Peak (MAX) and Trough (MIN) sharp technical callout pins
+    // Peak (MAX) and Trough (MIN) curve-aware callout pins with crisp backdrop
     let pinsSvg = '';
     if (n >= 2) {
-      let maxIdx = 0;
-      let minIdx = 0;
-      for (let i = 0; i < n; i += 1) {
-        if (normalized[i].value >= normalized[maxIdx].value) maxIdx = i;
-        if (normalized[i].value < normalized[minIdx].value) minIdx = i;
-      }
-
       const showMin = n >= 4 && rawMin < rawMax && minIdx !== maxIdx;
+      const placedBoxes = [];
+      const beaconBox = {
+        x0: lastX - 11,
+        y0: lastY - 11,
+        x1: lastX + 11,
+        y1: lastY + 11,
+      };
 
       const buildPin = (idx, tag, isMax) => {
         const px = xs[idx];
-        const py = ys[idx];
-        const valStr = `${tag} ${formatValue(normalized[idx].value)}`;
-        const goLeft = px > plotX1 - Math.max(96, valStr.length * 8.5);
-        const dir = goLeft ? -1 : 1;
-        const anchor = goLeft ? 'end' : 'start';
+        const py = displayYs[idx];
+        const isLiveEnd = idx === n - 1;
+        const valStr = `${tag} ${formatValue(rawValues[idx])}`;
+        const textW = estimateSvgTextWidth(valStr, 10);
+        const boxPadX = 5;
+        const boxW = textW + boxPadX * 2;
+        const boxH = 16;
+        const stemH = 8;
 
-        let elbowY;
-        let textY;
-        if (isMax) {
-          const tooHigh = py - 14 < 10;
-          elbowY = tooHigh ? py + 11 : py - 10;
-          textY = elbowY + 3;
-        } else {
-          const tooLow = py + 15 > plotY1 - 3;
-          elbowY = tooLow ? py - 10 : py + 11;
-          textY = elbowY + 3;
+        const yOffsets = isMax
+          ? [-14, -22, -32, -44, 16, 26, 38]
+          : [13, 21, -16, -24, -34, -46, -58, -70];
+        const dirs = px > plotX0 + plotW * 0.55 ? [-1, 1] : [1, -1];
+
+        const minBoxX = plotX0 + 2;
+        const maxBoxX = plotX1 - 2;
+        const minBoxY = 4;
+        const maxBoxY = plotY1 - 2;
+
+        let best = null;
+        for (const dy of yOffsets) {
+          const elbowY = py + dy;
+          const isPreferredV = isMax ? dy < 0 : dy > 0;
+          for (const dir of dirs) {
+            const boxX0 = dir > 0 ? px + stemH : px - stemH - boxW;
+            const boxX1 = boxX0 + boxW;
+            const boxY0 = elbowY - boxH / 2;
+            const boxY1 = elbowY + boxH / 2;
+            const box = { x0: boxX0, y0: boxY0, x1: boxX1, y1: boxY1 };
+
+            let score = Math.abs(dy) * 1.55;
+            if (!isPreferredV) score += 14;
+            if (dir !== dirs[0]) score += 4;
+
+            // Strict plot-bounds guard
+            if (boxX0 < minBoxX) score += 12000 + (minBoxX - boxX0) * 60;
+            if (boxX1 > maxBoxX) score += 12000 + (boxX1 - maxBoxX) * 60;
+            if (boxY0 < minBoxY) score += 12000 + (minBoxY - boxY0) * 60;
+            if (boxY1 > maxBoxY) score += 12000 + (boxY1 - maxBoxY) * 60;
+
+            // Avoid colliding with the rendered curve
+            let curveHits = 0;
+            let stemHits = 0;
+            const padBox = 4;
+            const stemX0 = Math.min(px, px + dir * stemH);
+            const stemX1 = Math.max(px, px + dir * stemH);
+            for (let k = 0; k < denseCurvePts.length; k += 1) {
+              const cp = denseCurvePts[k];
+              if (cp.x >= boxX0 - padBox && cp.x <= boxX1 + padBox) {
+                if (cp.y >= boxY0 - padBox && cp.y <= boxY1 + padBox) {
+                  curveHits += 1;
+                }
+              }
+              if (
+                Math.abs(cp.x - px) > 3 &&
+                cp.x >= stemX0 &&
+                cp.x <= stemX1 &&
+                Math.abs(cp.y - elbowY) < 4
+              ) {
+                stemHits += 1;
+              }
+            }
+            score += curveHits * 460 + stemHits * 90;
+
+            // Avoid colliding with already placed pins
+            for (const prevBox of placedBoxes) {
+              if (rectsOverlap(box, prevBox, 6)) {
+                score += 6500;
+              }
+            }
+
+            // Avoid colliding with the live endpoint beacon
+            if (rectsOverlap(box, beaconBox, 2)) {
+              score += 1200;
+            }
+
+            if (!best || score < best.score) {
+              best = { score, dir, elbowY, box };
+            }
+          }
         }
+
+        const chosen = best;
+        placedBoxes.push(chosen.box);
+
+        const dir = chosen.dir;
+        const elbowY = chosen.elbowY;
+        const { x0: boxX0, y0: boxY0, x1: boxX1 } = chosen.box;
+        const anchor = dir > 0 ? 'start' : 'end';
+        const textX = dir > 0 ? boxX0 + boxPadX : boxX1 - boxPadX;
+        const textY = elbowY + 3.5;
+        const stemEndX = dir > 0 ? boxX0 : boxX1;
+        const stemStartY = isLiveEnd
+          ? py + (elbowY < py ? -5 : 5)
+          : py;
 
         const pinColor = isMax ? channelColor : 'var(--text-secondary)';
         const diamond = `${f2(px)},${f2(py - 3)} ${f2(px + 3)},${f2(py)} ${f2(px)},${f2(py + 3)} ${f2(px - 3)},${f2(py)}`;
+        const markerSvg = isLiveEnd
+          ? ''
+          : `<polygon points="${diamond}" fill="var(--bg-elevated)" stroke="${escapeText(pinColor)}" stroke-width="1.2" />`;
+
         return `
           <g class="scope-pin ${isMax ? 'scope-pin-max' : 'scope-pin-min'}">
-            <polyline points="${f2(px)},${f2(py)} ${f2(px)},${f2(elbowY)} ${f2(px + dir * 7)},${f2(elbowY)}" fill="none" stroke="${escapeText(pinColor)}" stroke-width="1" />
-            <polygon points="${diamond}" fill="var(--bg-elevated)" stroke="${escapeText(pinColor)}" stroke-width="1.2" />
-            <text x="${f2(px + dir * 10)}" y="${f2(textY)}" text-anchor="${anchor}" fill="${escapeText(pinColor)}" font-family="var(--font-sans, sans-serif)" font-size="10" font-weight="500" style="font-variant-numeric: tabular-nums;">${escapeText(valStr)}</text>
+            <polyline points="${f2(px)},${f2(stemStartY)} ${f2(px)},${f2(elbowY)} ${f2(stemEndX)},${f2(elbowY)}" fill="none" stroke="${escapeText(pinColor)}" stroke-width="1" opacity="0.88" />
+            ${markerSvg}
+            <rect class="scope-pin-bg" x="${f2(boxX0)}" y="${f2(boxY0)}" width="${f2(boxW)}" height="${f2(boxH)}" fill="var(--bg-void)" fill-opacity="0.88" stroke="${escapeText(pinColor)}" stroke-opacity="0.32" stroke-width="1" />
+            <text x="${f2(textX)}" y="${f2(textY)}" text-anchor="${anchor}" fill="${escapeText(pinColor)}" font-family="var(--font-sans, sans-serif)" font-size="10" font-weight="500" style="font-variant-numeric: tabular-nums;">${escapeText(valStr)}</text>
           </g>
         `;
       };
@@ -751,9 +1197,6 @@ export function renderTelemetryChart(container, points, options = {}) {
         pinsSvg += buildPin(minIdx, '最低', false);
       }
     }
-
-    const lastX = xs[n - 1];
-    const lastY = ys[n - 1];
 
     container.innerHTML = `
       <svg class="scope-svg" viewBox="0 0 ${width} ${height}" width="100%" height="100%" style="display: block; touch-action: pan-y; user-select: none;">
@@ -766,7 +1209,7 @@ export function renderTelemetryChart(container, points, options = {}) {
         </defs>
         <g class="scope-grid">${gridSvg}</g>
         <path class="scope-area" d="${areaPath}" fill="url(#${escapeText(gradUid)})" />
-        <path class="scope-curve" d="${curvePath}" fill="none" stroke="${escapeText(channelColor)}" stroke-width="2" stroke-linecap="butt" stroke-linejoin="round" />
+        <path class="scope-curve" d="${curvePath}" fill="none" stroke="${escapeText(channelColor)}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
         <g class="scope-pins">${pinsSvg}</g>
         <g class="scope-axes">${axisLabelsSvg}</g>
         <g class="scope-live-endpoint">
@@ -848,7 +1291,7 @@ export function renderTelemetryChart(container, points, options = {}) {
       const safeIdx = Math.max(0, Math.min(n - 1, idx));
       const pt = normalized[safeIdx];
       const px = xs[safeIdx];
-      const py = ys[safeIdx];
+      const py = displayYs[safeIdx];
       const deltaFromStart = pt.value - normalized[0].value;
 
       if (crosshairGroup && vLine && hLine && haloEl && dotEl) {

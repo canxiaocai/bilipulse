@@ -1301,7 +1301,7 @@ samp {
 .scope-curve {
   fill: none;
   stroke-width: 2.15;
-  stroke-linecap: butt;
+  stroke-linecap: round;
   stroke-linejoin: round;
 }
 

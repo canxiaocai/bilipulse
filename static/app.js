@@ -7,14 +7,14 @@
 import {
   renderTelemetryChart,
   clearChartsInGroup,
-} from "./charts.js?v=20261119a";
+} from "./charts.js?v=20261119b";
 import {
   animateNumber,
   runViewTransition,
   staggerEnter,
   positionSlidingIndicator,
   prefersReducedMotion,
-} from "./motion.js?v=20261119a";
+} from "./motion.js?v=20261119b";
 import {
   createDemoDataset,
   tickDemoDataset,
@@ -25,7 +25,7 @@ import {
   reorderDemoAccounts,
   buildFallbackCoverSvg,
   buildDemoAvatarSvg,
-} from "./demo-data.js?v=20261119a";
+} from "./demo-data.js?v=20261119b";
 
 const THEME_STORAGE_KEY = "bilipulse_theme";
 const DEMO_PULSE_INTERVAL_MS = 3500;
