@@ -25,7 +25,7 @@ import {
   reorderDemoAccounts,
   buildFallbackCoverSvg,
   buildDemoAvatarSvg,
-} from "./demo-data.js?v=20261119b";
+} from "./demo-data.js?v=20261119d";
 
 const THEME_STORAGE_KEY = "bilipulse_theme";
 const DEMO_PULSE_INTERVAL_MS = 3500;
@@ -1810,6 +1810,37 @@ function formatEngagementRate(count, playCount, hasStats) {
   return { text: `${pct.toFixed(2)}%`, empty: false };
 }
 
+function formatPlayCount7d(video) {
+  const rawStatus = String(video?.play_count_7d_status || "").trim();
+  const rawVal = video?.play_count_7d;
+  const hasNumericVal =
+    rawVal !== null && rawVal !== undefined && rawVal !== "" && Number.isFinite(Number(rawVal));
+  const pubSec = Number(video?.pubdate || 0);
+  const nowSec = Math.floor(Date.now() / 1000);
+  const ageDays = pubSec > 0 ? Math.max(0, (nowSec - pubSec) / 86400) : null;
+
+  if (hasNumericVal && (rawStatus === "tracking" || rawStatus === "locked" || !rawStatus)) {
+    const val = Math.max(0, Math.round(Number(rawVal)));
+    const isTracking = rawStatus === "tracking";
+    const text = fmtCompact(val);
+    let title;
+    if (isTracking) {
+      const ageHint = ageDays !== null ? `已发布 ${ageDays.toFixed(1)} 天，` : "";
+      title = `发布7日播放量：${fmtNumber(val)} 次（${ageHint}未满7天，满7天自动锁定）`;
+    } else {
+      title = `发布7日播放量：${fmtNumber(val)} 次（视频发布后7天内累计播放）`;
+    }
+    return { text, empty: false, isTracking, title };
+  }
+
+  return {
+    text: "--",
+    empty: true,
+    isTracking: false,
+    title: "发布7日播放量：暂无数据（视频发布满7天时尚未采集）",
+  };
+}
+
 function createOrUpdateRankRow(video, rank, maxMetric, spec) {
   const bvid = String(video.bvid || "");
   const cache = state[spec.cacheKey];
@@ -1845,15 +1876,24 @@ function createOrUpdateRankRow(video, rank, maxMetric, spec) {
               <span class="rank-dur muted"></span>
             </div>
           </div>
-          <div class="rank-rates mono" aria-label="互动率">
-            <span class="rank-rate-item rank-rate-coin">
-              <span class="rank-rate-label">投币率</span>
-              <span class="rank-rate-val"></span>
-            </span>
-            <span class="rank-rate-item rank-rate-like">
-              <span class="rank-rate-label">点赞率</span>
-              <span class="rank-rate-val"></span>
-            </span>
+          <div class="rank-side-metrics mono">
+            <div class="rank-play7d" aria-label="发布7日播放量">
+              <span class="rank-play7d-head">
+                <span class="rank-play7d-label">7日播放</span>
+                <span class="rank-play7d-badge hidden">统计中</span>
+              </span>
+              <span class="rank-play7d-val"></span>
+            </div>
+            <div class="rank-rates" aria-label="互动率">
+              <span class="rank-rate-item rank-rate-coin">
+                <span class="rank-rate-label">投币率</span>
+                <span class="rank-rate-val"></span>
+              </span>
+              <span class="rank-rate-item rank-rate-like">
+                <span class="rank-rate-label">点赞率</span>
+                <span class="rank-rate-val"></span>
+              </span>
+            </div>
           </div>
         </div>
         <div class="rank-heat-track" aria-hidden="true">
@@ -1896,6 +1936,23 @@ function createOrUpdateRankRow(video, rank, maxMetric, spec) {
 
   const durEl = row.querySelector(".rank-dur");
   if (durEl) durEl.textContent = `${Number(video.cid_count || 1)}集 · ${fmtDuration(video.duration)}`;
+
+  const play7d = formatPlayCount7d(video);
+  const play7dEl = row.querySelector(".rank-play7d");
+  const play7dValEl = row.querySelector(".rank-play7d-val");
+  const play7dBadgeEl = row.querySelector(".rank-play7d-badge");
+  if (play7dEl) {
+    play7dEl.title = play7d.title;
+    play7dEl.classList.toggle("is-tracking", play7d.isTracking);
+    play7dEl.classList.toggle("is-empty", play7d.empty);
+  }
+  if (play7dValEl) {
+    play7dValEl.textContent = play7d.text;
+    play7dValEl.classList.toggle("is-empty", play7d.empty);
+  }
+  if (play7dBadgeEl) {
+    play7dBadgeEl.classList.toggle("hidden", !play7d.isTracking);
+  }
 
   const playCountVal = Math.max(0, Number(video.play_count || 0));
   const coinCountVal = Math.max(0, Number(video.coin_count || 0));

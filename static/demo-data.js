@@ -620,6 +620,14 @@ function createSingleDemoAccountDataset(profile, now, timeline) {
     const bvidKey = profile.uid === DEMO_UID ? spec.bvid : `${spec.bvid}_${profile.uid.slice(-3)}`;
     videoHistories[bvidKey] = history;
 
+    const isWithin7d = spec.pub_days < 7;
+    const sevenDayRatio = isWithin7d
+      ? 1
+      : Math.max(0.46, Math.min(0.86, 0.86 - Math.log2(spec.pub_days / 7 + 1) * 0.09));
+    const playCount7d = isWithin7d
+      ? scaledPlayCount
+      : Math.round(scaledPlayCount * sevenDayRatio);
+
     return {
       bvid: bvidKey,
       uid: profile.uid,
@@ -637,6 +645,8 @@ function createSingleDemoAccountDataset(profile, now, timeline) {
       pubdate: Math.floor((now - spec.pub_days * dayMs) / 1000),
       duration: spec.duration,
       play_count: scaledPlayCount,
+      play_count_7d: playCount7d,
+      play_count_7d_status: isWithin7d ? "tracking" : "locked",
       like_count: likeCount,
       coin_count: coinCount,
       stats_synced_at: latest.collected_at,
@@ -755,6 +765,9 @@ function tickSingleDemoAccount(ds) {
 
     const playStep = Math.max(0, Math.round((nextOnline / 45) + ((ds.tickCounter + i) % 3 === 0 ? 2 : 0)));
     v.play_count += playStep;
+    if (v.play_count_7d_status === "tracking") {
+      v.play_count_7d = v.play_count;
+    }
     const likeRatio = Number(v._likeRatio || 0.068);
     const likeAccum = Number(v._likeCarry || 0) + playStep * likeRatio;
     const likeStep = Math.floor(likeAccum);

@@ -19,8 +19,144 @@ FAST_PLAY_RATE_THRESHOLD = 80.0
 ACTIVE_PLAY_RATE_THRESHOLD = 25.0
 PLAY_RATE_MIN_INTERVAL_SEC = 180
 PLAY_RATE_SETTLE_INTERVAL_SEC = 600
+SEVEN_DAY_WINDOW_SECONDS = 7 * 86400
+SEVEN_DAY_BRACKET_TOLERANCE_SECONDS = 12 * 3600
+SEVEN_DAY_SINGLE_SIDE_TOLERANCE_SECONDS = 6 * 3600
 BJT_TZ = timezone(timedelta(hours=8))
 _SQLITE_CHUNK_SIZE = 500
+
+
+def _settle_play_count_7d(
+    *,
+    target_ts: int,
+    pre_ts: Optional[int],
+    pre_play: Optional[int],
+    post_ts: Optional[int],
+    post_play: Optional[int],
+) -> tuple[Optional[int], int, int]:
+    """Resolve and lock the 7-day post-publication play count from bounding observations."""
+    has_pre = pre_ts is not None and pre_play is not None and pre_ts <= target_ts
+    has_post = post_ts is not None and post_play is not None and post_ts >= target_ts
+
+    if has_pre and has_post:
+        assert pre_ts is not None and pre_play is not None
+        assert post_ts is not None and post_play is not None
+        gap_before = target_ts - pre_ts
+        gap_after = post_ts - target_ts
+        p_before = max(0, int(pre_play))
+        p_after = max(p_before, int(post_play))
+        if pre_ts == post_ts:
+            return (p_after, target_ts, 1)
+        if (
+            gap_before <= SEVEN_DAY_BRACKET_TOLERANCE_SECONDS
+            and gap_after <= SEVEN_DAY_BRACKET_TOLERANCE_SECONDS
+        ):
+            ratio = gap_before / (post_ts - pre_ts)
+            interp = int(round(p_before + (p_after - p_before) * ratio))
+            return (interp, target_ts, 1)
+        if gap_before <= SEVEN_DAY_SINGLE_SIDE_TOLERANCE_SECONDS:
+            return (p_before, pre_ts, 1)
+        if gap_after <= SEVEN_DAY_SINGLE_SIDE_TOLERANCE_SECONDS:
+            return (p_after, post_ts, 1)
+        return (None, 0, 1)
+
+    if has_pre:
+        assert pre_ts is not None and pre_play is not None
+        gap_before = target_ts - pre_ts
+        if gap_before <= SEVEN_DAY_SINGLE_SIDE_TOLERANCE_SECONDS:
+            return (max(0, int(pre_play)), pre_ts, 1)
+        return (None, 0, 1)
+
+    if has_post:
+        assert post_ts is not None and post_play is not None
+        gap_after = post_ts - target_ts
+        if gap_after <= SEVEN_DAY_SINGLE_SIDE_TOLERANCE_SECONDS:
+            return (max(0, int(post_play)), post_ts, 1)
+        return (None, 0, 1)
+
+    return (None, 0, 1)
+
+
+def _compute_play_count_7d_update(
+    *,
+    pubdate: int,
+    obs_play: int,
+    obs_ts: int,
+    old_play_7d: Optional[int],
+    old_play_7d_ts: int,
+    old_locked: int,
+) -> tuple[Optional[int], int, int]:
+    """Compute updated (play_count_7d, play_count_7d_ts, play_count_7d_locked) for a fresh play observation."""
+    if old_locked:
+        return (
+            int(old_play_7d) if old_play_7d is not None else None,
+            int(old_play_7d_ts or 0),
+            1,
+        )
+
+    pub_ts = int(pubdate or 0)
+    now_ts = int(obs_ts or 0)
+    play_val = max(0, int(obs_play))
+    if pub_ts <= 0 or now_ts <= 0:
+        return (
+            int(old_play_7d) if old_play_7d is not None else None,
+            int(old_play_7d_ts or 0),
+            0,
+        )
+
+    target_ts = pub_ts + SEVEN_DAY_WINDOW_SECONDS
+    prev_ts = int(old_play_7d_ts or 0)
+    prev_play = int(old_play_7d) if old_play_7d is not None else None
+
+    if now_ts < target_ts:
+        next_play = max(prev_play, play_val) if prev_play is not None else play_val
+        next_ts = max(prev_ts, now_ts)
+        return (next_play, next_ts, 0)
+
+    valid_pre = prev_play is not None and 0 < prev_ts <= target_ts
+    return _settle_play_count_7d(
+        target_ts=target_ts,
+        pre_ts=prev_ts if valid_pre else None,
+        pre_play=prev_play if valid_pre else None,
+        post_ts=now_ts,
+        post_play=play_val,
+    )
+
+
+def _resolve_video_play_count_7d_view(
+    *,
+    pubdate: int,
+    play_count: int,
+    stored_play_7d: Optional[int],
+    stored_play_7d_ts: int,
+    stored_locked: int,
+    now_ts: int,
+) -> tuple[Optional[int], str]:
+    """Return (display_play_count_7d, status) where status is 'tracking' | 'locked' | 'unavailable'."""
+    if stored_locked:
+        if stored_play_7d is not None:
+            return (max(0, int(stored_play_7d)), "locked")
+        return (None, "unavailable")
+
+    pub_ts = int(pubdate or 0)
+    if pub_ts <= 0:
+        return (None, "unavailable")
+
+    target_ts = pub_ts + SEVEN_DAY_WINDOW_SECONDS
+    if now_ts < target_ts:
+        cur_play = max(0, int(play_count or 0))
+        if stored_play_7d is not None:
+            cur_play = max(cur_play, max(0, int(stored_play_7d)))
+        return (cur_play, "tracking")
+
+    prev_ts = int(stored_play_7d_ts or 0)
+    if (
+        stored_play_7d is not None
+        and 0 < prev_ts <= target_ts
+        and (target_ts - prev_ts) <= SEVEN_DAY_BRACKET_TOLERANCE_SECONDS
+    ):
+        return (max(0, int(stored_play_7d)), "locked")
+    return (None, "unavailable")
 
 
 def _compute_play_rate_update(
@@ -171,6 +307,9 @@ class Database:
                     pubdate INTEGER NOT NULL DEFAULT 0,
                     duration INTEGER NOT NULL DEFAULT 0,
                     play_count INTEGER NOT NULL DEFAULT 0,
+                    play_count_7d INTEGER,
+                    play_count_7d_ts INTEGER NOT NULL DEFAULT 0,
+                    play_count_7d_locked INTEGER NOT NULL DEFAULT 0,
                     like_count INTEGER NOT NULL DEFAULT 0,
                     coin_count INTEGER NOT NULL DEFAULT 0,
                     stats_synced_at TEXT,
@@ -288,6 +427,16 @@ class Database:
                     "UPDATE videos SET last_play_ts = ? WHERE last_play_ts = 0 AND play_count > 0",
                     (now_epoch,),
                 )
+            if "play_count_7d" not in video_cols:
+                conn.execute("ALTER TABLE videos ADD COLUMN play_count_7d INTEGER")
+            if "play_count_7d_ts" not in video_cols:
+                conn.execute(
+                    "ALTER TABLE videos ADD COLUMN play_count_7d_ts INTEGER NOT NULL DEFAULT 0"
+                )
+            if "play_count_7d_locked" not in video_cols:
+                conn.execute(
+                    "ALTER TABLE videos ADD COLUMN play_count_7d_locked INTEGER NOT NULL DEFAULT 0"
+                )
             video_snap_cols = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(video_online_snapshots)").fetchall()
@@ -304,7 +453,153 @@ class Database:
             self._migrate_online_count_rule(conn, now)
             self._migrate_initial_account(conn, now)
             self._migrate_global_cookie(conn, now)
+            self._migrate_play_count_7d(conn, now)
             self._seed_default_admin_password(conn, now)
+
+    @classmethod
+    def _migrate_play_count_7d(cls, conn: sqlite3.Connection, now: str) -> None:
+        """One-time backfill of 7-day post-publication play counts from historical snapshots."""
+        flag_row = conn.execute(
+            "SELECT value FROM settings WHERE key = 'play_count_7d_backfilled_v1'"
+        ).fetchone()
+        if flag_row and flag_row["value"] == "1":
+            return
+
+        video_rows = conn.execute(
+            """
+            SELECT bvid, pubdate, play_count, last_play_ts,
+                   play_count_7d, play_count_7d_ts, play_count_7d_locked
+            FROM videos
+            WHERE pubdate > 0
+            """
+        ).fetchall()
+        if video_rows:
+            now_epoch = int(time.time())
+            acc_bounds = conn.execute(
+                "SELECT MIN(collected_at_ts) AS min_ts, MAX(collected_at_ts) AS max_ts FROM account_snapshots"
+            ).fetchone()
+            pulse_bounds = conn.execute(
+                "SELECT MIN(collected_at_ts) AS min_ts, MAX(collected_at_ts) AS max_ts FROM video_pulse_snapshots"
+            ).fetchone()
+            min_candidates = [
+                int(r["min_ts"])
+                for r in (acc_bounds, pulse_bounds)
+                if r is not None and r["min_ts"] is not None
+            ]
+            min_snap_ts = min(min_candidates) if min_candidates else None
+
+            updates: list[tuple[Optional[int], int, int, str]] = []
+            for row in video_rows:
+                if int(row["play_count_7d_locked"] or 0):
+                    continue
+                bvid = row["bvid"]
+                pubdate = int(row["pubdate"] or 0)
+                cur_play = max(0, int(row["play_count"] or 0))
+                last_play_ts = int(row["last_play_ts"] or 0)
+                target_ts = pubdate + SEVEN_DAY_WINDOW_SECONDS
+
+                if now_epoch < target_ts:
+                    checkpoint_ts = (
+                        min(last_play_ts, target_ts - 1)
+                        if last_play_ts > 0
+                        else min(now_epoch, target_ts - 1)
+                    )
+                    updates.append((cur_play, checkpoint_ts, 0, bvid))
+                    continue
+
+                # Video is already >= 7 days old. Skip snapshot scan if 7d mark predates all snapshots.
+                if (
+                    min_snap_ts is None
+                    or target_ts < min_snap_ts - SEVEN_DAY_BRACKET_TOLERANCE_SECONDS
+                ):
+                    if (
+                        last_play_ts >= target_ts
+                        and (last_play_ts - target_ts) <= SEVEN_DAY_SINGLE_SIDE_TOLERANCE_SECONDS
+                    ):
+                        updates.append((cur_play, last_play_ts, 1, bvid))
+                    elif now_epoch - target_ts <= SEVEN_DAY_SINGLE_SIDE_TOLERANCE_SECONDS:
+                        updates.append((None, 0, 0, bvid))
+                    else:
+                        updates.append((None, 0, 1, bvid))
+                    continue
+
+                pre_row = conn.execute(
+                    """
+                    SELECT collected_at_ts, play_count
+                    FROM (
+                        SELECT s.collected_at_ts AS collected_at_ts, v.play_count AS play_count
+                        FROM video_online_snapshots v
+                        JOIN account_snapshots s ON s.id = v.snapshot_id
+                        WHERE v.bvid = ? AND v.play_count IS NOT NULL AND s.collected_at_ts <= ?
+                        UNION ALL
+                        SELECT p.collected_at_ts AS collected_at_ts, p.play_count AS play_count
+                        FROM video_pulse_snapshots p
+                        WHERE p.bvid = ? AND p.play_count IS NOT NULL AND p.collected_at_ts <= ?
+                    )
+                    ORDER BY collected_at_ts DESC, play_count DESC
+                    LIMIT 1
+                    """,
+                    (bvid, target_ts, bvid, target_ts),
+                ).fetchone()
+
+                post_row = conn.execute(
+                    """
+                    SELECT collected_at_ts, play_count
+                    FROM (
+                        SELECT s.collected_at_ts AS collected_at_ts, v.play_count AS play_count
+                        FROM video_online_snapshots v
+                        JOIN account_snapshots s ON s.id = v.snapshot_id
+                        WHERE v.bvid = ? AND v.play_count IS NOT NULL AND s.collected_at_ts >= ?
+                        UNION ALL
+                        SELECT p.collected_at_ts AS collected_at_ts, p.play_count AS play_count
+                        FROM video_pulse_snapshots p
+                        WHERE p.bvid = ? AND p.play_count IS NOT NULL AND p.collected_at_ts >= ?
+                    )
+                    ORDER BY collected_at_ts ASC, play_count ASC
+                    LIMIT 1
+                    """,
+                    (bvid, target_ts, bvid, target_ts),
+                ).fetchone()
+
+                pre_ts = int(pre_row["collected_at_ts"]) if pre_row is not None else None
+                pre_play = int(pre_row["play_count"]) if pre_row is not None else None
+                post_ts = int(post_row["collected_at_ts"]) if post_row is not None else None
+                post_play = int(post_row["play_count"]) if post_row is not None else None
+
+                # If no post-7d sample exists yet and we're still within the bracket window,
+                # keep unlocked so the next live crawl can bracket and interpolate accurately.
+                if (
+                    post_ts is None
+                    and (now_epoch - target_ts) <= SEVEN_DAY_BRACKET_TOLERANCE_SECONDS
+                ):
+                    if pre_ts is not None and pre_play is not None:
+                        updates.append((max(0, pre_play), pre_ts, 0, bvid))
+                    else:
+                        updates.append((None, 0, 0, bvid))
+                    continue
+
+                settled_play, settled_ts, settled_locked = _settle_play_count_7d(
+                    target_ts=target_ts,
+                    pre_ts=pre_ts,
+                    pre_play=pre_play,
+                    post_ts=post_ts,
+                    post_play=post_play,
+                )
+                updates.append((settled_play, settled_ts, settled_locked, bvid))
+
+            if updates:
+                conn.executemany(
+                    """
+                    UPDATE videos
+                    SET play_count_7d = ?,
+                        play_count_7d_ts = ?,
+                        play_count_7d_locked = ?
+                    WHERE bvid = ?
+                    """,
+                    updates,
+                )
+
+        cls._upsert_setting(conn, "play_count_7d_backfilled_v1", "1", now)
 
     @staticmethod
     def _seed_default_admin_password(conn: sqlite3.Connection, now: str) -> None:
@@ -1027,8 +1322,9 @@ class Database:
                 placeholders = ",".join("?" for _ in chunk)
                 rows = conn.execute(
                     f"""
-                    SELECT bvid, play_count, last_play_ts, play_rate_per_hour,
-                           fast_until_ts, hot_until_ts, zero_online_streak
+                    SELECT bvid, pubdate, play_count, last_play_ts, play_rate_per_hour,
+                           fast_until_ts, hot_until_ts, zero_online_streak,
+                           play_count_7d, play_count_7d_ts, play_count_7d_locked
                     FROM videos WHERE bvid IN ({placeholders})
                     """,
                     chunk,
@@ -1046,6 +1342,7 @@ class Database:
                 coin_val = max(0, int(v.get("coin_count") or 0)) if has_stats else 0
                 synced_val = v.get("stats_synced_at") or (now if has_stats else None)
                 incoming_play = max(0, int(v.get("play_count", 0)))
+                incoming_pubdate = int(v.get("pubdate", 0))
 
                 existing = existing_map.get(v["bvid"])
                 if existing is not None:
@@ -1066,6 +1363,17 @@ class Database:
                         old_hot_until=int(existing["hot_until_ts"] or 0),
                         old_zero_streak=int(existing["zero_online_streak"] or 0),
                     )
+                    effective_pubdate = (
+                        incoming_pubdate if incoming_pubdate > 0 else int(existing["pubdate"] or 0)
+                    )
+                    play_7d, play_7d_ts, play_7d_locked = _compute_play_count_7d_update(
+                        pubdate=effective_pubdate,
+                        obs_play=eff_play,
+                        obs_ts=effective_now_ts,
+                        old_play_7d=existing["play_count_7d"],
+                        old_play_7d_ts=int(existing["play_count_7d_ts"] or 0),
+                        old_locked=int(existing["play_count_7d_locked"] or 0),
+                    )
                 else:
                     eff_play = incoming_play
                     play_rate = max(0.0, float(v.get("play_rate_per_hour") or 0.0))
@@ -1073,6 +1381,15 @@ class Database:
                     fast_until = int(v.get("fast_until_ts") or 0)
                     hot_until = int(v.get("hot_until_ts") or 0)
                     zero_streak = max(0, int(v.get("zero_online_streak") or 0))
+                    effective_pubdate = incoming_pubdate
+                    play_7d, play_7d_ts, play_7d_locked = _compute_play_count_7d_update(
+                        pubdate=effective_pubdate,
+                        obs_play=eff_play,
+                        obs_ts=effective_now_ts,
+                        old_play_7d=v.get("play_count_7d"),
+                        old_play_7d_ts=int(v.get("play_count_7d_ts") or 0),
+                        old_locked=int(v.get("play_count_7d_locked") or 0),
+                    )
 
                 stats_play_val = eff_play if synced_val is not None else None
                 params.append(
@@ -1082,9 +1399,12 @@ class Database:
                         int(v["aid"]),
                         v["title"],
                         v.get("pic", ""),
-                        int(v.get("pubdate", 0)),
+                        effective_pubdate,
                         int(v.get("duration", 0)),
                         eff_play,
+                        play_7d,
+                        play_7d_ts,
+                        play_7d_locked,
                         like_val,
                         coin_val,
                         synced_val,
@@ -1103,21 +1423,34 @@ class Database:
                 """
                 INSERT INTO videos (
                     bvid, uid, aid, title, pic, pubdate, duration, play_count,
+                    play_count_7d, play_count_7d_ts, play_count_7d_locked,
                     like_count, coin_count, stats_synced_at, stats_play_count, cids_json,
                     hot_until_ts, fast_until_ts, zero_online_streak, play_rate_per_hour,
                     last_play_ts, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(bvid) DO UPDATE SET
                     uid=excluded.uid,
                     aid=excluded.aid,
                     title=excluded.title,
                     pic=excluded.pic,
-                    pubdate=excluded.pubdate,
+                    pubdate=CASE
+                        WHEN excluded.pubdate > 0 THEN excluded.pubdate
+                        ELSE videos.pubdate
+                    END,
                     duration=CASE
                         WHEN excluded.duration > 0 THEN excluded.duration
                         ELSE videos.duration
                     END,
                     play_count=MAX(videos.play_count, excluded.play_count),
+                    play_count_7d=CASE
+                        WHEN videos.play_count_7d_locked = 1 THEN videos.play_count_7d
+                        ELSE excluded.play_count_7d
+                    END,
+                    play_count_7d_ts=CASE
+                        WHEN videos.play_count_7d_locked = 1 THEN videos.play_count_7d_ts
+                        ELSE excluded.play_count_7d_ts
+                    END,
+                    play_count_7d_locked=MAX(videos.play_count_7d_locked, excluded.play_count_7d_locked),
                     like_count=CASE
                         WHEN excluded.stats_synced_at IS NOT NULL THEN excluded.like_count
                         ELSE videos.like_count
@@ -1164,8 +1497,9 @@ class Database:
                 placeholders = ",".join("?" for _ in chunk)
                 rows = conn.execute(
                     f"""
-                    SELECT bvid, play_count, last_play_ts, play_rate_per_hour,
-                           fast_until_ts, hot_until_ts, zero_online_streak
+                    SELECT bvid, pubdate, play_count, last_play_ts, play_rate_per_hour,
+                           fast_until_ts, hot_until_ts, zero_online_streak,
+                           play_count_7d, play_count_7d_ts, play_count_7d_locked
                     FROM videos WHERE bvid IN ({placeholders})
                     """,
                     chunk,
@@ -1196,6 +1530,14 @@ class Database:
                         old_hot_until=int(existing["hot_until_ts"] or 0),
                         old_zero_streak=int(existing["zero_online_streak"] or 0),
                     )
+                    play_7d, play_7d_ts, play_7d_locked = _compute_play_count_7d_update(
+                        pubdate=int(existing["pubdate"] or 0),
+                        obs_play=eff_play,
+                        obs_ts=effective_now_ts,
+                        old_play_7d=existing["play_count_7d"],
+                        old_play_7d_ts=int(existing["play_count_7d_ts"] or 0),
+                        old_locked=int(existing["play_count_7d_locked"] or 0),
+                    )
                 else:
                     eff_play = incoming_play
                     play_rate = 0.0
@@ -1203,10 +1545,16 @@ class Database:
                     fast_until = 0
                     hot_until = 0
                     zero_streak = 0
+                    play_7d = None
+                    play_7d_ts = 0
+                    play_7d_locked = 0
 
                 params.append(
                     (
                         eff_play,
+                        play_7d,
+                        play_7d_ts,
+                        play_7d_locked,
                         max(0, int(item["like_count"])),
                         max(0, int(item["coin_count"])),
                         now,
@@ -1226,6 +1574,15 @@ class Database:
                 """
                 UPDATE videos
                 SET play_count = ?,
+                    play_count_7d = CASE
+                        WHEN play_count_7d_locked = 1 THEN play_count_7d
+                        ELSE ?
+                    END,
+                    play_count_7d_ts = CASE
+                        WHEN play_count_7d_locked = 1 THEN play_count_7d_ts
+                        ELSE ?
+                    END,
+                    play_count_7d_locked = MAX(play_count_7d_locked, ?),
                     like_count = ?,
                     coin_count = ?,
                     stats_synced_at = ?,
@@ -1304,11 +1661,13 @@ class Database:
                         )
             return len(to_delete)
 
-    def get_videos(self, uid: str) -> list[dict[str, Any]]:
+    def get_videos(self, uid: str, now_ts: Optional[int] = None) -> list[dict[str, Any]]:
+        effective_now_ts = int(now_ts if now_ts is not None else time.time())
         with self.connection() as conn:
             rows = conn.execute(
                 """
                 SELECT bvid, uid, aid, title, pic, pubdate, duration, play_count,
+                       play_count_7d, play_count_7d_ts, play_count_7d_locked,
                        like_count, coin_count, stats_synced_at, stats_play_count,
                        stats_backoff_until_ts, cids_json, last_online_count,
                        last_online_raw, last_checked_at, hot_until_ts, fast_until_ts,
@@ -1322,6 +1681,14 @@ class Database:
         items = []
         for r in rows:
             cids = json.loads(r["cids_json"] or "[]")
+            display_7d, status_7d = _resolve_video_play_count_7d_view(
+                pubdate=int(r["pubdate"] or 0),
+                play_count=int(r["play_count"] or 0),
+                stored_play_7d=r["play_count_7d"],
+                stored_play_7d_ts=int(r["play_count_7d_ts"] or 0),
+                stored_locked=int(r["play_count_7d_locked"] or 0),
+                now_ts=effective_now_ts,
+            )
             items.append(
                 {
                     "bvid": r["bvid"],
@@ -1332,6 +1699,10 @@ class Database:
                     "pubdate": r["pubdate"],
                     "duration": r["duration"],
                     "play_count": r["play_count"],
+                    "play_count_7d": display_7d,
+                    "play_count_7d_status": status_7d,
+                    "play_count_7d_ts": int(r["play_count_7d_ts"] or 0),
+                    "play_count_7d_locked": bool(r["play_count_7d_locked"]),
                     "like_count": r["like_count"],
                     "coin_count": r["coin_count"],
                     "stats_synced_at": r["stats_synced_at"],

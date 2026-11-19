@@ -4151,3 +4151,232 @@ def test_crawl_service_emits_live_events(tmp_path: Path):
     assert events[1]["status"] == "success"
     assert svc.crawling_uid is None
 
+
+def test_video_play_count_7d_tracking_settlement_and_locking(tmp_path: Path):
+    db = Database(db_path=tmp_path / "play7d.db")
+    uid = "777001"
+    now_ts = int(time.time())
+    seven_days = 7 * 86400
+
+    # 1. Video published 3 days ago: stays in 'tracking' and follows play_count updates
+    pub_recent = now_ts - 3 * 86400
+    db.upsert_videos(
+        uid,
+        [
+            {
+                "bvid": "BV1recent7d",
+                "aid": 1,
+                "title": "Recent Video",
+                "pubdate": pub_recent,
+                "play_count": 12000,
+            }
+        ],
+        now_ts=now_ts,
+    )
+    vmap = {v["bvid"]: v for v in db.get_videos(uid, now_ts=now_ts)}
+    assert vmap["BV1recent7d"]["play_count_7d"] == 12000
+    assert vmap["BV1recent7d"]["play_count_7d_status"] == "tracking"
+    assert vmap["BV1recent7d"]["play_count_7d_locked"] is False
+
+    # Updating stats while still < 7d updates live tracking play_count_7d
+    db.update_video_stats_batch(
+        [{"bvid": "BV1recent7d", "play_count": 18500, "like_count": 1000, "coin_count": 120}],
+        now_ts=now_ts + 3600,
+    )
+    vmap = {v["bvid"]: v for v in db.get_videos(uid, now_ts=now_ts + 3600)}
+    assert vmap["BV1recent7d"]["play_count_7d"] == 18500
+    assert vmap["BV1recent7d"]["play_count_7d_status"] == "tracking"
+
+    # 2. Video crossing pubdate + 7d with bracketed pre & post samples: linearly interpolated & locked
+    pub_cross = now_ts - seven_days - 3600
+    target_cross = pub_cross + seven_days
+    # Pre-7d observation 10 minutes before target_cross
+    db.upsert_videos(
+        uid,
+        [
+            {
+                "bvid": "BV1cross7d",
+                "aid": 2,
+                "title": "Crossing Video",
+                "pubdate": pub_cross,
+                "play_count": 50000,
+            }
+        ],
+        now_ts=target_cross - 600,
+    )
+    # Post-7d observation 20 minutes after target_cross -> 1/3 between 50,000 and 50,300 = 50,100
+    db.update_video_stats_batch(
+        [{"bvid": "BV1cross7d", "play_count": 50300, "like_count": 2000, "coin_count": 300}],
+        now_ts=target_cross + 1200,
+    )
+    vmap = {v["bvid"]: v for v in db.get_videos(uid, now_ts=target_cross + 1200)}
+    assert vmap["BV1cross7d"]["play_count_7d"] == 50100
+    assert vmap["BV1cross7d"]["play_count_7d_status"] == "locked"
+    assert vmap["BV1cross7d"]["play_count_7d_locked"] is True
+
+    # Subsequent huge play growth must NOT mutate locked 7-day play count
+    db.upsert_videos(
+        uid,
+        [
+            {
+                "bvid": "BV1cross7d",
+                "aid": 2,
+                "title": "Crossing Video",
+                "pubdate": pub_cross,
+                "play_count": 999999,
+            }
+        ],
+        now_ts=target_cross + 10 * 86400,
+    )
+    db.update_video_stats_batch(
+        [{"bvid": "BV1cross7d", "play_count": 1200000, "like_count": 50000, "coin_count": 8000}],
+        now_ts=target_cross + 11 * 86400,
+    )
+    vmap = {v["bvid"]: v for v in db.get_videos(uid, now_ts=target_cross + 11 * 86400)}
+    assert vmap["BV1cross7d"]["play_count"] == 1200000
+    assert vmap["BV1cross7d"]["play_count_7d"] == 50100
+    assert vmap["BV1cross7d"]["play_count_7d_status"] == "locked"
+
+    # 3. Video first observed within 6h after 7d mark -> settles to post sample
+    pub_just_past = now_ts - seven_days - 2 * 3600
+    db.upsert_videos(
+        uid,
+        [
+            {
+                "bvid": "BV1post7d",
+                "aid": 3,
+                "title": "Just Past 7d",
+                "pubdate": pub_just_past,
+                "play_count": 42000,
+            }
+        ],
+        now_ts=now_ts,
+    )
+    vmap = {v["bvid"]: v for v in db.get_videos(uid, now_ts=now_ts)}
+    assert vmap["BV1post7d"]["play_count_7d"] == 42000
+    assert vmap["BV1post7d"]["play_count_7d_status"] == "locked"
+
+    # 4. Old video (> 7d + 6h) first observed now -> locked as unavailable
+    pub_old = now_ts - 30 * 86400
+    db.upsert_videos(
+        uid,
+        [
+            {
+                "bvid": "BV1old7d",
+                "aid": 4,
+                "title": "Old Video",
+                "pubdate": pub_old,
+                "play_count": 300000,
+            }
+        ],
+        now_ts=now_ts,
+    )
+    vmap = {v["bvid"]: v for v in db.get_videos(uid, now_ts=now_ts)}
+    assert vmap["BV1old7d"]["play_count_7d"] is None
+    assert vmap["BV1old7d"]["play_count_7d_status"] == "unavailable"
+    assert vmap["BV1old7d"]["play_count_7d_locked"] is True
+
+
+def test_video_play_count_7d_backfill_migration_and_api(tmp_path: Path):
+    import sqlite3
+    from datetime import datetime, timezone
+
+    db_path = tmp_path / "legacy_play7d.db"
+    db = Database(db_path=db_path)
+    uid = "888002"
+    db.create_account(uid=uid, enabled=True, set_active=True)
+
+    now_ts = int(time.time())
+    seven_days = 7 * 86400
+    pub_bracket = now_ts - 10 * 86400
+    target_bracket = pub_bracket + seven_days
+    pub_tracking = now_ts - 2 * 86400
+    pub_ancient = now_ts - 60 * 86400
+
+    # Insert videos & historical snapshots directly, then clear backfill flag and reset columns
+    with db.connection() as conn:
+        iso_now = datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat()
+        conn.executemany(
+            """
+            INSERT INTO videos (
+                bvid, uid, aid, title, pubdate, play_count, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("BV1backfill_ok", uid, 11, "Backfill Bracket", pub_bracket, 95000, iso_now),
+                ("BV1backfill_track", uid, 12, "Backfill Tracking", pub_tracking, 14000, iso_now),
+                ("BV1backfill_old", uid, 13, "Backfill Ancient", pub_ancient, 500000, iso_now),
+            ],
+        )
+        # Pre-7d sample in account_snapshots/video_online_snapshots (15 min before 7d)
+        pre_ts = target_bracket - 900
+        cur = conn.execute(
+            """
+            INSERT INTO account_snapshots (
+                uid, collected_at, collected_at_ts, follower_count, online_viewers_total, status
+            ) VALUES (?, ?, ?, 1000, 10, 'success')
+            """,
+            (uid, datetime.fromtimestamp(pre_ts, tz=timezone.utc).isoformat(), pre_ts),
+        )
+        snap_pre_id = int(cur.lastrowid)
+        conn.execute(
+            """
+            INSERT INTO video_online_snapshots (
+                snapshot_id, bvid, online_count, online_raw, play_count, like_count
+            ) VALUES (?, ?, 5, '6', ?, 400)
+            """,
+            (snap_pre_id, "BV1backfill_ok", 60000),
+        )
+        # Post-7d sample in video_pulse_snapshots (45 min after 7d) -> 1/4 of 4000 = +1000 -> 61000
+        post_ts = target_bracket + 2700
+        conn.execute(
+            """
+            INSERT INTO video_pulse_snapshots (
+                uid, bvid, collected_at, collected_at_ts, online_count, online_raw, play_count, like_count
+            ) VALUES (?, ?, ?, ?, 4, '5', ?, 450)
+            """,
+            (
+                uid,
+                "BV1backfill_ok",
+                datetime.fromtimestamp(post_ts, tz=timezone.utc).isoformat(),
+                post_ts,
+                64000,
+            ),
+        )
+        conn.execute("DELETE FROM settings WHERE key = 'play_count_7d_backfilled_v1'")
+
+    # Re-open Database to trigger one-time backfill migration
+    db2 = Database(db_path=db_path)
+    vmap = {v["bvid"]: v for v in db2.get_videos(uid)}
+    assert vmap["BV1backfill_ok"]["play_count_7d"] == 61000
+    assert vmap["BV1backfill_ok"]["play_count_7d_status"] == "locked"
+    assert vmap["BV1backfill_track"]["play_count_7d"] == 14000
+    assert vmap["BV1backfill_track"]["play_count_7d_status"] == "tracking"
+    assert vmap["BV1backfill_old"]["play_count_7d"] is None
+    assert vmap["BV1backfill_old"]["play_count_7d_status"] == "unavailable"
+
+    # Locked 7-day play count survives snapshot pruning
+    db2.prune_old_snapshots(retention_days=1)
+    vmap_after_prune = {v["bvid"]: v for v in db2.get_videos(uid)}
+    assert vmap_after_prune["BV1backfill_ok"]["play_count_7d"] == 61000
+    assert vmap_after_prune["BV1backfill_ok"]["play_count_7d_status"] == "locked"
+
+    # Verify /api/dashboard and /api/videos expose play_count_7d & play_count_7d_status
+    application = create_app(database=db2, enable_scheduler=False)
+    with TestClient(application) as client:
+        dash_resp = client.get(f"/api/dashboard?uid={uid}")
+        assert dash_resp.status_code == 200
+        dash_videos = {v["bvid"]: v for v in dash_resp.json()["top_videos"]}
+        assert dash_videos["BV1backfill_ok"]["play_count_7d"] == 61000
+        assert dash_videos["BV1backfill_ok"]["play_count_7d_status"] == "locked"
+        assert dash_videos["BV1backfill_track"]["play_count_7d"] == 14000
+        assert dash_videos["BV1backfill_track"]["play_count_7d_status"] == "tracking"
+        assert dash_videos["BV1backfill_old"]["play_count_7d"] is None
+        assert dash_videos["BV1backfill_old"]["play_count_7d_status"] == "unavailable"
+
+        vid_resp = client.get(f"/api/videos?uid={uid}")
+        assert vid_resp.status_code == 200
+        api_videos = {v["bvid"]: v for v in vid_resp.json()["videos"]}
+        assert api_videos["BV1backfill_ok"]["play_count_7d"] == 61000
+
+
