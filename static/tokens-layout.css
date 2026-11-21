@@ -253,29 +253,6 @@ svg {
 }
 
 /* ==========================================================================
-   Top 3px Laser Progress Strip
-   ========================================================================== */
-
-.crawl-laser-bar {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 3px;
-  z-index: 90;
-  background: var(--line-subtle);
-  overflow: hidden;
-  pointer-events: none;
-}
-
-.crawl-laser-fill {
-  height: 100%;
-  width: 0%;
-  background: linear-gradient(90deg, var(--sig-cyan) 0%, var(--sig-pink) 100%);
-  transform-origin: left center;
-}
-
-/* ==========================================================================
    Studio Architectural Shell & Command Rail
    ========================================================================== */
 
@@ -283,14 +260,13 @@ svg {
   display: grid;
   grid-template-columns: 276px minmax(0, 1fr);
   min-height: 100dvh;
-  padding-top: 3px;
   background: transparent;
 }
 
 .command-rail {
   position: sticky;
-  top: 3px;
-  height: calc(100dvh - 3px);
+  top: 0;
+  height: 100dvh;
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -469,13 +445,13 @@ svg {
   display: flex;
   flex-direction: column;
   min-width: 0;
-  min-height: calc(100dvh - 3px);
+  min-height: 100dvh;
   background: var(--bg-surface);
 }
 
 .signal-topbar {
   position: sticky;
-  top: 3px;
+  top: 0;
   z-index: 30;
   display: flex;
   flex-wrap: wrap;
@@ -1339,11 +1315,11 @@ dialog.telemetry-modal[open]::backdrop {
 
   .account-sidebar {
     position: fixed;
-    inset-block: 3px 0;
+    inset-block: 0;
     inset-inline-start: 0;
     inline-size: min(300px, 84dvw);
     max-inline-size: none;
-    block-size: calc(100dvh - 3px);
+    block-size: 100dvh;
     max-block-size: none;
     margin: 0;
     padding: 0;

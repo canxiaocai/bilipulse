@@ -89,7 +89,6 @@ const state = {
   modalReqSeq: 0,
   modalAbortController: null,
   modalPoints: null,
-  clockTimer: null,
   demoTimer: null,
   pollTimer: null,
   pollIntervalMs: 0,
@@ -435,57 +434,6 @@ function toggleTheme() {
   );
 }
 
-/* ---------- Top Laser Progress ---------- */
-
-function updateLiveClockAndLaser() {
-  const nowMs = Date.now();
-
-  const laserBar = document.getElementById("crawlLaserBar");
-  const laserFill = document.getElementById("crawlLaserFill");
-
-  const sched = state.dashboard?.scheduler;
-  const isCrawling = Boolean(state.isManualCrawling || sched?.is_crawling);
-
-  if (laserBar) {
-    laserBar.classList.toggle("is-crawling", isCrawling);
-  }
-
-  if (isCrawling) {
-    if (laserFill) laserFill.style.width = "100%";
-    return;
-  }
-
-  if (state.demoMode) {
-    const intervalMs = Math.max(60000, Number(sched?.interval_minutes || 5) * 60 * 1000);
-    let nextMs = Date.parse(sched?.next_run_time || "");
-    if (Number.isNaN(nextMs) || nextMs <= nowMs) {
-      nextMs = nowMs + intervalMs;
-      if (sched) sched.next_run_time = new Date(nextMs).toISOString();
-    }
-    const remMs = Math.max(0, nextMs - nowMs);
-    const pct = Math.min(100, Math.max(0, ((intervalMs - remMs) / intervalMs) * 100));
-    if (laserFill) laserFill.style.width = `${pct.toFixed(2)}%`;
-    return;
-  }
-
-  const hasEnabledAccounts = Number(sched?.enabled_accounts_count || 0) > 0 || Boolean(state.backendUid);
-  if (!hasEnabledAccounts || !sched || !sched.enabled || !sched.running || !sched.next_run_time) {
-    if (laserFill) laserFill.style.width = "0%";
-    return;
-  }
-
-  const intervalMs = Math.max(60000, Number(sched.interval_minutes || 5) * 60 * 1000);
-  const nextMs = Date.parse(sched.next_run_time);
-  if (Number.isNaN(nextMs)) {
-    if (laserFill) laserFill.style.width = "0%";
-    return;
-  }
-
-  const remMs = Math.max(0, nextMs - nowMs);
-  const pct = Math.min(100, Math.max(0, ((intervalMs - remMs) / intervalMs) * 100));
-  if (laserFill) laserFill.style.width = `${pct.toFixed(2)}%`;
-}
-
 /* ---------- Sliding Indicators ---------- */
 
 function syncModalRangeControls({ immediate = false } = {}) {
@@ -656,7 +604,6 @@ function toggleDemoLivePulse() {
   if (!state.demoMode) return;
   state.demoLivePulse = !state.demoLivePulse;
   syncBannersAndDemoControls();
-  updateLiveClockAndLaser();
   showToast(state.demoLivePulse ? "实时脉冲推流已恢复" : "实时脉冲已暂停，波形定格");
 }
 
@@ -3112,8 +3059,6 @@ function renderDashboard(
 
   renderAccountPill(data.settings || {});
 
-  updateLiveClockAndLaser();
-
   // Unified Card KPIs
   const latest = data.latest;
   const kpiFollowers = document.getElementById("kpiFollowers");
@@ -4872,7 +4817,6 @@ function connectLiveEventStream() {
     if (state.dashboard?.scheduler && typeof payload.is_crawling === "boolean") {
       state.dashboard.scheduler.is_crawling = payload.is_crawling;
       state.dashboard.scheduler.crawling_uid = payload.crawling_uid || null;
-      updateLiveClockAndLaser();
       renderAccountSidebar();
     }
 
@@ -4910,7 +4854,6 @@ function connectLiveEventStream() {
       if (state.dashboard?.scheduler) {
         state.dashboard.scheduler.is_crawling = true;
         state.dashboard.scheduler.crawling_uid = payload.uid || null;
-        updateLiveClockAndLaser();
         renderAccountSidebar();
       }
       return;
@@ -5052,7 +4995,6 @@ async function triggerCrawl(forceSyncVideos = false) {
   const btnSync = document.getElementById("btnSyncVideos");
   state.isManualCrawling = true;
   if (btnSync) btnSync.disabled = true;
-  updateLiveClockAndLaser();
   renderAccountSidebar();
 
   showToast(
@@ -5079,7 +5021,6 @@ async function triggerCrawl(forceSyncVideos = false) {
   } finally {
     state.isManualCrawling = false;
     if (btnSync) btnSync.disabled = false;
-    updateLiveClockAndLaser();
     renderAccountSidebar();
   }
 }
@@ -5810,7 +5751,7 @@ async function init() {
   const accountValidator = wireAccessibleAccountForm();
   bindEvents(settingsValidator, accountValidator);
 
-  // Sync sliding indicators immediately (no fly-in from 0,0) & start 1s broadcast clock
+  // Sync sliding indicators immediately (no fly-in from 0,0)
   syncSlidingIndicators({ immediate: true });
   requestAnimationFrame(() => {
     syncSlidingIndicators({ immediate: true });
@@ -5820,9 +5761,6 @@ async function init() {
   if (document.fonts && typeof document.fonts.ready?.then === "function") {
     document.fonts.ready.then(() => syncSlidingIndicators({ immediate: true })).catch(() => {});
   }
-
-  updateLiveClockAndLaser();
-  state.clockTimer = setInterval(updateLiveClockAndLaser, 1000);
 
   // Fetch initial backend state
   let initialData = null;

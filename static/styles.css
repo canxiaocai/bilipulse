@@ -69,84 +69,7 @@ samp {
 }
 
 /* --------------------------------------------------------------------------
-   1. Top Crawl Laser Bar (.crawl-laser-bar, .crawl-laser-fill, .is-crawling)
-   -------------------------------------------------------------------------- */
-
-.crawl-laser-bar {
-  background: var(--bg-void);
-  border-bottom: 1px solid var(--line-subtle);
-  border-radius: 0;
-}
-
-.crawl-laser-fill {
-  position: relative;
-  height: 100%;
-  width: 0%;
-  border-radius: 0;
-  background: linear-gradient(
-    90deg,
-    var(--sig-cyan) 0%,
-    var(--sig-violet) 54%,
-    var(--sig-pink) 100%
-  );
-  box-shadow:
-    0 0 10px var(--sig-cyan-dim),
-    0 0 20px var(--sig-pink-dim);
-  transform-origin: left center;
-  transition: width 0.65s var(--ease-out-expo), opacity 0.25s ease;
-}
-
-.crawl-laser-fill::after {
-  content: "";
-  position: absolute;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  width: 20px;
-  background: linear-gradient(90deg, transparent, #ffffff);
-  opacity: 0.92;
-  pointer-events: none;
-}
-
-/* Active crawl: electric cyan-to-pink high-velocity scanning laser beam */
-.crawl-laser-bar.is-crawling {
-  border-bottom-color: var(--line-accent);
-}
-
-.crawl-laser-bar.is-crawling .crawl-laser-fill {
-  width: 100% !important;
-  background: linear-gradient(
-    90deg,
-    transparent 0%,
-    var(--sig-cyan) 24%,
-    #ffffff 50%,
-    var(--sig-pink) 76%,
-    transparent 100%
-  );
-}
-
-@media (prefers-reduced-motion: no-preference) {
-  .crawl-laser-bar.is-crawling .crawl-laser-fill {
-    width: 44% !important;
-    animation: crawlLaserSweep 1.2s cubic-bezier(0.4, 0, 0.2, 1) infinite;
-    will-change: transform;
-  }
-}
-
-@keyframes crawlLaserSweep {
-  0% {
-    transform: translate3d(-115%, 0, 0) scaleX(0.75);
-  }
-  50% {
-    transform: translate3d(75%, 0, 0) scaleX(1.18);
-  }
-  100% {
-    transform: translate3d(245%, 0, 0) scaleX(0.75);
-  }
-}
-
-/* --------------------------------------------------------------------------
-   2. Command Rail, Brand Identity & Sliding Indicators
+   1. Command Rail, Brand Identity & Sliding Indicators
    -------------------------------------------------------------------------- */
 
 .brand-mark {
@@ -2760,7 +2683,6 @@ html.vt-theme::view-transition-new(root) {
   }
 
   .nav-active-rail,
-  .crawl-laser-fill,
   .segmented-meter-fill,
   .rank-heat-fill,
   .inline-heat-fill,
