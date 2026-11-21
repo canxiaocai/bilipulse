@@ -326,15 +326,25 @@ export function staggerEnter(container, selector = '[data-stagger]', options = {
 /**
  * Positions a sliding active rail/bar indicator relative to its offsetParent,
  * supporting both vertical desktop rails ('y') and horizontal rails/range bars ('x').
+ * First placement (or `{ immediate: true }`) snaps without CSS transition so the
+ * indicator never flies in from (0, 0) on page boot, drawer open, or resize.
  *
  * @param {HTMLElement | null} indicatorEl
  * @param {HTMLElement | null} activeEl
  * @param {'auto' | 'x' | 'y'} [axis='auto']
+ * @param {{ immediate?: boolean }} [options]
  */
-export function positionSlidingIndicator(indicatorEl, activeEl, axis = 'auto') {
+export function positionSlidingIndicator(
+  indicatorEl,
+  activeEl,
+  axis = 'auto',
+  options = {}
+) {
   if (!indicatorEl) return;
   if (!activeEl) {
     indicatorEl.style.opacity = '0';
+    delete indicatorEl.dataset.indicatorReady;
+    delete indicatorEl.dataset.indicatorSnap;
     return;
   }
 
@@ -361,6 +371,13 @@ export function positionSlidingIndicator(indicatorEl, activeEl, axis = 'auto') {
   const h = activeEl.offsetHeight;
   if (w === 0 && h === 0) {
     return;
+  }
+
+  const shouldSnap =
+    Boolean(options?.immediate) ||
+    indicatorEl.dataset.indicatorReady !== 'true';
+  if (shouldSnap) {
+    indicatorEl.dataset.indicatorSnap = 'true';
   }
 
   let x = 0;
@@ -441,6 +458,13 @@ export function positionSlidingIndicator(indicatorEl, activeEl, axis = 'auto') {
   }
 
   indicatorEl.dataset.axis = resolvedAxis;
+  indicatorEl.dataset.indicatorReady = 'true';
   indicatorEl.style.opacity = '1';
   indicatorEl.style.transform = `translate3d(${tx}px, ${ty}px, 0)`;
+
+  if (shouldSnap) {
+    // Commit snapped geometry and opacity before re-enabling CSS transitions
+    void indicatorEl.offsetWidth;
+    delete indicatorEl.dataset.indicatorSnap;
+  }
 }

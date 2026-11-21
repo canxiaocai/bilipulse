@@ -14,7 +14,7 @@ import {
   staggerEnter,
   positionSlidingIndicator,
   prefersReducedMotion,
-} from "./motion.js?v=20261121b";
+} from "./motion.js?v=20261121c";
 import {
   createDemoDataset,
   tickDemoDataset,
@@ -488,7 +488,7 @@ function updateLiveClockAndLaser() {
 
 /* ---------- Sliding Indicators ---------- */
 
-function syncModalRangeControls() {
+function syncModalRangeControls({ immediate = false } = {}) {
   const group = document.getElementById("modalRangeGroup");
   if (!group) return;
   const targetHours = Number(state.modalHours ?? 24);
@@ -517,11 +517,11 @@ function syncModalRangeControls() {
   const modal = document.getElementById("videoModal");
   const modalBar = document.getElementById("modalRangeActiveBar");
   if (modal?.open && modalBar && activeBtn) {
-    positionSlidingIndicator(modalBar, activeBtn, "x");
+    positionSlidingIndicator(modalBar, activeBtn, "x", { immediate });
   }
 }
 
-function syncRangeControls() {
+function syncRangeControls({ immediate = false } = {}) {
   const group = document.getElementById("rangeGroup");
   if (!group) return;
   const targetHours = Number(state.hours ?? 24);
@@ -537,15 +537,15 @@ function syncRangeControls() {
 
   const rangeBar = document.getElementById("rangeActiveBar");
   if (rangeBar && activeBtn) {
-    positionSlidingIndicator(rangeBar, activeBtn, "x");
+    positionSlidingIndicator(rangeBar, activeBtn, "x", { immediate });
   }
 }
 
-function syncSlidingIndicators() {
+function syncSlidingIndicators({ immediate = true } = {}) {
   const rangeBar = document.getElementById("rangeActiveBar");
   const activeRange = document.querySelector("#rangeGroup .range-btn.active");
   if (rangeBar && activeRange) {
-    positionSlidingIndicator(rangeBar, activeRange, "x");
+    positionSlidingIndicator(rangeBar, activeRange, "x", { immediate });
   }
   const modal = document.getElementById("videoModal");
   if (modal && modal.open) {
@@ -554,7 +554,7 @@ function syncSlidingIndicators() {
       '#modalRangeGroup .range-btn[aria-pressed="true"]'
     );
     if (modalBar && activeModalRange) {
-      positionSlidingIndicator(modalBar, activeModalRange, "x");
+      positionSlidingIndicator(modalBar, activeModalRange, "x", { immediate });
     }
   }
 }
@@ -1636,6 +1636,7 @@ function setupResponsiveSidebar() {
       sidebar.classList.add("is-drawer-open");
       scrim?.classList.add("is-open");
     }
+    syncSlidingIndicators({ immediate: true });
     closeBtn?.focus({ preventScroll: true });
   };
 
@@ -1654,6 +1655,7 @@ function setupResponsiveSidebar() {
       sidebar.removeAttribute("aria-modal");
       stage.inert = false;
       openBtn.setAttribute("aria-expanded", "false");
+      syncSlidingIndicators({ immediate: true });
     }
   };
 
@@ -3710,8 +3712,8 @@ async function openVideoModal(bvid, fallbackTitle = "") {
     }
   }
 
-  syncModalRangeControls();
-  requestAnimationFrame(() => syncModalRangeControls());
+  syncModalRangeControls({ immediate: true });
+  requestAnimationFrame(() => syncModalRangeControls({ immediate: true }));
   await loadVideoModalSeries(bvid, state.modalHours, { animate: true });
 }
 
@@ -5808,14 +5810,15 @@ async function init() {
   const accountValidator = wireAccessibleAccountForm();
   bindEvents(settingsValidator, accountValidator);
 
-  // Sync sliding indicators & start 1s broadcast clock immediately
+  // Sync sliding indicators immediately (no fly-in from 0,0) & start 1s broadcast clock
+  syncSlidingIndicators({ immediate: true });
   requestAnimationFrame(() => {
-    syncSlidingIndicators();
+    syncSlidingIndicators({ immediate: true });
     const overviewPanel = document.getElementById("tab-overview");
     if (overviewPanel) staggerEnter(overviewPanel);
   });
   if (document.fonts && typeof document.fonts.ready?.then === "function") {
-    document.fonts.ready.then(() => syncSlidingIndicators()).catch(() => {});
+    document.fonts.ready.then(() => syncSlidingIndicators({ immediate: true })).catch(() => {});
   }
 
   updateLiveClockAndLaser();

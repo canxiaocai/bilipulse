@@ -667,14 +667,12 @@ svg {
   left: 0;
   height: 100%;
   width: 48px;
+  opacity: 0;
   background: var(--sig-cyan-dim);
   border-bottom: 2px solid var(--sig-cyan);
   pointer-events: none;
   z-index: 0;
-  transition:
-    transform 0.34s var(--ease-spring),
-    width 0.34s var(--ease-spring),
-    height 0.34s var(--ease-spring);
+  transition: none;
 }
 
 /* Dual-Channel Oscilloscope Stage */
@@ -1015,8 +1013,7 @@ dialog.telemetry-drawer[open]::backdrop {
     transition-duration: 0.1s;
   }
 
-  .nav-active-rail,
-  .range-active-bar {
+  .nav-active-rail {
     transition-duration: 0.01s;
   }
 }
