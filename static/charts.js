@@ -700,10 +700,13 @@ export function renderTelemetryChart(container, points, options = {}) {
     label = '数值',
     formatValue = (v) => Math.round(v).toLocaleString('zh-CN'),
     animate = true,
+    animateDuration = 520,
     syncGroup = null,
     onHover = null,
     emptyText = '暂无采样波形',
   } = options;
+  const resolvedAnimMs = Math.max(80, Math.min(1200, Math.round(Number(animateDuration) || 520)));
+  const resolvedAreaDelayMs = Math.min(50, Math.round(resolvedAnimMs * 0.12));
 
   if (
     typeof window !== 'undefined' &&
@@ -1265,10 +1268,10 @@ export function renderTelemetryChart(container, points, options = {}) {
         void curveEl.getBoundingClientRect();
 
         curveEl.style.transition =
-          'stroke-dashoffset 850ms cubic-bezier(0.16, 1, 0.3, 1)';
+          `stroke-dashoffset ${resolvedAnimMs}ms cubic-bezier(0.16, 1, 0.3, 1)`;
         curveEl.style.strokeDashoffset = '0';
         areaEl.style.transition =
-          'opacity 850ms cubic-bezier(0.16, 1, 0.3, 1) 70ms';
+          `opacity ${resolvedAnimMs}ms cubic-bezier(0.16, 1, 0.3, 1) ${resolvedAreaDelayMs}ms`;
         areaEl.style.opacity = '1';
 
         instance.animTimer = setTimeout(() => {
@@ -1278,7 +1281,7 @@ export function renderTelemetryChart(container, points, options = {}) {
           curveEl.style.strokeDashoffset = '';
           areaEl.style.transition = '';
           instance.animTimer = 0;
-        }, 920);
+        }, resolvedAnimMs + resolvedAreaDelayMs + 40);
       }
     }
 
@@ -1311,10 +1314,7 @@ export function renderTelemetryChart(container, points, options = {}) {
         hudTimeEl.textContent =
           pt.hudTime || formatHudTimestamp(pt.tsMs, pt.ts);
         hudLabelEl.textContent = `${label}：`;
-        hudValueEl.textContent =
-          pt.raw && pt.raw !== formattedVal
-            ? `${formattedVal} (${pt.raw})`
-            : formattedVal;
+        hudValueEl.textContent = formattedVal;
 
         hudEl.classList.add('is-active');
         hudEl.style.visibility = 'visible';

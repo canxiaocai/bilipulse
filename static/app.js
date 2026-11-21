@@ -7,7 +7,7 @@
 import {
   renderTelemetryChart,
   clearChartsInGroup,
-} from "./charts.js?v=20261119b";
+} from "./charts.js?v=20261121a";
 import {
   animateNumber,
   runViewTransition,
@@ -51,6 +51,11 @@ const state = {
   playsLimit: LEADERBOARD_PAGE_SIZE,
   isManualCrawling: false,
   dashboardReqSeq: 0,
+  dashboardAbortController: null,
+  snapshotsReqSeq: 0,
+  snapshotsAbortController: null,
+  snapshotsLoadingTimer: null,
+  snapshotCache: new Map(),
   accountModalMode: "add",
   accountModalUid: "",
   deleteTargetUid: "",
@@ -66,6 +71,7 @@ const state = {
   modalTitle: "",
   modalHours: 24,
   modalReqSeq: 0,
+  modalAbortController: null,
   modalPoints: null,
   clockTimer: null,
   demoTimer: null,
@@ -496,6 +502,26 @@ function syncModalRangeControls() {
   }
 }
 
+function syncRangeControls() {
+  const group = document.getElementById("rangeGroup");
+  if (!group) return;
+  const targetHours = Number(state.hours ?? 24);
+  const btns = Array.from(group.querySelectorAll(".range-btn"));
+  let activeBtn = null;
+
+  for (const btn of btns) {
+    const isMatch = Number(btn.dataset.hours) === targetHours;
+    btn.classList.toggle("active", isMatch);
+    btn.setAttribute("aria-pressed", String(isMatch));
+    if (isMatch) activeBtn = btn;
+  }
+
+  const rangeBar = document.getElementById("rangeActiveBar");
+  if (rangeBar && activeBtn) {
+    positionSlidingIndicator(rangeBar, activeBtn, "x");
+  }
+}
+
 function syncSlidingIndicators() {
   const rangeBar = document.getElementById("rangeActiveBar");
   const activeRange = document.querySelector("#rangeGroup .range-btn.active");
@@ -590,6 +616,7 @@ function clearRankCaches({ resetLimits = false } = {}) {
 
 function activateDemoMode({ showNotification = true } = {}) {
   disconnectLiveEventStream();
+  cancelPendingOverviewSnapshots();
   state.demoMode = true;
   state.demoLivePulse = true;
   state.demoDataset = createDemoDataset();
@@ -619,6 +646,8 @@ async function exitDemoMode() {
   state.demoLivePulse = false;
   state.demoDataset = null;
   stopDemoPulseLoop();
+  cancelPendingOverviewSnapshots();
+  state.snapshotCache.clear();
   clearRankCaches({ resetLimits: true });
   clearChartsInGroup("overview");
 
@@ -1655,6 +1684,7 @@ async function switchAccount(uid) {
 
   if (targetUid === state.activeUid) return;
 
+  cancelPendingOverviewSnapshots();
   state.activeUid = targetUid;
   state.backendUid = targetUid;
   clearRankCaches({ resetLimits: true });
@@ -1710,7 +1740,139 @@ function attachAvatarFallback(imgEl) {
 
 /* ---------- Charts ---------- */
 
-function renderOverviewCharts(data, animate = true) {
+const SNAPSHOT_CACHE_MAX_ENTRIES = 48;
+const SNAPSHOT_LOADING_DELAY_MS = 120;
+const OVERVIEW_SWITCH_ANIM_MS = 280;
+
+function isAbortError(err) {
+  return Boolean(err && (err.name === "AbortError" || err.cause?.name === "AbortError"));
+}
+
+function getSnapshotEpochSec(snap) {
+  const rawTs = Number(snap?.collected_at_ts);
+  if (Number.isFinite(rawTs) && rawTs > 0) return rawTs;
+  const parsedMs = Date.parse(String(snap?.collected_at || ""));
+  return Number.isFinite(parsedMs) ? Math.floor(parsedMs / 1000) : Number.NaN;
+}
+
+function cacheOverviewSnapshots(uid, hours, snapshots, { rev = state.liveEventRev, downsampled = false } = {}) {
+  const cleanUid = String(uid || "").trim();
+  if (!cleanUid || !Array.isArray(snapshots)) return;
+  const normHours = Math.max(0, Math.round(Number(hours) || 0));
+  const normRev = Number.isFinite(Number(rev)) ? Number(rev) : 0;
+
+  // Prune stale revisions whenever a newer revision arrives
+  if (normRev > 0) {
+    for (const [key, entry] of state.snapshotCache.entries()) {
+      if (entry.rev > 0 && entry.rev < normRev) {
+        state.snapshotCache.delete(key);
+      }
+    }
+  }
+
+  const cacheKey = `${cleanUid}:${normHours}`;
+  state.snapshotCache.delete(cacheKey);
+  state.snapshotCache.set(cacheKey, {
+    uid: cleanUid,
+    hours: normHours,
+    rev: normRev,
+    downsampled: Boolean(downsampled),
+    snapshots,
+    fetchedAtMs: Date.now(),
+  });
+
+  while (state.snapshotCache.size > SNAPSHOT_CACHE_MAX_ENTRIES) {
+    const oldestKey = state.snapshotCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    state.snapshotCache.delete(oldestKey);
+  }
+}
+
+function getCachedOverviewSnapshots(uid, hours, currentRev = state.liveEventRev) {
+  const cleanUid = String(uid || "").trim();
+  if (!cleanUid) return null;
+  const targetHours = Math.max(0, Math.round(Number(hours) || 0));
+  const normRev = Number.isFinite(Number(currentRev)) ? Number(currentRev) : 0;
+  const nowMs = Date.now();
+
+  const isFresh = (entry) => {
+    if (!entry || entry.uid !== cleanUid) return false;
+    if (normRev > 0) {
+      return entry.rev === normRev;
+    }
+    return entry.rev === 0 && nowMs - entry.fetchedAtMs < 60000;
+  };
+
+  // 1) Exact window hit
+  const exact = state.snapshotCache.get(`${cleanUid}:${targetHours}`);
+  if (isFresh(exact)) {
+    return exact.snapshots;
+  }
+
+  // 2) Lossless slice from any cached wider (non-downsampled) window for the same UID & revision
+  if (targetHours > 0) {
+    let bestSuperset = null;
+    for (const entry of state.snapshotCache.values()) {
+      if (!isFresh(entry) || entry.downsampled) continue;
+      const coversTarget = entry.hours === 0 || entry.hours > targetHours;
+      if (!coversTarget) continue;
+      if (
+        !bestSuperset ||
+        (bestSuperset.hours === 0 && entry.hours > 0) ||
+        (entry.hours > 0 && bestSuperset.hours > 0 && entry.hours < bestSuperset.hours)
+      ) {
+        bestSuperset = entry;
+      }
+    }
+    if (bestSuperset) {
+      const cutoffSec = Math.floor(nowMs / 1000) - targetHours * 3600;
+      return bestSuperset.snapshots.filter((item) => {
+        const tsSec = getSnapshotEpochSec(item);
+        return Number.isFinite(tsSec) && tsSec >= cutoffSec;
+      });
+    }
+  }
+
+  return null;
+}
+
+function clearOverviewChartsLoadingTimer() {
+  if (state.snapshotsLoadingTimer) {
+    clearTimeout(state.snapshotsLoadingTimer);
+    state.snapshotsLoadingTimer = null;
+  }
+}
+
+function setOverviewChartsLoading(isLoading) {
+  const loading = Boolean(isLoading);
+  const pairs = [
+    ["chartFollowers", "chartFollowersLoading"],
+    ["chartOnline", "chartOnlineLoading"],
+  ];
+  for (const [plotId, badgeId] of pairs) {
+    const plotEl = document.getElementById(plotId);
+    const cellEl = plotEl?.closest(".scope-cell");
+    if (cellEl) {
+      cellEl.classList.toggle("is-loading", loading);
+      cellEl.setAttribute("aria-busy", String(loading));
+    }
+    const badgeEl = document.getElementById(badgeId);
+    if (badgeEl) {
+      badgeEl.classList.toggle("hidden", !loading);
+    }
+  }
+}
+
+function cancelPendingOverviewSnapshots() {
+  clearOverviewChartsLoadingTimer();
+  if (state.snapshotsAbortController) {
+    state.snapshotsAbortController.abort();
+    state.snapshotsAbortController = null;
+  }
+  setOverviewChartsLoading(false);
+}
+
+function renderOverviewCharts(data, animate = true, { animateDuration = 520 } = {}) {
   const snaps = data?.snapshots || [];
 
   const followerPoints = [];
@@ -1749,6 +1911,7 @@ function renderOverviewCharts(data, animate = true) {
       label: "粉丝总量",
       formatValue: (v) => fmtNumber(v),
       animate,
+      animateDuration,
       syncGroup: "overview",
       emptyText: "暂无粉丝量采样波形",
     });
@@ -1761,6 +1924,7 @@ function renderOverviewCharts(data, animate = true) {
       label: "全视频在看",
       formatValue: (v) => `${fmtNumber(v)} 人`,
       animate,
+      animateDuration,
       syncGroup: "overview",
       emptyText: "暂无实时在看采样波形",
     });
@@ -3050,6 +3214,10 @@ async function loadVideoModalSeries(bvid, hours, { animate = true, silent = fals
 
   const reqId = ++state.modalReqSeq;
   const targetHours = Number(hours ?? 24);
+  if (state.modalAbortController) {
+    state.modalAbortController.abort();
+    state.modalAbortController = null;
+  }
 
   if (state.demoMode) {
     const history = getDemoVideoHistory(state, bvid, {
@@ -3074,6 +3242,8 @@ async function loadVideoModalSeries(bvid, hours, { animate = true, silent = fals
     setModalChartsPlaceholder("正在拉取视频趋势与每小时增量采样序列...");
   }
 
+  const controller = new AbortController();
+  state.modalAbortController = controller;
   try {
     const params = new URLSearchParams({
       hours: String(targetHours),
@@ -3081,7 +3251,7 @@ async function loadVideoModalSeries(bvid, hours, { animate = true, silent = fals
     });
     const res = await apiFetch(
       `/api/videos/${encodeURIComponent(bvid)}/history?${params.toString()}`,
-      { timeoutMs: 15000 }
+      { timeoutMs: 15000, signal: controller.signal }
     );
     const modal = document.getElementById("videoModal");
     if (state.modalBvid !== bvid || reqId !== state.modalReqSeq) return;
@@ -3095,8 +3265,13 @@ async function loadVideoModalSeries(bvid, hours, { animate = true, silent = fals
       }
     });
   } catch (err) {
+    if (isAbortError(err)) return;
     if (silent || state.modalBvid !== bvid || reqId !== state.modalReqSeq) return;
     setModalChartsPlaceholder(`波形拉取失败: ${err.message}`);
+  } finally {
+    if (state.modalAbortController === controller) {
+      state.modalAbortController = null;
+    }
   }
 }
 
@@ -3783,6 +3958,111 @@ function wireAccessibleAccountForm() {
 
 /* ---------- Data Loaders & Mutations ---------- */
 
+async function loadOverviewSnapshots(
+  hours = state.hours,
+  { animateCharts = true, uid = null } = {}
+) {
+  const targetHours = Math.max(0, Math.round(Number(hours) || 0));
+
+  if (state.demoMode) {
+    cancelPendingOverviewSnapshots();
+    const demoData = getDemoDashboard(state, targetHours);
+    if (state.dashboard) {
+      state.dashboard = {
+        ...state.dashboard,
+        snapshots: demoData.snapshots || [],
+      };
+    } else {
+      state.dashboard = demoData;
+    }
+    renderOverviewCharts(state.dashboard, animateCharts, {
+      animateDuration: OVERVIEW_SWITCH_ANIM_MS,
+    });
+    return state.dashboard.snapshots;
+  }
+
+  const targetUid = String(uid !== null ? uid : state.activeUid || state.backendUid || "").trim();
+  if (!targetUid) {
+    return loadDashboard({ animateCharts });
+  }
+
+  const reqSeq = ++state.snapshotsReqSeq;
+
+  // Fast path: exact revision-coherent cache hit or lossless slice from a cached wider window
+  const cachedSnapshots = getCachedOverviewSnapshots(targetUid, targetHours, state.liveEventRev);
+  if (cachedSnapshots !== null) {
+    cancelPendingOverviewSnapshots();
+    if (state.dashboard) {
+      state.dashboard = {
+        ...state.dashboard,
+        snapshots: cachedSnapshots,
+      };
+    }
+    renderOverviewCharts({ snapshots: cachedSnapshots }, animateCharts, {
+      animateDuration: OVERVIEW_SWITCH_ANIM_MS,
+    });
+    return cachedSnapshots;
+  }
+
+  cancelPendingOverviewSnapshots();
+  const controller = new AbortController();
+  state.snapshotsAbortController = controller;
+
+  state.snapshotsLoadingTimer = setTimeout(() => {
+    state.snapshotsLoadingTimer = null;
+    if (reqSeq === state.snapshotsReqSeq && state.snapshotsAbortController === controller) {
+      setOverviewChartsLoading(true);
+    }
+  }, SNAPSHOT_LOADING_DELAY_MS);
+
+  const params = new URLSearchParams({
+    hours: String(targetHours),
+    uid: targetUid,
+  });
+
+  try {
+    const res = await apiFetch(`/api/snapshots?${params.toString()}`, {
+      timeoutMs: 12000,
+      signal: controller.signal,
+    });
+    if (reqSeq !== state.snapshotsReqSeq) return null;
+    const currentUid = String(state.activeUid || state.backendUid || "").trim();
+    if (currentUid && currentUid !== targetUid) return null;
+
+    const snapshots = Array.isArray(res?.snapshots) ? res.snapshots : [];
+    cacheOverviewSnapshots(targetUid, targetHours, snapshots, {
+      rev: state.liveEventRev,
+      downsampled: Boolean(res?.downsampled),
+    });
+
+    if (state.dashboard) {
+      state.dashboard = {
+        ...state.dashboard,
+        snapshots,
+      };
+    }
+
+    clearOverviewChartsLoadingTimer();
+    setOverviewChartsLoading(false);
+    renderOverviewCharts({ snapshots }, animateCharts, {
+      animateDuration: OVERVIEW_SWITCH_ANIM_MS,
+    });
+    return snapshots;
+  } catch (err) {
+    if (isAbortError(err)) return null;
+    if (reqSeq === state.snapshotsReqSeq) {
+      clearOverviewChartsLoadingTimer();
+      setOverviewChartsLoading(false);
+      showToast(`切换采样窗口失败: ${err.message}`, "err");
+    }
+    return null;
+  } finally {
+    if (state.snapshotsAbortController === controller) {
+      state.snapshotsAbortController = null;
+    }
+  }
+}
+
 async function loadDashboard({
   animateCharts = false,
   uid = null,
@@ -3796,8 +4076,22 @@ async function loadDashboard({
   }
 
   const targetUid = uid !== null ? uid : state.activeUid;
+  const reqHours = Math.max(0, Math.round(Number(state.hours) || 0));
   const activeReqId = reqId !== null ? reqId : ++state.dashboardReqSeq;
-  const params = new URLSearchParams({ hours: String(state.hours) });
+  if (!silent) {
+    cancelPendingOverviewSnapshots();
+    if (state.dashboardAbortController) {
+      state.dashboardAbortController.abort();
+      state.dashboardAbortController = null;
+    }
+  }
+
+  const controller = new AbortController();
+  if (!silent) {
+    state.dashboardAbortController = controller;
+  }
+
+  const params = new URLSearchParams({ hours: String(reqHours) });
   if (targetUid) {
     params.set("uid", targetUid);
   }
@@ -3805,6 +4099,7 @@ async function loadDashboard({
   try {
     const data = await apiFetch(`/api/dashboard?${params.toString()}`, {
       timeoutMs: 15000,
+      signal: controller.signal,
     });
     if (activeReqId !== state.dashboardReqSeq) return null;
 
@@ -3821,16 +4116,49 @@ async function loadDashboard({
         state.activeUid = state.backendUid;
       }
     }
-    renderDashboard(data, { animateCharts, isLiveTick: false });
+
+    const resolvedUid = String(state.activeUid || state.backendUid || targetUid || "").trim();
+    const fetchedSnaps = Array.isArray(data?.snapshots) ? data.snapshots : [];
+    if (resolvedUid) {
+      cacheOverviewSnapshots(resolvedUid, reqHours, fetchedSnaps, {
+        rev: state.liveEventRev,
+        downsampled: fetchedSnaps.length >= 2000,
+      });
+    }
+
+    // If the user switched horizon while this full dashboard fetch was in flight,
+    // keep the user's selected horizon instead of clobbering charts with stale reqHours.
+    const currentHours = Math.max(0, Math.round(Number(state.hours) || 0));
+    const horizonChangedInFlight = currentHours !== reqHours;
+    if (horizonChangedInFlight) {
+      const preservedSnaps =
+        getCachedOverviewSnapshots(resolvedUid, currentHours, state.liveEventRev) ||
+        (state.dashboard?.snapshots ?? fetchedSnaps);
+      renderDashboard(
+        { ...data, snapshots: preservedSnaps },
+        { animateCharts: false, isLiveTick: false }
+      );
+      if (resolvedUid && getCachedOverviewSnapshots(resolvedUid, currentHours, state.liveEventRev) === null) {
+        loadOverviewSnapshots(currentHours, { animateCharts: false, uid: resolvedUid });
+      }
+    } else {
+      renderDashboard(data, { animateCharts, isLiveTick: false });
+    }
+
     if (!state.demoMode && !document.hidden && !state.liveEventSource) {
       connectLiveEventStream();
     }
     return data;
   } catch (err) {
+    if (isAbortError(err)) return null;
     if (!silent) {
       showToast(`加载遥测面板失败: ${err.message}`, "err");
     }
     return null;
+  } finally {
+    if (state.dashboardAbortController === controller) {
+      state.dashboardAbortController = null;
+    }
   }
 }
 
@@ -4425,15 +4753,18 @@ function bindEvents(settingsValidator, accountValidator) {
   document.getElementById("rangeGroup")?.addEventListener("click", (ev) => {
     const btn = ev.target.closest(".range-btn");
     if (!btn) return;
-    document.querySelectorAll("#rangeGroup .range-btn").forEach((b) => {
-      b.classList.toggle("active", b === btn);
-    });
-    const rangeBar = document.getElementById("rangeActiveBar");
-    if (rangeBar) {
-      positionSlidingIndicator(rangeBar, btn, "x");
+    const nextHours = Number(btn.dataset.hours || 0);
+    if (nextHours === Number(state.hours) && state.dashboard) {
+      syncRangeControls();
+      return;
     }
-    state.hours = Number(btn.dataset.hours || 0);
-    loadDashboard({ animateCharts: true });
+    state.hours = nextHours;
+    syncRangeControls();
+    if (state.dashboard || state.demoMode) {
+      loadOverviewSnapshots(nextHours, { animateCharts: true });
+    } else {
+      loadDashboard({ animateCharts: true });
+    }
   });
 
   // Video Modal Time-Window Toolbar (focusgroup fallback + range switch)
@@ -4860,8 +5191,9 @@ async function init() {
 
   // Fetch initial backend state
   let initialData = null;
+  const initHours = Math.max(0, Math.round(Number(state.hours) || 0));
   try {
-    const initParams = new URLSearchParams({ hours: String(state.hours) });
+    const initParams = new URLSearchParams({ hours: String(initHours) });
     initialData = await apiFetch(`/api/dashboard?${initParams.toString()}`, {
       timeoutMs: 15000,
     });
@@ -4881,7 +5213,15 @@ async function init() {
   if (!state.backendUid) {
     activateDemoMode({ showNotification: false });
   } else if (initialData) {
+    const initSnaps = Array.isArray(initialData.snapshots) ? initialData.snapshots : [];
+    cacheOverviewSnapshots(state.backendUid, initHours, initSnaps, {
+      rev: state.liveEventRev,
+      downsampled: initSnaps.length >= 2000,
+    });
     renderDashboard(initialData, { animateCharts: true, isLiveTick: false });
+    if (Number(state.hours) !== initHours) {
+      loadOverviewSnapshots(state.hours, { animateCharts: true, uid: state.backendUid });
+    }
   }
 
   bindLiveSyncLifecycle();

@@ -4468,4 +4468,126 @@ def test_batch_crawl_skips_deleted_and_mid_crawl_deleted_accounts(tmp_path: Path
     assert db.get_setting("last_video_sync_ts_30003", "") == ""
 
 
+def test_chart_snapshots_endpoint_lightweight_windowing_and_downsampling(tmp_path: Path):
+    from datetime import datetime, timedelta, timezone
+
+    db = Database(db_path=tmp_path / "chart_snaps.db")
+    app = create_app(database=db, enable_scheduler=False)
+
+    with TestClient(app) as client:
+        # Empty state when no account is configured
+        empty_resp = client.get("/api/snapshots?hours=24")
+        assert empty_resp.status_code == 200
+        assert empty_resp.headers.get("cache-control") == "no-store"
+        assert "x-data-revision" in empty_resp.headers
+        assert empty_resp.json() == {
+            "uid": "",
+            "hours": 24,
+            "snapshots": [],
+            "downsampled": False,
+            "total_in_window": 0,
+        }
+
+        db.create_account("50001", account_name="UP_A", set_active=True)
+        db.create_account("50002", account_name="UP_B", set_active=False)
+
+        now = datetime.now(timezone.utc).astimezone()
+        # Insert 80 snapshots over the last 40 hours (30-min spacing), with distinct peaks/troughs
+        for i in range(80):
+            ts = now - timedelta(minutes=(79 - i) * 30)
+            followers = 1000 + i * 5
+            online = 20 + (i % 7)
+            if i == 15:
+                followers = 900  # global min followers
+            elif i == 30:
+                followers = 5000  # global max followers
+            if i == 22:
+                online = 0  # global min online
+            elif i == 40:
+                online = 999  # global max online
+            db.insert_snapshot(
+                uid="50001",
+                follower_count=followers,
+                following_count=10,
+                online_viewers_total=online,
+                video_count=5,
+                videos_succeeded=5,
+                extra_metrics={"blob": "x" * 200},
+                status="success",
+                error_message=None,
+                duration_ms=40,
+                video_online_items=[],
+                collected_at=ts,
+            )
+
+        db.insert_snapshot(
+            uid="50002",
+            follower_count=200,
+            following_count=1,
+            online_viewers_total=3,
+            video_count=1,
+            videos_succeeded=1,
+            extra_metrics={},
+            status="success",
+            error_message=None,
+            duration_ms=10,
+            video_online_items=[],
+            collected_at=now,
+        )
+
+        # 1) 1-hour window returns only recent points, lightweight fields only, not downsampled
+        r_1h = client.get("/api/snapshots?hours=1&uid=50001")
+        assert r_1h.status_code == 200
+        body_1h = r_1h.json()
+        assert body_1h["uid"] == "50001"
+        assert body_1h["hours"] == 1
+        assert body_1h["downsampled"] is False
+        assert 1 <= len(body_1h["snapshots"]) <= 4
+        assert body_1h["total_in_window"] == len(body_1h["snapshots"])
+        assert set(body_1h["snapshots"][0].keys()) == {
+            "collected_at",
+            "collected_at_ts",
+            "follower_count",
+            "online_viewers_total",
+        }
+
+        # 2) All-time window with max_points=32 downsamples while preserving endpoints & extrema
+        r_all = client.get("/api/snapshots?hours=0&uid=50001&max_points=32")
+        assert r_all.status_code == 200
+        body_all = r_all.json()
+        assert body_all["downsampled"] is True
+        assert body_all["total_in_window"] == 80
+        pts = body_all["snapshots"]
+        assert len(pts) <= 36  # max_points plus small extrema budget
+        ts_list = [p["collected_at_ts"] for p in pts]
+        assert ts_list == sorted(ts_list)
+        followers_vals = [p["follower_count"] for p in pts]
+        online_vals = [p["online_viewers_total"] for p in pts]
+        assert 900 in followers_vals
+        assert 5000 in followers_vals
+        assert 0 in online_vals
+        assert 999 in online_vals
+
+        # 3) Explicit uid isolates account data
+        r_b = client.get("/api/snapshots?hours=24&uid=50002")
+        assert r_b.status_code == 200
+        assert len(r_b.json()["snapshots"]) == 1
+        assert r_b.json()["snapshots"][0]["follower_count"] == 200
+
+        # 4) Verify composite index exists and get_accounts_summary matches exact latest/delta
+        with db.connection() as conn:
+            indexes = {
+                row["name"]
+                for row in conn.execute("PRAGMA index_list(account_snapshots)").fetchall()
+            }
+        assert "idx_snapshots_uid_ts_id" in indexes
+
+        summaries = {a["uid"]: a for a in db.get_accounts_summary()}
+        assert summaries["50001"]["latest_follower_count"] == 1000 + 79 * 5
+        assert summaries["50001"]["follower_delta"] == 5
+        assert summaries["50002"]["latest_follower_count"] == 200
+        assert summaries["50002"]["follower_delta"] is None
+
+
+
 

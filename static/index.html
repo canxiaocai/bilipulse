@@ -15,7 +15,7 @@
   <title>B站账号实时监控</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 28 28' fill='none'%3E%3Crect width='28' height='28' fill='%2307090E'/%3E%3Crect x='2.5' y='4.5' width='23' height='19' stroke='%2300E5FF' stroke-width='2'/%3E%3Cpolyline points='5.5,16 9,16 11.2,10.5 14,20 16.8,13 19,16 22.5,16' stroke='%23FF2A7A' stroke-width='2.2' stroke-linecap='square' stroke-linejoin='miter'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="/static/tokens-layout.css?v=20261119b" />
-  <link rel="stylesheet" href="/static/styles.css?v=20261119e" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261121a" />
 </head>
 <body>
   <!-- Top 3px Scheduled Crawl Laser Strip -->
@@ -76,12 +76,12 @@
         </div>
         <div class="range-bar rail-range-grid" id="rangeGroup" role="group" aria-label="采样时间窗口">
           <span class="range-active-bar" id="rangeActiveBar" aria-hidden="true"></span>
-          <button type="button" class="range-btn mono" data-hours="1">1小时</button>
-          <button type="button" class="range-btn mono" data-hours="6">6小时</button>
-          <button type="button" class="range-btn mono active" data-hours="24">24小时</button>
-          <button type="button" class="range-btn mono" data-hours="168">7天</button>
-          <button type="button" class="range-btn mono" data-hours="720">30天</button>
-          <button type="button" class="range-btn mono" data-hours="0">全部</button>
+          <button type="button" class="range-btn mono" data-hours="1" aria-pressed="false">1小时</button>
+          <button type="button" class="range-btn mono" data-hours="6" aria-pressed="false">6小时</button>
+          <button type="button" class="range-btn mono active" data-hours="24" aria-pressed="true">24小时</button>
+          <button type="button" class="range-btn mono" data-hours="168" aria-pressed="false">7天</button>
+          <button type="button" class="range-btn mono" data-hours="720" aria-pressed="false">30天</button>
+          <button type="button" class="range-btn mono" data-hours="0" aria-pressed="false">全部</button>
         </div>
       </section>
 
@@ -240,6 +240,10 @@
                 </div>
               </div>
               <div class="scope-plot" id="chartFollowers"></div>
+              <div class="scope-loading-indicator hidden" id="chartFollowersLoading">
+                <progress class="loading-spinner" aria-label="正在加载粉丝量采样波形"></progress>
+                <span class="mono">同步中</span>
+              </div>
             </article>
 
             <article class="scope-cell scope-cyan" data-stagger>
@@ -250,6 +254,10 @@
                 <div class="metric-value mono" id="kpiOnline">--</div>
               </div>
               <div class="scope-plot" id="chartOnline"></div>
+              <div class="scope-loading-indicator hidden" id="chartOnlineLoading">
+                <progress class="loading-spinner" aria-label="正在加载实时在看采样波形"></progress>
+                <span class="mono">同步中</span>
+              </div>
             </article>
           </div>
 
@@ -730,6 +738,6 @@
   <!-- HUD Toast Notifications Stack -->
   <div class="toast-stack" id="toastStack" aria-live="polite"></div>
 
-  <script type="module" src="/static/app.js?v=20261119e"></script>
+  <script type="module" src="/static/app.js?v=20261121a"></script>
 </body>
 </html>

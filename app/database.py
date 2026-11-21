@@ -299,6 +299,8 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_snapshots_uid_ts
                     ON account_snapshots (uid, collected_at_ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_snapshots_uid_ts_id
+                    ON account_snapshots (uid, collected_at_ts DESC, id DESC);
 
                 CREATE TABLE IF NOT EXISTS videos (
                     bvid TEXT PRIMARY KEY,
@@ -977,22 +979,21 @@ class Database:
             }
 
             snaps_by_uid: dict[str, list[dict[str, Any]]] = {}
-            snap_rows = conn.execute(
-                """
-                SELECT *
-                FROM (
-                    SELECT *,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY uid ORDER BY collected_at_ts DESC, id DESC
-                           ) AS rn
+            for acc_row in acc_rows:
+                acc_uid = acc_row["uid"]
+                snap_rows = conn.execute(
+                    """
+                    SELECT id, uid, collected_at, collected_at_ts, follower_count,
+                           online_viewers_total, video_count, status
                     FROM account_snapshots
-                )
-                WHERE rn <= 2
-                ORDER BY uid, rn ASC
-                """
-            ).fetchall()
-            for r in snap_rows:
-                snaps_by_uid.setdefault(r["uid"], []).append(self._row_to_snapshot(r))
+                    WHERE uid = ?
+                    ORDER BY collected_at_ts DESC, id DESC
+                    LIMIT 2
+                    """,
+                    (acc_uid,),
+                ).fetchall()
+                if snap_rows:
+                    snaps_by_uid[acc_uid] = [dict(r) for r in snap_rows]
 
         summaries: list[dict[str, Any]] = []
         for acc_row in acc_rows:
@@ -2018,6 +2019,129 @@ class Database:
             ).fetchall()
         # Return chronologically ascending for charting
         return [self._row_to_snapshot(r) for r in reversed(rows)]
+
+    @staticmethod
+    def _downsample_account_snapshots(
+        rows: list[dict[str, Any]], max_points: int = 480
+    ) -> list[dict[str, Any]]:
+        """Downsample overview chart snapshots chronologically while preserving endpoints, extrema, and live tail."""
+        total = len(rows)
+        if total <= max_points or max_points < 16:
+            return rows
+
+        tail_keep = min(48, total // 5)
+        head_count = total - tail_keep
+        target_head = max(16, max_points - tail_keep - 10)
+        stride = head_count / target_head
+
+        must_keep: set[int] = {0, total - 1}
+        first_f_idx: Optional[int] = None
+        last_f_idx: Optional[int] = None
+        min_f_idx: Optional[int] = None
+        max_f_idx: Optional[int] = None
+        min_f = float("inf")
+        max_f = float("-inf")
+
+        first_o_idx: Optional[int] = None
+        last_o_idx: Optional[int] = None
+        min_o_idx: Optional[int] = None
+        max_o_idx: Optional[int] = None
+        min_o = float("inf")
+        max_o = float("-inf")
+
+        for i, row in enumerate(rows):
+            f_raw = row.get("follower_count")
+            if f_raw is not None:
+                f_val = int(f_raw)
+                if first_f_idx is None:
+                    first_f_idx = i
+                last_f_idx = i
+                if f_val < min_f:
+                    min_f = f_val
+                    min_f_idx = i
+                if f_val > max_f:
+                    max_f = f_val
+                    max_f_idx = i
+
+            o_raw = row.get("online_viewers_total")
+            if o_raw is not None:
+                o_val = int(o_raw)
+                if first_o_idx is None:
+                    first_o_idx = i
+                last_o_idx = i
+                if o_val < min_o:
+                    min_o = o_val
+                    min_o_idx = i
+                if o_val > max_o:
+                    max_o = o_val
+                    max_o_idx = i
+
+        for idx in (
+            first_f_idx,
+            last_f_idx,
+            min_f_idx,
+            max_f_idx,
+            first_o_idx,
+            last_o_idx,
+            min_o_idx,
+            max_o_idx,
+        ):
+            if idx is not None:
+                must_keep.add(idx)
+
+        for k in range(target_head):
+            must_keep.add(min(head_count - 1, round(k * stride)))
+        for i in range(max(0, head_count), total):
+            must_keep.add(i)
+
+        return [rows[idx] for idx in sorted(must_keep)]
+
+    def get_chart_snapshots(
+        self,
+        uid: str,
+        since_hours: Optional[int] = 24,
+        limit: int = 50000,
+        max_points: Optional[int] = 480,
+    ) -> tuple[list[dict[str, Any]], bool, int]:
+        """Fetch lightweight chart-only snapshot points with optional extrema-preserving downsampling."""
+        params: list[Any] = [uid]
+        where = "WHERE uid = ?"
+        if since_hours is not None and since_hours > 0:
+            cutoff = int(time.time()) - since_hours * 3600
+            where += " AND collected_at_ts >= ?"
+            params.append(cutoff)
+        params.append(limit)
+
+        with self.connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT collected_at, collected_at_ts, follower_count, online_viewers_total
+                FROM account_snapshots
+                {where}
+                ORDER BY collected_at_ts DESC, id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+
+        total_in_window = len(rows)
+        items = [
+            {
+                "collected_at": r["collected_at"],
+                "collected_at_ts": r["collected_at_ts"],
+                "follower_count": r["follower_count"],
+                "online_viewers_total": r["online_viewers_total"],
+            }
+            for r in reversed(rows)
+        ]
+        if max_points is not None and max_points > 0 and len(items) > max_points:
+            return (
+                self._downsample_account_snapshots(items, max_points=max_points),
+                True,
+                total_in_window,
+            )
+        truncated = total_in_window >= limit
+        return (items, truncated, total_in_window)
 
     def get_recent_snapshots(self, uid: str, limit: int = 30) -> list[dict[str, Any]]:
         with self.connection() as conn:

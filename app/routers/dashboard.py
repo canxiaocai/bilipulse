@@ -156,6 +156,46 @@ async def get_dashboard(
     return await asyncio.to_thread(_assemble_dashboard)
 
 
+@router.get("/snapshots")
+async def get_chart_snapshots(
+    request: Request,
+    response: Response,
+    hours: int = Query(default=24, ge=0, le=8760, description="Time window in hours; 0 for all"),
+    uid: Optional[str] = Query(default=None, description="Optional account UID"),
+    max_points: Optional[int] = Query(
+        default=480, ge=16, le=5000, description="Maximum chart points returned"
+    ),
+) -> dict[str, Any]:
+    """Lightweight overview chart telemetry endpoint for fast time-window switching."""
+    _apply_no_store_headers(request, response)
+    db = request.app.state.db
+
+    def _load() -> dict[str, Any]:
+        target_uid = (uid if uid is not None else db.get_setting("uid", "")).strip()
+        if not target_uid:
+            return {
+                "uid": "",
+                "hours": hours,
+                "snapshots": [],
+                "downsampled": False,
+                "total_in_window": 0,
+            }
+        snapshots, downsampled, total_in_window = db.get_chart_snapshots(
+            target_uid,
+            since_hours=hours if hours > 0 else None,
+            max_points=max_points,
+        )
+        return {
+            "uid": target_uid,
+            "hours": hours,
+            "snapshots": snapshots,
+            "downsampled": downsampled,
+            "total_in_window": total_in_window,
+        }
+
+    return await asyncio.to_thread(_load)
+
+
 @router.get("/videos")
 async def get_videos(
     request: Request,
