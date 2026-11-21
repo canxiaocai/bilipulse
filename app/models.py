@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from pydantic import BaseModel, Field
 
 
@@ -46,6 +46,13 @@ class SettingsUpdate(BaseModel):
         default=None,
         description="Optional admin password; pass empty string to clear DB password, omit to keep existing",
     )
+
+
+class ChartSnapshotOut(BaseModel):
+    collected_at: str
+    collected_at_ts: int
+    follower_count: Optional[int] = None
+    online_viewers_total: Optional[int] = None
 
 
 class SnapshotOut(BaseModel):
@@ -157,6 +164,7 @@ class DashboardSummary(BaseModel):
     follower_daily: FollowerDailyChange = Field(default_factory=FollowerDailyChange)
     total_snapshots: int = 0
     total_videos: int = 0
-    snapshots: list[SnapshotOut] = Field(default_factory=list)
+    snapshots: list[Union[SnapshotOut, ChartSnapshotOut]] = Field(default_factory=list)
+    snapshots_downsampled: bool = False
     top_videos: list[VideoOut] = Field(default_factory=list)
     accounts: list[AccountSummary] = Field(default_factory=list)

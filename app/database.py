@@ -250,7 +250,44 @@ class Database:
     def __init__(self, db_path: Optional[Path] = None) -> None:
         self.db_path = Path(db_path or DB_PATH)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._local = threading.local()
         self.init_schema()
+
+    def _open_read_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path), timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("PRAGMA temp_store=MEMORY;")
+        conn.execute("PRAGMA query_only=ON;")
+        return conn
+
+    @contextmanager
+    def read_session(self) -> Iterator[sqlite3.Connection]:
+        """Share a single read-only SQLite connection across multiple read queries on the current thread."""
+        existing: Optional[sqlite3.Connection] = getattr(self._local, "read_conn", None)
+        if existing is not None:
+            yield existing
+            return
+        conn = self._open_read_connection()
+        self._local.read_conn = conn
+        try:
+            yield conn
+        finally:
+            self._local.read_conn = None
+            conn.close()
+
+    @contextmanager
+    def read_connection(self) -> Iterator[sqlite3.Connection]:
+        """Reuse the active thread-local read session if present, else open a lightweight read-only connection."""
+        existing: Optional[sqlite3.Connection] = getattr(self._local, "read_conn", None)
+        if existing is not None:
+            yield existing
+            return
+        conn = self._open_read_connection()
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
@@ -335,6 +372,10 @@ class Database:
                     ON videos (uid, pubdate DESC);
                 CREATE INDEX IF NOT EXISTS idx_videos_uid_online_pubdate
                     ON videos (uid, last_online_count DESC, pubdate DESC);
+                CREATE INDEX IF NOT EXISTS idx_videos_uid_online_play
+                    ON videos (uid, last_online_count DESC, play_count DESC);
+                CREATE INDEX IF NOT EXISTS idx_videos_uid_play_online
+                    ON videos (uid, play_count DESC, last_online_count DESC);
 
                 CREATE TABLE IF NOT EXISTS video_online_snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -738,7 +779,7 @@ class Database:
         cls._upsert_setting(conn, "global_cookie_migrated_v1", "1", now)
 
     def get_all_settings(self) -> dict[str, str]:
-        with self.connection() as conn:
+        with self.read_connection() as conn:
             rows = conn.execute("SELECT key, value FROM settings").fetchall()
         result = dict(DEFAULT_SETTINGS)
         for row in rows:
@@ -746,7 +787,7 @@ class Database:
         return result
 
     def get_public_settings(self, uid: Optional[str] = None) -> dict[str, Any]:
-        with self.connection() as conn:
+        with self.read_connection() as conn:
             rows = conn.execute("SELECT key, value FROM settings").fetchall()
             raw = dict(DEFAULT_SETTINGS)
             for row in rows:
@@ -892,14 +933,14 @@ class Database:
         return self.get_public_settings()
 
     def get_setting(self, key: str, default: str = "") -> str:
-        with self.connection() as conn:
+        with self.read_connection() as conn:
             row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else default
 
     def get_effective_cookie(self, uid: Optional[str] = None) -> str:
         """Return account-specific cookie override if set, otherwise the global cookie."""
         clean_uid = str(uid or "").strip()
-        with self.connection() as conn:
+        with self.read_connection() as conn:
             if clean_uid:
                 acc_row = conn.execute(
                     "SELECT cookie FROM monitored_accounts WHERE uid = ?", (clean_uid,)
@@ -915,21 +956,21 @@ class Database:
         clean_uid = str(uid or "").strip()
         if not clean_uid:
             return None
-        with self.connection() as conn:
+        with self.read_connection() as conn:
             row = conn.execute(
                 "SELECT * FROM monitored_accounts WHERE uid = ?", (clean_uid,)
             ).fetchone()
         return dict(row) if row else None
 
     def list_accounts(self) -> list[dict[str, Any]]:
-        with self.connection() as conn:
+        with self.read_connection() as conn:
             rows = conn.execute(
                 "SELECT * FROM monitored_accounts ORDER BY sort_order ASC, created_at ASC"
             ).fetchall()
         return [dict(r) for r in rows]
 
     def get_enabled_accounts(self) -> list[dict[str, Any]]:
-        with self.connection() as conn:
+        with self.read_connection() as conn:
             rows = conn.execute(
                 "SELECT * FROM monitored_accounts WHERE enabled = 1 ORDER BY sort_order ASC, created_at ASC"
             ).fetchall()
@@ -959,7 +1000,7 @@ class Database:
         return []
 
     def get_accounts_summary(self, crawling_uid: Optional[str] = None) -> list[dict[str, Any]]:
-        with self.connection() as conn:
+        with self.read_connection() as conn:
             acc_rows = conn.execute(
                 "SELECT * FROM monitored_accounts ORDER BY sort_order ASC, created_at ASC"
             ).fetchall()
@@ -1184,7 +1225,13 @@ class Database:
                 if account_face is not None:
                     self._upsert_setting(conn, "account_face", account_face.strip(), now)
 
-    def set_active_account(self, uid: str) -> Optional[dict[str, Any]]:
+    def set_active_account(
+        self,
+        uid: str,
+        *,
+        include_summary: bool = True,
+        crawling_uid: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
         clean_uid = str(uid).strip()
         now = datetime.now(timezone.utc).astimezone().isoformat()
         with self.connection() as conn:
@@ -1199,7 +1246,19 @@ class Database:
             self._upsert_setting(
                 conn, "enabled", "true" if row["enabled"] else "false", now
             )
-        return next((a for a in self.get_accounts_summary() if a["uid"] == clean_uid), None)
+            basic_account = {
+                "uid": clean_uid,
+                "account_name": row["account_name"] or "",
+                "account_face": row["account_face"] or "",
+                "enabled": bool(row["enabled"]),
+                "sort_order": int(row["sort_order"] or 0),
+            }
+        if not include_summary:
+            return basic_account
+        return next(
+            (a for a in self.get_accounts_summary(crawling_uid=crawling_uid) if a["uid"] == clean_uid),
+            basic_account,
+        )
 
     @staticmethod
     def _delete_video_snapshots_by_bvids(conn: sqlite3.Connection, bvids: list[str]) -> None:
@@ -1666,7 +1725,7 @@ class Database:
 
     def get_videos(self, uid: str, now_ts: Optional[int] = None) -> list[dict[str, Any]]:
         effective_now_ts = int(now_ts if now_ts is not None else time.time())
-        with self.connection() as conn:
+        with self.read_connection() as conn:
             rows = conn.execute(
                 """
                 SELECT bvid, uid, aid, title, pic, pubdate, duration, play_count,
@@ -1725,6 +1784,105 @@ class Database:
                 }
             )
         return items
+
+    def get_dashboard_videos(
+        self,
+        uid: str,
+        *,
+        top_limit: Optional[int] = None,
+        now_ts: Optional[int] = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Fetch lightweight dashboard video rows (no cids_json Python parsing) with optional dual-board top-N cap."""
+        effective_now_ts = int(now_ts if now_ts is not None else time.time())
+        select_cols = """
+            bvid, uid, aid, title, pic, pubdate, duration, play_count,
+            play_count_7d, play_count_7d_ts, play_count_7d_locked,
+            like_count, coin_count, stats_synced_at,
+            CASE
+                WHEN json_valid(cids_json) THEN COALESCE(json_array_length(cids_json), 0)
+                ELSE 0
+            END AS cid_len,
+            last_online_count, last_online_raw, last_checked_at
+        """
+        with self.read_connection() as conn:
+            if top_limit is not None and top_limit > 0:
+                total_row = conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM videos WHERE uid = ?", (uid,)
+                ).fetchone()
+                total_videos = int(total_row["cnt"]) if total_row else 0
+                if total_videos == 0:
+                    return ([], 0)
+                online_rows = conn.execute(
+                    f"""
+                    SELECT {select_cols}
+                    FROM videos
+                    WHERE uid = ?
+                    ORDER BY last_online_count DESC, play_count DESC
+                    LIMIT ?
+                    """,
+                    (uid, top_limit),
+                ).fetchall()
+                play_rows = conn.execute(
+                    f"""
+                    SELECT {select_cols}
+                    FROM videos
+                    WHERE uid = ?
+                    ORDER BY play_count DESC, last_online_count DESC
+                    LIMIT ?
+                    """,
+                    (uid, top_limit),
+                ).fetchall()
+                seen_bvids: set[str] = set()
+                rows: list[sqlite3.Row] = []
+                for r in (*online_rows, *play_rows):
+                    bvid = r["bvid"]
+                    if bvid not in seen_bvids:
+                        seen_bvids.add(bvid)
+                        rows.append(r)
+            else:
+                rows = conn.execute(
+                    f"""
+                    SELECT {select_cols}
+                    FROM videos
+                    WHERE uid = ?
+                    ORDER BY last_online_count DESC, pubdate DESC
+                    """,
+                    (uid,),
+                ).fetchall()
+                total_videos = len(rows)
+
+        items: list[dict[str, Any]] = []
+        for r in rows:
+            display_7d, status_7d = _resolve_video_play_count_7d_view(
+                pubdate=int(r["pubdate"] or 0),
+                play_count=int(r["play_count"] or 0),
+                stored_play_7d=r["play_count_7d"],
+                stored_play_7d_ts=int(r["play_count_7d_ts"] or 0),
+                stored_locked=int(r["play_count_7d_locked"] or 0),
+                now_ts=effective_now_ts,
+            )
+            items.append(
+                {
+                    "bvid": r["bvid"],
+                    "uid": r["uid"],
+                    "aid": r["aid"],
+                    "title": r["title"],
+                    "pic": r["pic"],
+                    "pubdate": r["pubdate"],
+                    "duration": r["duration"],
+                    "play_count": r["play_count"],
+                    "play_count_7d": display_7d,
+                    "play_count_7d_status": status_7d,
+                    "like_count": r["like_count"],
+                    "coin_count": r["coin_count"],
+                    "stats_synced_at": r["stats_synced_at"],
+                    "cid_count": max(1, int(r["cid_len"] or 0)),
+                    "last_online_count": r["last_online_count"],
+                    "last_online_raw": r["last_online_raw"],
+                    "last_checked_at": r["last_checked_at"],
+                }
+            )
+        return (items, total_videos)
 
     def update_video_cids(self, bvid: str, cids: list[dict[str, Any]]) -> None:
         now = datetime.now(timezone.utc).astimezone().isoformat()
@@ -2007,7 +2165,7 @@ class Database:
             params.append(cutoff)
         params.append(limit)
 
-        with self.connection() as conn:
+        with self.read_connection() as conn:
             rows = conn.execute(
                 f"""
                 SELECT * FROM account_snapshots
@@ -2112,7 +2270,7 @@ class Database:
             params.append(cutoff)
         params.append(limit)
 
-        with self.connection() as conn:
+        with self.read_connection() as conn:
             rows = conn.execute(
                 f"""
                 SELECT collected_at, collected_at_ts, follower_count, online_viewers_total
@@ -2144,7 +2302,7 @@ class Database:
         return (items, truncated, total_in_window)
 
     def get_recent_snapshots(self, uid: str, limit: int = 30) -> list[dict[str, Any]]:
-        with self.connection() as conn:
+        with self.read_connection() as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM account_snapshots
@@ -2163,7 +2321,7 @@ class Database:
         return latest, prev
 
     def count_snapshots(self, uid: str) -> int:
-        with self.connection() as conn:
+        with self.read_connection() as conn:
             row = conn.execute(
                 "SELECT COUNT(*) AS cnt FROM account_snapshots WHERE uid = ?", (uid,)
             ).fetchone()
@@ -2213,7 +2371,7 @@ class Database:
         t_today = int(today_start.timestamp())
         t_tomorrow = int(tomorrow_start.timestamp())
 
-        with self.connection() as conn:
+        with self.read_connection() as conn:
             rows = conn.execute(
                 """
                 SELECT collected_at_ts, follower_count
@@ -2391,7 +2549,7 @@ class Database:
             sql += " LIMIT ?"
             params.append(limit)
 
-        with self.connection() as conn:
+        with self.read_connection() as conn:
             rows = conn.execute(sql, params).fetchall()
         items = [dict(r) for r in reversed(rows)]
         if max_points is not None and max_points > 0 and len(items) > max_points:

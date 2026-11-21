@@ -187,51 +187,62 @@ export function runViewTransition(mutateDom, options = {}) {
 }
 
 /**
- * Triggers staggered entrance choreography on matching child elements inside a container,
- * capping --stagger-i to 0..16 so large tables stay responsive and cleaning up .is-entering.
- *
- * @param {ParentNode | null} container
- * @param {string} [selector='[data-stagger]']
+ * Checks whether the browser supports CSS sibling-index() in animation-delay.
+ * Uses a literal time value (never var()) per CSS @supports / CSS.supports rules.
+ * @returns {boolean}
  */
-export function staggerEnter(container, selector = '[data-stagger]') {
-  if (!container || typeof container.querySelectorAll !== 'function') return;
+function supportsCssSiblingIndex() {
+  return (
+    typeof CSS !== 'undefined' &&
+    typeof CSS.supports === 'function' &&
+    CSS.supports('animation-delay: calc(sibling-index() * 0.1s)')
+  );
+}
 
-  const elements = Array.from(container.querySelectorAll(selector));
-  if (elements.length === 0) return;
+/**
+ * Triggers staggered entrance choreography on matching child elements inside one
+ * or more containers. When multiple containers are passed as an array, each
+ * container indexes its items independently from 0..16 and all groups share a
+ * single batched reflow so paired rows across columns enter in lockstep.
+ *
+ * @param {ParentNode | ParentNode[] | null} container
+ * @param {string} [selector='[data-stagger]']
+ * @param {object} [options]
+ * @param {boolean} [options.useSiblingIndex=false]
+ */
+export function staggerEnter(container, selector = '[data-stagger]', options = {}) {
+  if (!container) return;
+
+  const { useSiblingIndex = false } = options;
+  const containers = (Array.isArray(container) ? container : [container]).filter(
+    (node) => node && typeof node.querySelectorAll === 'function'
+  );
+  if (containers.length === 0) return;
+
+  const groups = containers
+    .map((node) => Array.from(node.querySelectorAll(selector)))
+    .filter((items) => items.length > 0);
+  if (groups.length === 0) return;
 
   const reduced = prefersReducedMotion();
+  const needsSiblingIndexFallback = useSiblingIndex && !supportsCssSiblingIndex();
 
-  for (let i = 0; i < elements.length; i += 1) {
-    const el = elements[i];
-    const cappedIndex = Math.min(i, 16);
-    el.style.setProperty('--stagger-i', String(cappedIndex));
+  for (let g = 0; g < groups.length; g += 1) {
+    const elements = groups[g];
+    for (let i = 0; i < elements.length; i += 1) {
+      const el = elements[i];
+      const cappedIndex = Math.min(i, 16);
+      if (useSiblingIndex) {
+        if (needsSiblingIndexFallback) {
+          el.style.setProperty('--sibling-index', String(i + 1));
+        } else {
+          el.style.removeProperty('--sibling-index');
+        }
+        el.style.removeProperty('--stagger-i');
+      } else {
+        el.style.setProperty('--stagger-i', String(cappedIndex));
+      }
 
-    if (el._staggerTimer) {
-      clearTimeout(el._staggerTimer);
-      el._staggerTimer = 0;
-    }
-    if (el._staggerEndHandler) {
-      el.removeEventListener('animationend', el._staggerEndHandler);
-      el.removeEventListener('animationcancel', el._staggerEndHandler);
-      el._staggerEndHandler = null;
-    }
-    el.classList.remove('is-entering');
-  }
-
-  if (reduced) {
-    return;
-  }
-
-  // Batch a single layout read so removing/adding .is-entering reliably restarts keyframes
-  if (container instanceof HTMLElement) {
-    void container.offsetWidth;
-  }
-
-  for (let i = 0; i < elements.length; i += 1) {
-    const el = elements[i];
-    const cappedIndex = Math.min(i, 16);
-
-    const cleanup = () => {
       if (el._staggerTimer) {
         clearTimeout(el._staggerTimer);
         el._staggerTimer = 0;
@@ -242,31 +253,73 @@ export function staggerEnter(container, selector = '[data-stagger]') {
         el._staggerEndHandler = null;
       }
       el.classList.remove('is-entering');
-    };
+    }
+  }
 
-    const onAnimFinish = (event) => {
-      if (event.target !== el) return;
-      cleanup();
-    };
+  if (reduced) {
+    return;
+  }
 
-    el._staggerEndHandler = onAnimFinish;
-    el.addEventListener('animationend', onAnimFinish);
-    el.addEventListener('animationcancel', onAnimFinish);
-    el.classList.add('is-entering');
+  // Batch a single layout read so removing/adding .is-entering reliably restarts
+  // keyframes across all containers on the exact same paint frame.
+  const reflowHost = containers.find((node) => node instanceof HTMLElement);
+  if (reflowHost) {
+    void reflowHost.offsetWidth;
+  }
 
-    // If no CSS animation runs on this element, clean up promptly; also keep hard timeout safety
-    requestAnimationFrame(() => {
-      if (
-        el.classList.contains('is-entering') &&
-        typeof el.getAnimations === 'function' &&
-        el.offsetParent !== null &&
-        el.getAnimations().length === 0
-      ) {
+  const supportsEventAnimation =
+    typeof AnimationEvent !== 'undefined' &&
+    'animation' in AnimationEvent.prototype;
+
+  for (let g = 0; g < groups.length; g += 1) {
+    const elements = groups[g];
+    for (let i = 0; i < elements.length; i += 1) {
+      const el = elements[i];
+      const cappedIndex = Math.min(i, 16);
+
+      const cleanup = () => {
+        if (el._staggerTimer) {
+          clearTimeout(el._staggerTimer);
+          el._staggerTimer = 0;
+        }
+        if (el._staggerEndHandler) {
+          el.removeEventListener('animationend', el._staggerEndHandler);
+          el.removeEventListener('animationcancel', el._staggerEndHandler);
+          el._staggerEndHandler = null;
+        }
+        el.classList.remove('is-entering');
+      };
+
+      const onAnimFinish = (event) => {
+        if (event.target !== el) return;
+        if (
+          supportsEventAnimation &&
+          event.animation?.effect?.pseudoElement
+        ) {
+          return;
+        }
         cleanup();
-      }
-    });
+      };
 
-    el._staggerTimer = setTimeout(cleanup, 920 + cappedIndex * 42);
+      el._staggerEndHandler = onAnimFinish;
+      el.addEventListener('animationend', onAnimFinish);
+      el.addEventListener('animationcancel', onAnimFinish);
+      el.classList.add('is-entering');
+
+      // If no CSS animation runs on this element, clean up promptly; also keep hard timeout safety
+      requestAnimationFrame(() => {
+        if (
+          el.classList.contains('is-entering') &&
+          typeof el.getAnimations === 'function' &&
+          el.offsetParent !== null &&
+          el.getAnimations().length === 0
+        ) {
+          cleanup();
+        }
+      });
+
+      el._staggerTimer = setTimeout(cleanup, 920 + cappedIndex * 42);
+    }
   }
 }
 

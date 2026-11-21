@@ -4589,5 +4589,129 @@ def test_chart_snapshots_endpoint_lightweight_windowing_and_downsampling(tmp_pat
         assert summaries["50002"]["follower_delta"] is None
 
 
+def test_account_switch_fast_dashboard_and_non_invalidating_activate(tmp_path: Path):
+    from datetime import datetime, timedelta, timezone
+
+    db = Database(db_path=tmp_path / "fast_switch.db")
+    app = create_app(database=db, enable_scheduler=False)
+
+    db.create_account("60001", account_name="UP_One", set_active=True)
+    db.create_account("60002", account_name="UP_Two", set_active=False)
+
+    # Seed 25 videos where top-5 by online and top-5 by play_count are completely disjoint
+    videos_seed = []
+    for i in range(25):
+        videos_seed.append(
+            {
+                "bvid": f"BV1fast{i:02d}",
+                "aid": 1000 + i,
+                "title": f"Video {i}",
+                "pubdate": int(time.time()) - (i + 1) * 3600,
+                "duration": 120,
+                "play_count": 100000 - i * 1000 if i < 5 else 500 + i,
+                "cids": [{"cid": i * 10 + 1, "page": 1, "part": "P1"}, {"cid": i * 10 + 2, "page": 2, "part": "P2"}]
+                if i % 2 == 0
+                else [{"cid": i * 10 + 1, "page": 1, "part": "P1"}],
+            }
+        )
+    db.upsert_videos("60002", videos_seed)
+    # Give videos 20..24 the highest online counts so top-5 online != top-5 plays
+    now = datetime.now(timezone.utc).astimezone()
+    for snap_idx in range(60):
+        ts = now - timedelta(minutes=(59 - snap_idx) * 20)
+        db.insert_snapshot(
+            uid="60002",
+            follower_count=2000 + snap_idx * 3,
+            following_count=10,
+            online_viewers_total=50 + (snap_idx % 10),
+            video_count=25,
+            videos_succeeded=5,
+            extra_metrics={"large_blob": "y" * 200},
+            status="success",
+            error_message=None,
+            duration_ms=30,
+            video_online_items=(
+                [
+                    {"bvid": f"BV1fast{20 + k:02d}", "online_count": 100 + k * 10, "online_raw": str(100 + k * 10)}
+                    for k in range(5)
+                ]
+                if snap_idx == 59
+                else []
+            ),
+            collected_at=ts,
+        )
+
+    # Verify new composite video leaderboard indexes exist
+    with db.read_connection() as conn:
+        vid_indexes = {
+            row["name"] for row in conn.execute("PRAGMA index_list(videos)").fetchall()
+        }
+    assert "idx_videos_uid_online_play" in vid_indexes
+    assert "idx_videos_uid_play_online" in vid_indexes
+
+    with TestClient(app) as client:
+        # 1) Lightweight dashboard for account switching: single read connection, capped top_videos, downsampled 4-field snapshots, no accounts scan
+        with (
+            patch.object(db, "_open_read_connection", wraps=db._open_read_connection) as spy_open,
+            patch.object(db, "get_accounts_summary", wraps=db.get_accounts_summary) as spy_accs,
+        ):
+            resp = client.get(
+                "/api/dashboard?hours=0&uid=60002&max_points=24&video_limit=5&include_accounts=false"
+            )
+            assert resp.status_code == 200
+            assert spy_open.call_count == 1
+            assert spy_accs.call_count == 0
+
+        body = resp.json()
+        assert body["settings"]["uid"] == "60002"
+        assert body["accounts"] == []
+        assert body["total_videos"] == 25
+        assert body["snapshots_downsampled"] is True
+        assert len(body["snapshots"]) <= 30
+        assert set(body["snapshots"][0].keys()) == {
+            "collected_at",
+            "collected_at_ts",
+            "follower_count",
+            "online_viewers_total",
+        }
+        returned_bvids = {v["bvid"] for v in body["top_videos"]}
+        assert len(returned_bvids) == 10
+        assert {f"BV1fast{i:02d}" for i in range(5)}.issubset(returned_bvids)
+        assert {f"BV1fast{i:02d}" for i in range(20, 25)}.issubset(returned_bvids)
+        # cid_count computed accurately via SQL json_array_length
+        by_bvid = {v["bvid"]: v for v in body["top_videos"]}
+        assert by_bvid["BV1fast00"]["cid_count"] == 2
+        assert by_bvid["BV1fast01"]["cid_count"] == 1
+
+        # 2) Lightweight /api/videos expansion returns all 25 videos without cids arrays
+        lw_vids = client.get("/api/videos?uid=60002&lightweight=true")
+        assert lw_vids.status_code == 200
+        lw_list = lw_vids.json()["videos"]
+        assert len(lw_list) == 25
+        assert "cids" not in lw_list[0]
+
+        # 3) Background activate (?include_accounts=false) skips summary query and does NOT bump revision
+        rev_before = int(resp.headers["x-data-revision"])
+        with patch.object(db, "get_accounts_summary", wraps=db.get_accounts_summary) as spy_accs2:
+            act_lw = client.post("/api/accounts/60002/activate?include_accounts=false")
+            assert act_lw.status_code == 200
+            assert act_lw.json()["active_uid"] == "60002"
+            assert act_lw.json()["accounts"] == []
+            assert spy_accs2.call_count == 0
+
+        # Default activate computes get_accounts_summary at most ONCE (no double query) and still keeps revision stable
+        with patch.object(db, "get_accounts_summary", wraps=db.get_accounts_summary) as spy_accs3:
+            act_full = client.post("/api/accounts/60001/activate")
+            assert act_full.status_code == 200
+            assert act_full.json()["active_uid"] == "60001"
+            assert len(act_full.json()["accounts"]) == 2
+            assert spy_accs3.call_count == 1
+
+        after_resp = client.get("/api/dashboard?hours=24&uid=60001&max_points=24&video_limit=5")
+        assert after_resp.status_code == 200
+        assert int(after_resp.headers["x-data-revision"]) == rev_before
+
+
+
 
 

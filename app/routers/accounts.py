@@ -36,9 +36,10 @@ async def list_accounts(request: Request, response: Response) -> AccountsListOut
     crawling_uid = crawl_service.crawling_uid
 
     def _load() -> tuple[str, list[dict[str, Any]]]:
-        active_uid = db.get_setting("uid", "").strip()
-        accounts = db.get_accounts_summary(crawling_uid=crawling_uid)
-        return active_uid, accounts
+        with db.read_session():
+            active_uid = db.get_setting("uid", "").strip()
+            accounts = db.get_accounts_summary(crawling_uid=crawling_uid)
+            return active_uid, accounts
 
     active_uid, accounts = await asyncio.to_thread(_load)
     return AccountsListOut(
@@ -171,7 +172,14 @@ async def update_account(request: Request, uid: str, body: AccountUpdate) -> dic
 
 
 @router.post("/accounts/{uid}/activate", dependencies=[Depends(require_admin)])
-async def activate_account(request: Request, uid: str) -> dict[str, Any]:
+async def activate_account(
+    request: Request,
+    uid: str,
+    include_accounts: bool = Query(
+        default=True,
+        description="Whether to compute and return full accounts summary list",
+    ),
+) -> dict[str, Any]:
     db = request.app.state.db
     crawl_service = request.app.state.crawl_service
 
@@ -179,17 +187,19 @@ async def activate_account(request: Request, uid: str) -> dict[str, Any]:
     crawling_uid = crawl_service.crawling_uid
 
     def _activate() -> tuple[Optional[dict[str, Any]], list[dict[str, Any]]]:
-        activated = db.set_active_account(clean_uid)
+        activated = db.set_active_account(clean_uid, include_summary=False)
         if activated is None:
             return None, []
+        if not include_accounts:
+            return activated, []
         accounts = db.get_accounts_summary(crawling_uid=crawling_uid)
-        return activated, accounts
+        summary_acc = next((a for a in accounts if a["uid"] == clean_uid), activated)
+        return summary_acc, accounts
 
     activated, accounts = await asyncio.to_thread(_activate)
     if activated is None:
         raise HTTPException(status_code=404, detail="未找到该监控账号")
 
-    _emit_accounts_event(request, "accounts_changed", uid=clean_uid)
     return {
         "active_uid": clean_uid,
         "account": activated,

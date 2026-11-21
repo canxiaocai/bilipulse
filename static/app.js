@@ -14,7 +14,7 @@ import {
   staggerEnter,
   positionSlidingIndicator,
   prefersReducedMotion,
-} from "./motion.js?v=20261119b";
+} from "./motion.js?v=20261121b";
 import {
   createDemoDataset,
   tickDemoDataset,
@@ -34,6 +34,11 @@ const FALLBACK_POLL_INTERVAL_MS = 10000;
 const LIVE_SYNC_DEBOUNCE_MS = 220;
 const FOCUS_SYNC_MIN_GAP_MS = 3000;
 const LEADERBOARD_PAGE_SIZE = 50;
+const DASHBOARD_CHART_MAX_POINTS = 480;
+const DASHBOARD_CACHE_MAX_ENTRIES = 24;
+const CACHE_SOFT_TTL_MS = 120000;
+const ACCOUNT_PREFETCH_DELAY_MS = 85;
+const ACCOUNT_SWITCH_LOADING_DELAY_MS = 120;
 
 const state = {
   hours: 24,
@@ -47,6 +52,8 @@ const state = {
   demoDataset: null,
   dashboard: null,
   videos: [],
+  totalVideos: 0,
+  allVideosLoaded: false,
   onlineLimit: LEADERBOARD_PAGE_SIZE,
   playsLimit: LEADERBOARD_PAGE_SIZE,
   isManualCrawling: false,
@@ -55,7 +62,16 @@ const state = {
   snapshotsReqSeq: 0,
   snapshotsAbortController: null,
   snapshotsLoadingTimer: null,
+  accountSwitchLoadingTimer: null,
+  videosExpandAbortController: null,
+  activateReqSeq: 0,
+  activateAbortController: null,
+  accountPrefetchTimer: null,
+  accountPrefetch: null,
   snapshotCache: new Map(),
+  dashboardCache: new Map(),
+  globalCacheEpoch: 0,
+  uidCacheEpochs: new Map(),
   accountModalMode: "add",
   accountModalUid: "",
   deleteTargetUid: "",
@@ -84,6 +100,9 @@ const state = {
   liveRefreshTimer: null,
   liveRefreshInFlight: false,
   liveRefreshPending: false,
+  accountsRefreshTimer: null,
+  accountsRefreshInFlight: false,
+  accountsRefreshPending: false,
   liveSyncDirty: false,
   lastDashboardSyncMs: 0,
   onlineRowCache: new Map(),
@@ -647,7 +666,9 @@ async function exitDemoMode() {
   state.demoDataset = null;
   stopDemoPulseLoop();
   cancelPendingOverviewSnapshots();
-  state.snapshotCache.clear();
+  cancelPendingAccountPrefetch();
+  cancelPendingVideoExpand();
+  clearAllClientCaches();
   clearRankCaches({ resetLimits: true });
   clearChartsInGroup("overview");
 
@@ -1664,6 +1685,190 @@ function setupResponsiveSidebar() {
   return { openDrawer, closeDrawer };
 }
 
+function cancelPendingVideoExpand() {
+  if (state.videosExpandAbortController) {
+    state.videosExpandAbortController.abort();
+    state.videosExpandAbortController = null;
+  }
+}
+
+function cancelPendingAccountPrefetch() {
+  if (state.accountPrefetchTimer) {
+    clearTimeout(state.accountPrefetchTimer);
+    state.accountPrefetchTimer = null;
+  }
+  if (state.accountPrefetch?.controller) {
+    state.accountPrefetch.controller.abort();
+  }
+  state.accountPrefetch = null;
+}
+
+function persistActiveAccount(targetUid) {
+  if (!targetUid || state.demoMode) return;
+  if (state.adminAuth.enabled && !state.adminAuth.authenticated) return;
+
+  const seq = ++state.activateReqSeq;
+  if (state.activateAbortController) {
+    state.activateAbortController.abort();
+    state.activateAbortController = null;
+  }
+  const controller = new AbortController();
+  state.activateAbortController = controller;
+
+  // Low-priority background persistence: never blocks the critical dashboard fetch
+  apiFetch(`/api/accounts/${encodeURIComponent(targetUid)}/activate?include_accounts=false`, {
+    method: "POST",
+    priority: "low",
+    signal: controller.signal,
+  })
+    .catch((err) => {
+      if (isAbortError(err) || err?.status === 401) return;
+      if (seq === state.activateReqSeq) {
+        console.warn("Failed to persist active account:", err);
+      }
+    })
+    .finally(() => {
+      if (state.activateAbortController === controller) {
+        state.activateAbortController = null;
+      }
+    });
+}
+
+function renderAccountPill(settings) {
+  const accountPill = document.getElementById("accountPill");
+  if (!accountPill) return;
+  const s = settings || {};
+  if (s.uid) {
+    const faceUrl = safeUrl(s.account_face) || (state.demoMode ? buildDemoAvatarSvg() : "");
+    const avatarHtml = faceUrl
+      ? `<img src="${escapeHtml(faceUrl)}" referrerpolicy="no-referrer" alt="" />`
+      : "";
+    const name = s.account_name || `账号 ${s.uid}`;
+    const simChip = state.demoMode ? `<span class="status-chip mono">示例</span>` : "";
+    accountPill.innerHTML = `
+      ${avatarHtml}
+      <strong>${escapeHtml(name)}</strong>
+      <a class="mono" href="https://space.bilibili.com/${encodeURIComponent(s.uid)}" target="_blank" rel="noopener noreferrer">编号:${escapeHtml(s.uid)}</a>
+      ${simChip}
+    `;
+    const avImg = accountPill.querySelector("img");
+    if (avImg) {
+      avImg.addEventListener(
+        "error",
+        () => {
+          avImg.src = buildDemoAvatarSvg();
+        },
+        { once: true }
+      );
+    }
+  } else {
+    accountPill.innerHTML = `<span class="muted mono">尚未绑定监控账号</span>`;
+  }
+}
+
+function renderOptimisticAccountHeader(targetUid) {
+  const acc = (state.accounts || []).find((a) => String(a.uid) === String(targetUid));
+  if (!acc) return;
+
+  renderAccountPill({
+    uid: acc.uid,
+    account_name: acc.account_name || "",
+    account_face: acc.account_face || "",
+  });
+
+  const kpiFollowers = document.getElementById("kpiFollowers");
+  if (kpiFollowers) {
+    if (acc.latest_follower_count !== null && acc.latest_follower_count !== undefined) {
+      animateNumber(kpiFollowers, Number(acc.latest_follower_count), {
+        duration: 240,
+        flash: false,
+      });
+    } else {
+      resetNumericReadout(kpiFollowers, "--");
+    }
+  }
+
+  const kpiOnline = document.getElementById("kpiOnline");
+  if (kpiOnline) {
+    if (
+      acc.latest_online_viewers_total !== null &&
+      acc.latest_online_viewers_total !== undefined
+    ) {
+      animateNumber(kpiOnline, Number(acc.latest_online_viewers_total), {
+        duration: 240,
+        flash: false,
+      });
+    } else {
+      resetNumericReadout(kpiOnline, "--");
+    }
+  }
+
+  renderFollowerDailyStats(null);
+}
+
+function scheduleAccountPrefetch(uid) {
+  const targetUid = String(uid || "").trim();
+  if (!targetUid || state.demoMode) return;
+  if (accountDrag.active || accountKb.active) return;
+  if (targetUid === String(state.activeUid || "").trim()) return;
+
+  const targetHours = Math.max(0, Math.round(Number(state.hours) || 0));
+  const cached = getCachedDashboardEntry(targetUid);
+  const cachedSnaps = getCachedOverviewSnapshots(targetUid, targetHours);
+  if (cached?.isFresh && cachedSnaps !== null) return;
+
+  if (
+    state.accountPrefetch &&
+    state.accountPrefetch.uid === targetUid &&
+    state.accountPrefetch.hours === targetHours
+  ) {
+    return;
+  }
+
+  if (state.accountPrefetchTimer) {
+    clearTimeout(state.accountPrefetchTimer);
+    state.accountPrefetchTimer = null;
+  }
+
+  state.accountPrefetchTimer = setTimeout(() => {
+    state.accountPrefetchTimer = null;
+    if (state.demoMode || accountDrag.active || accountKb.active) return;
+    if (targetUid === String(state.activeUid || "").trim()) return;
+
+    const latestHours = Math.max(0, Math.round(Number(state.hours) || 0));
+    const freshDash = getCachedDashboardEntry(targetUid);
+    const freshSnaps = getCachedOverviewSnapshots(targetUid, latestHours);
+    if (freshDash?.isFresh && freshSnaps !== null) return;
+
+    if (state.accountPrefetch?.controller) {
+      state.accountPrefetch.controller.abort();
+    }
+    const controller = new AbortController();
+    const promise = fetchDashboardPayload({
+      uid: targetUid,
+      hours: latestHours,
+      includeAccounts: false,
+      videoLimit: LEADERBOARD_PAGE_SIZE,
+      maxPoints: DASHBOARD_CHART_MAX_POINTS,
+      priority: "low",
+      signal: controller.signal,
+    })
+      .catch(() => null)
+      .finally(() => {
+        if (state.accountPrefetch?.controller === controller) {
+          state.accountPrefetch = null;
+        }
+      });
+
+    state.accountPrefetch = {
+      uid: targetUid,
+      hours: latestHours,
+      controller,
+      promise,
+    };
+  }, ACCOUNT_PREFETCH_DELAY_MS);
+}
+
 async function switchAccount(uid) {
   const targetUid = String(uid || "").trim();
   if (!targetUid) return;
@@ -1685,28 +1890,74 @@ async function switchAccount(uid) {
   if (targetUid === state.activeUid) return;
 
   cancelPendingOverviewSnapshots();
+  clearAccountSwitchLoading();
+  cancelPendingVideoExpand();
+  if (state.accountPrefetchTimer) {
+    clearTimeout(state.accountPrefetchTimer);
+    state.accountPrefetchTimer = null;
+  }
+  if (state.accountPrefetch && state.accountPrefetch.uid !== targetUid) {
+    state.accountPrefetch.controller?.abort();
+    state.accountPrefetch = null;
+  }
+
   state.activeUid = targetUid;
   state.backendUid = targetUid;
   clearRankCaches({ resetLimits: true });
-  clearChartsInGroup("overview");
   renderAccountSidebar();
 
+  // Persist default active account in background without blocking the switch
+  persistActiveAccount(targetUid);
+
   const reqId = ++state.dashboardReqSeq;
-  try {
-    if (!state.adminAuth.enabled || state.adminAuth.authenticated) {
-      await apiFetch(`/api/accounts/${encodeURIComponent(targetUid)}/activate`, {
-        method: "POST",
-      });
-    }
-    if (reqId !== state.dashboardReqSeq) return;
-    await loadDashboard({ animateCharts: true, uid: targetUid, reqId });
-  } catch (err) {
-    if (err?.status === 401) {
-      await loadDashboard({ animateCharts: true, uid: targetUid, reqId });
+  const reqHours = Math.max(0, Math.round(Number(state.hours) || 0));
+  const cached = getCachedDashboardEntry(targetUid);
+  const freshSnaps = getCachedOverviewSnapshots(targetUid, reqHours);
+
+  if (cached) {
+    const previewSnaps =
+      freshSnaps !== null
+        ? freshSnaps
+        : getCachedOverviewSnapshots(targetUid, reqHours, { allowStale: true }) || [];
+    const hydrated = {
+      ...cached.entry,
+      snapshots: previewSnaps,
+      accounts: state.accounts,
+    };
+    renderDashboard(hydrated, {
+      animateCharts: false,
+      isLiveTick: false,
+      syncAccounts: false,
+    });
+
+    if (cached.isFresh) {
+      if (freshSnaps === null) {
+        await loadOverviewSnapshots(reqHours, { animateCharts: true, uid: targetUid });
+      }
       return;
     }
-    showToast(`切换账号失败: ${err.message}`, "err");
+
+    // Stale-while-revalidate: already showing cached account instantaneously; refresh in background
+    await loadDashboard({
+      animateCharts: false,
+      uid: targetUid,
+      reqId,
+      includeAccounts: false,
+      showLoading: false,
+    });
+    return;
   }
+
+  // First visit to this account: optimistic header/KPI paint + single lightweight request
+  renderOptimisticAccountHeader(targetUid);
+  await loadDashboard({
+    animateCharts: true,
+    animateDuration: OVERVIEW_SWITCH_ANIM_MS,
+    uid: targetUid,
+    reqId,
+    includeAccounts: false,
+    showLoading: true,
+  });
 }
 
 /* ---------- Image Cover Fallback ---------- */
@@ -1740,7 +1991,7 @@ function attachAvatarFallback(imgEl) {
 
 /* ---------- Charts ---------- */
 
-const SNAPSHOT_CACHE_MAX_ENTRIES = 48;
+const SNAPSHOT_CACHE_MAX_ENTRIES = 64;
 const SNAPSHOT_LOADING_DELAY_MS = 120;
 const OVERVIEW_SWITCH_ANIM_MS = 280;
 
@@ -1755,18 +2006,98 @@ function getSnapshotEpochSec(snap) {
   return Number.isFinite(parsedMs) ? Math.floor(parsedMs / 1000) : Number.NaN;
 }
 
-function cacheOverviewSnapshots(uid, hours, snapshots, { rev = state.liveEventRev, downsampled = false } = {}) {
+function getUidCacheStamp(uid) {
+  const cleanUid = String(uid || "").trim();
+  const uidEpoch = state.uidCacheEpochs.get(cleanUid) || 0;
+  return `${state.globalCacheEpoch}:${uidEpoch}`;
+}
+
+function invalidateUidCache(uid) {
+  const cleanUid = String(uid || "").trim();
+  if (!cleanUid) return;
+  state.uidCacheEpochs.set(cleanUid, (state.uidCacheEpochs.get(cleanUid) || 0) + 1);
+}
+
+function invalidateAllCaches() {
+  state.globalCacheEpoch += 1;
+}
+
+function clearAllClientCaches() {
+  state.snapshotCache.clear();
+  state.dashboardCache.clear();
+  state.uidCacheEpochs.clear();
+  state.globalCacheEpoch += 1;
+}
+
+function cacheDashboardData(uid, data, { allVideosLoaded = null } = {}) {
+  const cleanUid = String(uid || "").trim();
+  if (!cleanUid || !data || typeof data !== "object") return;
+
+  const stamp = getUidCacheStamp(cleanUid);
+  const existing = state.dashboardCache.get(cleanUid);
+  const incomingVideos = Array.isArray(data.top_videos) ? data.top_videos : [];
+  const totalVideos = Math.max(Number(data.total_videos || 0), incomingVideos.length);
+  const incomingFull =
+    allVideosLoaded !== null ? Boolean(allVideosLoaded) : incomingVideos.length >= totalVideos;
+
+  // Preserve an already-hydrated full video list if same cache stamp & incoming is a top-N slice
+  const keepExistingFullVideos =
+    existing &&
+    existing.stamp === stamp &&
+    existing.allVideosLoaded &&
+    !incomingFull &&
+    Array.isArray(existing.top_videos) &&
+    existing.top_videos.length >= totalVideos;
+
+  const entry = {
+    uid: cleanUid,
+    stamp,
+    fetchedAtMs: Date.now(),
+    settings: data.settings ? { ...data.settings } : existing?.settings || null,
+    scheduler: data.scheduler ? { ...data.scheduler } : existing?.scheduler || null,
+    admin_auth: data.admin_auth || existing?.admin_auth || null,
+    latest: data.latest ?? null,
+    previous: data.previous ?? null,
+    follower_delta: data.follower_delta ?? null,
+    online_delta: data.online_delta ?? null,
+    follower_daily: data.follower_daily || null,
+    total_snapshots: Number(data.total_snapshots || 0),
+    total_videos: totalVideos,
+    top_videos: keepExistingFullVideos ? existing.top_videos : incomingVideos,
+    allVideosLoaded: keepExistingFullVideos ? true : incomingFull,
+  };
+
+  state.dashboardCache.delete(cleanUid);
+  state.dashboardCache.set(cleanUid, entry);
+
+  while (state.dashboardCache.size > DASHBOARD_CACHE_MAX_ENTRIES) {
+    const oldestKey = state.dashboardCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    state.dashboardCache.delete(oldestKey);
+  }
+}
+
+function getCachedDashboardEntry(uid) {
+  const cleanUid = String(uid || "").trim();
+  if (!cleanUid) return null;
+  const entry = state.dashboardCache.get(cleanUid);
+  if (!entry) return null;
+  const isFresh =
+    entry.stamp === getUidCacheStamp(cleanUid) &&
+    Date.now() - entry.fetchedAtMs < CACHE_SOFT_TTL_MS;
+  return { entry, isFresh };
+}
+
+function cacheOverviewSnapshots(uid, hours, snapshots, { downsampled = false } = {}) {
   const cleanUid = String(uid || "").trim();
   if (!cleanUid || !Array.isArray(snapshots)) return;
   const normHours = Math.max(0, Math.round(Number(hours) || 0));
-  const normRev = Number.isFinite(Number(rev)) ? Number(rev) : 0;
+  const stamp = getUidCacheStamp(cleanUid);
 
-  // Prune stale revisions whenever a newer revision arrives
-  if (normRev > 0) {
-    for (const [key, entry] of state.snapshotCache.entries()) {
-      if (entry.rev > 0 && entry.rev < normRev) {
-        state.snapshotCache.delete(key);
-      }
+  // Prune stale entries for this UID only so other accounts stay warm
+  for (const [key, entry] of state.snapshotCache.entries()) {
+    if (entry.uid === cleanUid && entry.stamp !== stamp) {
+      state.snapshotCache.delete(key);
     }
   }
 
@@ -1775,7 +2106,7 @@ function cacheOverviewSnapshots(uid, hours, snapshots, { rev = state.liveEventRe
   state.snapshotCache.set(cacheKey, {
     uid: cleanUid,
     hours: normHours,
-    rev: normRev,
+    stamp,
     downsampled: Boolean(downsampled),
     snapshots,
     fetchedAtMs: Date.now(),
@@ -1788,32 +2119,30 @@ function cacheOverviewSnapshots(uid, hours, snapshots, { rev = state.liveEventRe
   }
 }
 
-function getCachedOverviewSnapshots(uid, hours, currentRev = state.liveEventRev) {
+function getCachedOverviewSnapshots(uid, hours, { allowStale = false } = {}) {
   const cleanUid = String(uid || "").trim();
   if (!cleanUid) return null;
   const targetHours = Math.max(0, Math.round(Number(hours) || 0));
-  const normRev = Number.isFinite(Number(currentRev)) ? Number(currentRev) : 0;
+  const currentStamp = getUidCacheStamp(cleanUid);
   const nowMs = Date.now();
 
-  const isFresh = (entry) => {
+  const matches = (entry) => {
     if (!entry || entry.uid !== cleanUid) return false;
-    if (normRev > 0) {
-      return entry.rev === normRev;
-    }
-    return entry.rev === 0 && nowMs - entry.fetchedAtMs < 60000;
+    if (allowStale) return true;
+    return entry.stamp === currentStamp && nowMs - entry.fetchedAtMs < CACHE_SOFT_TTL_MS;
   };
 
   // 1) Exact window hit
   const exact = state.snapshotCache.get(`${cleanUid}:${targetHours}`);
-  if (isFresh(exact)) {
+  if (matches(exact)) {
     return exact.snapshots;
   }
 
-  // 2) Lossless slice from any cached wider (non-downsampled) window for the same UID & revision
+  // 2) Lossless slice from any cached wider (non-downsampled) window for the same UID
   if (targetHours > 0) {
     let bestSuperset = null;
     for (const entry of state.snapshotCache.values()) {
-      if (!isFresh(entry) || entry.downsampled) continue;
+      if (!matches(entry) || entry.downsampled) continue;
       const coversTarget = entry.hours === 0 || entry.hours > targetHours;
       if (!coversTarget) continue;
       if (
@@ -1861,6 +2190,34 @@ function setOverviewChartsLoading(isLoading) {
       badgeEl.classList.toggle("hidden", !loading);
     }
   }
+}
+
+function setLeaderboardsLoading(isLoading) {
+  const loading = Boolean(isLoading);
+  document.querySelectorAll("#tab-overview .leaderboard-pane").forEach((pane) => {
+    pane.classList.toggle("is-loading", loading);
+    pane.setAttribute("aria-busy", String(loading));
+  });
+}
+
+function clearAccountSwitchLoading() {
+  if (state.accountSwitchLoadingTimer) {
+    clearTimeout(state.accountSwitchLoadingTimer);
+    state.accountSwitchLoadingTimer = null;
+  }
+  setOverviewChartsLoading(false);
+  setLeaderboardsLoading(false);
+}
+
+function scheduleAccountSwitchLoading(reqId) {
+  clearAccountSwitchLoading();
+  state.accountSwitchLoadingTimer = setTimeout(() => {
+    state.accountSwitchLoadingTimer = null;
+    if (reqId === state.dashboardReqSeq) {
+      setOverviewChartsLoading(true);
+      setLeaderboardsLoading(true);
+    }
+  }, ACCOUNT_SWITCH_LOADING_DELAY_MS);
 }
 
 function cancelPendingOverviewSnapshots() {
@@ -2172,18 +2529,21 @@ function renderLeaderboardColumn(videos, spec) {
 
   const limit = Math.max(LEADERBOARD_PAGE_SIZE, Number(state[spec.limitKey] || LEADERBOARD_PAGE_SIZE));
   const visible = sorted.slice(0, limit);
+  const totalCount = state.demoMode
+    ? sorted.length
+    : Math.max(sorted.length, Number(state.totalVideos || 0));
 
   const countChip = document.getElementById(spec.countId);
   if (countChip) {
     countChip.textContent =
-      sorted.length > visible.length
-        ? `显示 ${visible.length} / ${sorted.length}`
-        : `${sorted.length} 个视频`;
+      totalCount > visible.length
+        ? `显示 ${visible.length} / ${totalCount}`
+        : `${totalCount} 个视频`;
   }
 
   const expandWrap = document.getElementById(spec.expandWrapId);
   const expandBtn = document.getElementById(spec.expandBtnId);
-  const remaining = sorted.length - visible.length;
+  const remaining = Math.max(0, totalCount - visible.length);
   if (expandWrap && expandBtn) {
     if (remaining > 0) {
       const nextStep = Math.min(LEADERBOARD_PAGE_SIZE, remaining);
@@ -2521,8 +2881,14 @@ function renderCompareBoard({ stagger = false } = {}) {
   }
 
   if (stagger) {
-    const comparePanel = document.getElementById("tab-compare");
-    if (comparePanel) staggerEnter(comparePanel, ".compare-bar-item");
+    const compareLists = COMPARE_PANE_SPECS.map((spec) =>
+      document.getElementById(spec.listId)
+    ).filter(Boolean);
+    if (compareLists.length > 0) {
+      staggerEnter(compareLists, ":scope > .compare-bar-item", {
+        useSiblingIndex: true,
+      });
+    }
   }
 }
 
@@ -2682,48 +3048,67 @@ function renderFollowerDailyStats(daily) {
   );
 }
 
-function renderDashboard(data, { animateCharts = true, isLiveTick = false } = {}) {
+function patchSingleAccountSummary(data) {
+  if (!data || state.demoMode || !Array.isArray(state.accounts) || state.accounts.length === 0) {
+    return;
+  }
+  const targetUid = String(data.settings?.uid || "").trim();
+  if (!targetUid) return;
+  const idx = state.accounts.findIndex((a) => String(a.uid) === targetUid);
+  if (idx === -1) return;
+
+  const prev = state.accounts[idx];
+  const latest = data.latest;
+  const next = {
+    ...prev,
+    account_name: data.settings?.account_name || prev.account_name || "",
+    account_face: data.settings?.account_face || prev.account_face || "",
+    enabled: data.settings?.enabled !== undefined ? Boolean(data.settings.enabled) : prev.enabled,
+    video_count:
+      data.total_videos !== undefined && data.total_videos !== null
+        ? Number(data.total_videos)
+        : prev.video_count,
+    is_crawling:
+      data.scheduler?.crawling_uid !== undefined
+        ? String(data.scheduler.crawling_uid || "") === targetUid
+        : prev.is_crawling,
+  };
+  if (latest) {
+    next.latest_follower_count = latest.follower_count;
+    next.latest_online_viewers_total = latest.online_viewers_total;
+    next.follower_delta = data.follower_delta ?? prev.follower_delta;
+    next.online_delta = data.online_delta ?? prev.online_delta;
+    next.last_crawl_at = latest.collected_at || prev.last_crawl_at;
+    next.last_crawl_status = latest.status || prev.last_crawl_status;
+  }
+  state.accounts[idx] = next;
+}
+
+function renderDashboard(
+  data,
+  { animateCharts = true, animateDuration = 520, isLiveTick = false, syncAccounts = true } = {}
+) {
   if (!data) return;
   if (data.admin_auth) {
     syncAdminAuthState(data.admin_auth);
   }
   state.dashboard = data;
   state.videos = data.top_videos || [];
-  syncAccountsFromDashboard(data);
+  state.totalVideos = state.demoMode
+    ? state.videos.length
+    : Math.max(Number(data.total_videos || 0), state.videos.length);
+  state.allVideosLoaded = state.demoMode || state.videos.length >= state.totalVideos;
+
+  if (syncAccounts) {
+    syncAccountsFromDashboard(data);
+  } else {
+    patchSingleAccountSummary(data);
+  }
 
   syncBannersAndDemoControls();
   renderAccountSidebar();
 
-  const s = data.settings || {};
-  const accountPill = document.getElementById("accountPill");
-  if (accountPill) {
-    if (s.uid) {
-      const faceUrl = safeUrl(s.account_face) || (state.demoMode ? buildDemoAvatarSvg() : "");
-      const avatarHtml = faceUrl
-        ? `<img src="${escapeHtml(faceUrl)}" referrerpolicy="no-referrer" alt="" />`
-        : "";
-      const name = s.account_name || `账号 ${s.uid}`;
-      const simChip = state.demoMode ? `<span class="status-chip mono">示例</span>` : "";
-      accountPill.innerHTML = `
-        ${avatarHtml}
-        <strong>${escapeHtml(name)}</strong>
-        <a class="mono" href="https://space.bilibili.com/${encodeURIComponent(s.uid)}" target="_blank" rel="noopener noreferrer">编号:${escapeHtml(s.uid)}</a>
-        ${simChip}
-      `;
-      const avImg = accountPill.querySelector("img");
-      if (avImg) {
-        avImg.addEventListener(
-          "error",
-          () => {
-            avImg.src = buildDemoAvatarSvg();
-          },
-          { once: true }
-        );
-      }
-    } else {
-      accountPill.innerHTML = `<span class="muted mono">尚未绑定监控账号</span>`;
-    }
-  }
+  renderAccountPill(data.settings || {});
 
   updateLiveClockAndLaser();
 
@@ -2755,7 +3140,7 @@ function renderDashboard(data, { animateCharts = true, isLiveTick = false } = {}
     }
   }
 
-  renderOverviewCharts(data, animateCharts);
+  renderOverviewCharts(data, animateCharts, { animateDuration });
   renderLeaderboards(state.videos);
   renderCompareBoard();
 }
@@ -3958,6 +4343,111 @@ function wireAccessibleAccountForm() {
 
 /* ---------- Data Loaders & Mutations ---------- */
 
+async function fetchDashboardPayload({
+  uid = "",
+  hours = state.hours,
+  includeAccounts = true,
+  videoLimit = LEADERBOARD_PAGE_SIZE,
+  maxPoints = DASHBOARD_CHART_MAX_POINTS,
+  priority = undefined,
+  signal = undefined,
+} = {}) {
+  const cleanUid = String(uid || "").trim();
+  const normHours = Math.max(0, Math.round(Number(hours) || 0));
+  const params = new URLSearchParams({
+    hours: String(normHours),
+    max_points: String(maxPoints),
+    include_accounts: includeAccounts ? "true" : "false",
+  });
+  if (cleanUid) {
+    params.set("uid", cleanUid);
+  }
+  if (Number.isFinite(videoLimit) && videoLimit > 0) {
+    params.set("video_limit", String(Math.round(videoLimit)));
+  }
+
+  const data = await apiFetch(`/api/dashboard?${params.toString()}`, {
+    timeoutMs: 15000,
+    ...(signal ? { signal } : {}),
+    ...(priority ? { priority } : {}),
+  });
+
+  const resolvedUid = String(data?.settings?.uid || cleanUid || "").trim();
+  if (resolvedUid) {
+    const fetchedSnaps = Array.isArray(data?.snapshots) ? data.snapshots : [];
+    cacheDashboardData(resolvedUid, data);
+    cacheOverviewSnapshots(resolvedUid, normHours, fetchedSnaps, {
+      downsampled: Boolean(data?.snapshots_downsampled),
+    });
+  }
+  return data;
+}
+
+async function expandLeaderboard(spec) {
+  if (!spec) return;
+  const nextLimit =
+    Number(state[spec.limitKey] || LEADERBOARD_PAGE_SIZE) + LEADERBOARD_PAGE_SIZE;
+  state[spec.limitKey] = nextLimit;
+
+  if (state.demoMode || state.allVideosLoaded || state.videos.length >= state.totalVideos) {
+    renderLeaderboardColumn(state.videos, spec);
+    return;
+  }
+
+  const targetUid = String(state.activeUid || state.backendUid || "").trim();
+  if (!targetUid) {
+    renderLeaderboardColumn(state.videos, spec);
+    return;
+  }
+
+  cancelPendingVideoExpand();
+  const controller = new AbortController();
+  state.videosExpandAbortController = controller;
+
+  const expandBtn = document.getElementById(spec.expandBtnId);
+  const prevLabel = expandBtn?.textContent || "";
+  if (expandBtn) {
+    expandBtn.disabled = true;
+    expandBtn.textContent = "正在加载完整视频列表...";
+  }
+
+  try {
+    const params = new URLSearchParams({
+      uid: targetUid,
+      lightweight: "true",
+    });
+    const res = await apiFetch(`/api/videos?${params.toString()}`, {
+      timeoutMs: 15000,
+      signal: controller.signal,
+    });
+    if (String(state.activeUid || state.backendUid || "").trim() !== targetUid) return;
+    const fullVideos = Array.isArray(res?.videos) ? res.videos : [];
+    state.videos = fullVideos;
+    state.totalVideos = fullVideos.length;
+    state.allVideosLoaded = true;
+    if (state.dashboard) {
+      state.dashboard = {
+        ...state.dashboard,
+        top_videos: fullVideos,
+        total_videos: fullVideos.length,
+      };
+      cacheDashboardData(targetUid, state.dashboard, { allVideosLoaded: true });
+    }
+    renderLeaderboards(state.videos);
+  } catch (err) {
+    if (isAbortError(err)) return;
+    if (expandBtn && prevLabel) {
+      expandBtn.textContent = prevLabel;
+    }
+    showToast(`加载完整视频列表失败: ${err.message}`, "err");
+  } finally {
+    if (expandBtn) expandBtn.disabled = false;
+    if (state.videosExpandAbortController === controller) {
+      state.videosExpandAbortController = null;
+    }
+  }
+}
+
 async function loadOverviewSnapshots(
   hours = state.hours,
   { animateCharts = true, uid = null } = {}
@@ -3988,8 +4478,8 @@ async function loadOverviewSnapshots(
 
   const reqSeq = ++state.snapshotsReqSeq;
 
-  // Fast path: exact revision-coherent cache hit or lossless slice from a cached wider window
-  const cachedSnapshots = getCachedOverviewSnapshots(targetUid, targetHours, state.liveEventRev);
+  // Fast path: exact per-UID cache hit or lossless slice from a cached wider window
+  const cachedSnapshots = getCachedOverviewSnapshots(targetUid, targetHours);
   if (cachedSnapshots !== null) {
     cancelPendingOverviewSnapshots();
     if (state.dashboard) {
@@ -4031,7 +4521,6 @@ async function loadOverviewSnapshots(
 
     const snapshots = Array.isArray(res?.snapshots) ? res.snapshots : [];
     cacheOverviewSnapshots(targetUid, targetHours, snapshots, {
-      rev: state.liveEventRev,
       downsampled: Boolean(res?.downsampled),
     });
 
@@ -4065,17 +4554,20 @@ async function loadOverviewSnapshots(
 
 async function loadDashboard({
   animateCharts = false,
+  animateDuration = 520,
   uid = null,
   reqId = null,
   silent = false,
+  includeAccounts = true,
+  showLoading = false,
 } = {}) {
   if (state.demoMode) {
     const demoData = getDemoDashboard(state, state.hours);
-    renderDashboard(demoData, { animateCharts, isLiveTick: false });
+    renderDashboard(demoData, { animateCharts, animateDuration, isLiveTick: false });
     return demoData;
   }
 
-  const targetUid = uid !== null ? uid : state.activeUid;
+  const targetUid = String(uid !== null ? uid : state.activeUid || "").trim();
   const reqHours = Math.max(0, Math.round(Number(state.hours) || 0));
   const activeReqId = reqId !== null ? reqId : ++state.dashboardReqSeq;
   if (!silent) {
@@ -4086,23 +4578,52 @@ async function loadDashboard({
     }
   }
 
-  const controller = new AbortController();
+  if (showLoading && !silent) {
+    scheduleAccountSwitchLoading(activeReqId);
+  }
+
+  // Reuse an already in-flight hover/focus prefetch for the exact same (uid, hours)
+  let reusedPrefetch = null;
+  if (
+    !includeAccounts &&
+    targetUid &&
+    state.accountPrefetch &&
+    state.accountPrefetch.uid === targetUid &&
+    state.accountPrefetch.hours === reqHours
+  ) {
+    reusedPrefetch = state.accountPrefetch;
+    state.accountPrefetch = null;
+  }
+
+  const controller = reusedPrefetch ? reusedPrefetch.controller : new AbortController();
   if (!silent) {
     state.dashboardAbortController = controller;
   }
 
-  const params = new URLSearchParams({ hours: String(reqHours) });
-  if (targetUid) {
-    params.set("uid", targetUid);
-  }
+  const videoLimit =
+    targetUid &&
+    targetUid === String(state.activeUid || "").trim() &&
+    state.allVideosLoaded
+      ? Math.max(LEADERBOARD_PAGE_SIZE, Number(state.onlineLimit || 0), Number(state.playsLimit || 0))
+      : LEADERBOARD_PAGE_SIZE;
 
   try {
-    const data = await apiFetch(`/api/dashboard?${params.toString()}`, {
-      timeoutMs: 15000,
-      signal: controller.signal,
-    });
+    let data = reusedPrefetch ? await reusedPrefetch.promise : null;
+    if (!data) {
+      if (activeReqId !== state.dashboardReqSeq) return null;
+      data = await fetchDashboardPayload({
+        uid: targetUid,
+        hours: reqHours,
+        includeAccounts,
+        videoLimit,
+        maxPoints: DASHBOARD_CHART_MAX_POINTS,
+        priority: silent ? "low" : undefined,
+        signal: controller.signal,
+      });
+    }
     if (activeReqId !== state.dashboardReqSeq) return null;
 
+    clearAccountSwitchLoading();
     state.lastDashboardSyncMs = Date.now();
     state.liveSyncDirty = false;
 
@@ -4119,30 +4640,29 @@ async function loadDashboard({
 
     const resolvedUid = String(state.activeUid || state.backendUid || targetUid || "").trim();
     const fetchedSnaps = Array.isArray(data?.snapshots) ? data.snapshots : [];
-    if (resolvedUid) {
-      cacheOverviewSnapshots(resolvedUid, reqHours, fetchedSnaps, {
-        rev: state.liveEventRev,
-        downsampled: fetchedSnaps.length >= 2000,
-      });
-    }
 
-    // If the user switched horizon while this full dashboard fetch was in flight,
+    // If the user switched horizon while this dashboard fetch was in flight,
     // keep the user's selected horizon instead of clobbering charts with stale reqHours.
     const currentHours = Math.max(0, Math.round(Number(state.hours) || 0));
     const horizonChangedInFlight = currentHours !== reqHours;
     if (horizonChangedInFlight) {
       const preservedSnaps =
-        getCachedOverviewSnapshots(resolvedUid, currentHours, state.liveEventRev) ||
+        getCachedOverviewSnapshots(resolvedUid, currentHours) ||
         (state.dashboard?.snapshots ?? fetchedSnaps);
       renderDashboard(
         { ...data, snapshots: preservedSnaps },
-        { animateCharts: false, isLiveTick: false }
+        { animateCharts: false, animateDuration, isLiveTick: false, syncAccounts: includeAccounts }
       );
-      if (resolvedUid && getCachedOverviewSnapshots(resolvedUid, currentHours, state.liveEventRev) === null) {
+      if (resolvedUid && getCachedOverviewSnapshots(resolvedUid, currentHours) === null) {
         loadOverviewSnapshots(currentHours, { animateCharts: false, uid: resolvedUid });
       }
     } else {
-      renderDashboard(data, { animateCharts, isLiveTick: false });
+      renderDashboard(data, {
+        animateCharts,
+        animateDuration,
+        isLiveTick: false,
+        syncAccounts: includeAccounts,
+      });
     }
 
     if (!state.demoMode && !document.hidden && !state.liveEventSource) {
@@ -4151,6 +4671,9 @@ async function loadDashboard({
     return data;
   } catch (err) {
     if (isAbortError(err)) return null;
+    if (activeReqId === state.dashboardReqSeq) {
+      clearAccountSwitchLoading();
+    }
     if (!silent) {
       showToast(`加载遥测面板失败: ${err.message}`, "err");
     }
@@ -4171,6 +4694,57 @@ function clearLiveRefreshTimer() {
   }
 }
 
+function clearAccountsRefreshTimer() {
+  if (state.accountsRefreshTimer) {
+    clearTimeout(state.accountsRefreshTimer);
+    state.accountsRefreshTimer = null;
+  }
+}
+
+async function refreshAccountsSummary() {
+  if (state.demoMode || document.hidden) return;
+  if (state.accountsRefreshInFlight) {
+    state.accountsRefreshPending = true;
+    return;
+  }
+  clearAccountsRefreshTimer();
+  state.accountsRefreshInFlight = true;
+  state.accountsRefreshPending = false;
+  try {
+    const res = await apiFetch("/api/accounts", {
+      timeoutMs: 12000,
+      priority: "low",
+    });
+    if (state.demoMode) return;
+    if (Array.isArray(res?.accounts)) {
+      state.accounts = res.accounts;
+      renderAccountSidebar();
+      renderCompareBoard();
+    }
+  } catch {
+    // Silent background sync; fallback poll will recover
+  } finally {
+    state.accountsRefreshInFlight = false;
+    if (state.accountsRefreshPending && !state.demoMode && !document.hidden) {
+      state.accountsRefreshPending = false;
+      scheduleAccountsSummaryRefresh(1200);
+    }
+  }
+}
+
+function scheduleAccountsSummaryRefresh(delayMs = 1200) {
+  if (state.demoMode) return;
+  if (document.hidden) {
+    state.liveSyncDirty = true;
+    return;
+  }
+  clearAccountsRefreshTimer();
+  state.accountsRefreshTimer = setTimeout(() => {
+    state.accountsRefreshTimer = null;
+    refreshAccountsSummary();
+  }, Math.max(0, Number(delayMs) || 0));
+}
+
 async function refreshLiveData({ force = false } = {}) {
   if (state.demoMode) return;
   if (document.hidden && !force) {
@@ -4186,7 +4760,7 @@ async function refreshLiveData({ force = false } = {}) {
   state.liveRefreshInFlight = true;
   state.liveRefreshPending = false;
   try {
-    await loadDashboard({ animateCharts: false, silent: true });
+    await loadDashboard({ animateCharts: false, silent: true, includeAccounts: true });
     const modal = document.getElementById("videoModal");
     if (!state.demoMode && state.modalBvid && modal?.open) {
       await loadVideoModalSeries(state.modalBvid, state.modalHours, {
@@ -4239,6 +4813,7 @@ function syncFallbackPollInterval() {
 
 function disconnectLiveEventStream() {
   clearLiveRefreshTimer();
+  clearAccountsRefreshTimer();
   if (state.liveEventSource) {
     try {
       state.liveEventSource.close();
@@ -4310,6 +4885,7 @@ function connectLiveEventStream() {
     }
 
     if (wasDisconnected || missedUpdate || state.liveSyncDirty) {
+      invalidateAllCaches();
       scheduleLiveRefresh(80);
     }
   });
@@ -4342,6 +4918,20 @@ function connectLiveEventStream() {
     const currentUid = String(state.activeUid || state.backendUid || "").trim();
 
     if (
+      payload.kind === "snapshot" ||
+      payload.kind === "fast_pulse" ||
+      payload.kind === "account_profile"
+    ) {
+      if (eventUid) {
+        invalidateUidCache(eventUid);
+      } else {
+        invalidateAllCaches();
+      }
+    } else if (payload.kind === "accounts_changed" || payload.kind === "settings_changed") {
+      invalidateAllCaches();
+    }
+
+    if (
       (payload.kind === "fast_pulse" || (payload.kind === "crawl_finished" && payload.pulse)) &&
       eventUid &&
       currentUid &&
@@ -4360,11 +4950,24 @@ function connectLiveEventStream() {
       state.liveSyncDirty = true;
       return;
     }
-    const refreshDelay =
-      payload.kind === "snapshot" && eventUid && currentUid && eventUid !== currentUid
-        ? Math.max(LIVE_SYNC_DEBOUNCE_MS, 1200)
-        : LIVE_SYNC_DEBOUNCE_MS;
-    scheduleLiveRefresh(refreshDelay);
+
+    // Another account finished a crawl: update sidebar & compare board via lightweight /api/accounts
+    // instead of reloading the currently viewed account's entire dashboard.
+    if (
+      (payload.kind === "snapshot" || payload.kind === "account_profile") &&
+      eventUid &&
+      currentUid &&
+      eventUid !== currentUid
+    ) {
+      if (state.dashboard?.scheduler && state.dashboard.scheduler.crawling_uid === eventUid) {
+        state.dashboard.scheduler.crawling_uid = null;
+        renderAccountSidebar();
+      }
+      scheduleAccountsSummaryRefresh(1200);
+      return;
+    }
+
+    scheduleLiveRefresh(LIVE_SYNC_DEBOUNCE_MS);
   });
 
   es.onerror = () => {
@@ -4465,6 +5068,9 @@ async function triggerCrawl(forceSyncVideos = false) {
     showToast(
       `采样完成 · 粉丝 ${fmtNumber(res.follower_count)} · 实时在看 ${fmtNumber(res.online_viewers_total)} 人`
     );
+    if (targetUid) {
+      invalidateUidCache(targetUid);
+    }
     await loadDashboard({ animateCharts: false });
   } catch (err) {
     showToast(`采样未执行: ${err.message}`, "err");
@@ -4648,9 +5254,10 @@ function bindEvents(settingsValidator, accountValidator) {
   setupPasswordToggleButton("btnToggleSettingsAdminPassword", "inputAdminPassword");
   document.getElementById("btnSyncVideos")?.addEventListener("click", () => triggerCrawl(true));
 
-  // Left Sidebar Account Delegation (switch / edit / delete) & Drag Reorder
+  // Left Sidebar Account Delegation (switch / edit / delete / hover prefetch) & Drag Reorder
   setupAccountRailReorder();
-  document.getElementById("accountRailList")?.addEventListener("click", (ev) => {
+  const accountRailListEl = document.getElementById("accountRailList");
+  accountRailListEl?.addEventListener("click", (ev) => {
     if (ev.target.closest(".account-drag-handle")) return;
     const actionBtn = ev.target.closest("[data-account-action]");
     if (actionBtn) {
@@ -4673,6 +5280,18 @@ function bindEvents(settingsValidator, accountValidator) {
         switchMainTab("tab-overview", { animate: false });
       }
       switchAccount(switchBtn.dataset.accountSwitch);
+    }
+  });
+  accountRailListEl?.addEventListener("pointerover", (ev) => {
+    const switchBtn = ev.target.closest("[data-account-switch]");
+    if (switchBtn?.dataset.accountSwitch) {
+      scheduleAccountPrefetch(switchBtn.dataset.accountSwitch);
+    }
+  });
+  accountRailListEl?.addEventListener("focusin", (ev) => {
+    const switchBtn = ev.target.closest("[data-account-switch]");
+    if (switchBtn?.dataset.accountSwitch) {
+      scheduleAccountPrefetch(switchBtn.dataset.accountSwitch);
     }
   });
 
@@ -4733,19 +5352,24 @@ function bindEvents(settingsValidator, accountValidator) {
     renderCompareBoard();
   });
 
-  document.getElementById("tab-compare")?.addEventListener("click", (ev) => {
+  const comparePanelEl = document.getElementById("tab-compare");
+  comparePanelEl?.addEventListener("click", (ev) => {
     const rowBtn = ev.target.closest("[data-compare-uid]");
     if (!rowBtn || !rowBtn.dataset.compareUid) return;
     const uid = rowBtn.dataset.compareUid;
     switchMainTab("tab-overview", { animate: false });
     switchAccount(uid);
   });
+  comparePanelEl?.addEventListener("pointerover", (ev) => {
+    const rowBtn = ev.target.closest("[data-compare-uid]");
+    if (rowBtn?.dataset.compareUid) {
+      scheduleAccountPrefetch(rowBtn.dataset.compareUid);
+    }
+  });
 
   for (const spec of LEADERBOARD_SPECS) {
     document.getElementById(spec.expandBtnId)?.addEventListener("click", () => {
-      state[spec.limitKey] =
-        Number(state[spec.limitKey] || LEADERBOARD_PAGE_SIZE) + LEADERBOARD_PAGE_SIZE;
-      renderLeaderboardColumn(state.videos, spec);
+      expandLeaderboard(spec);
     });
   }
 
@@ -4936,6 +5560,11 @@ function bindEvents(settingsValidator, accountValidator) {
       state.accounts = res.accounts || [];
       state.activeUid = String(res.active_uid || "").trim();
       state.backendUid = state.activeUid;
+      state.dashboardCache.delete(uid);
+      for (const [key, entry] of state.snapshotCache.entries()) {
+        if (entry.uid === uid) state.snapshotCache.delete(key);
+      }
+      invalidateAllCaches();
       clearRankCaches({ resetLimits: true });
       clearChartsInGroup("overview");
       closeDeleteAccountModal();
@@ -5030,6 +5659,7 @@ function bindEvents(settingsValidator, accountValidator) {
           { method: "PUT", body: JSON.stringify(payload) }
         );
         state.accounts = res.accounts || state.accounts;
+        invalidateUidCache(state.accountModalUid);
         showToast(`已更新账号 ${state.accountModalUid} 配置`);
         closeAccountModal();
         await loadDashboard({ animateCharts: false });
@@ -5045,6 +5675,7 @@ function bindEvents(settingsValidator, accountValidator) {
         state.accounts = res.accounts || [];
         state.activeUid = String(res.active_uid || uid).trim();
         state.backendUid = state.activeUid;
+        invalidateAllCaches();
 
         stopDemoPulseLoop();
         state.demoMode = false;
@@ -5119,6 +5750,7 @@ function bindEvents(settingsValidator, accountValidator) {
         body: JSON.stringify(payload),
       });
       populateSettingsForm(updated);
+      invalidateAllCaches();
 
       if (updated.uid) {
         stopDemoPulseLoop();
@@ -5193,9 +5825,11 @@ async function init() {
   let initialData = null;
   const initHours = Math.max(0, Math.round(Number(state.hours) || 0));
   try {
-    const initParams = new URLSearchParams({ hours: String(initHours) });
-    initialData = await apiFetch(`/api/dashboard?${initParams.toString()}`, {
-      timeoutMs: 15000,
+    initialData = await fetchDashboardPayload({
+      hours: initHours,
+      includeAccounts: true,
+      videoLimit: LEADERBOARD_PAGE_SIZE,
+      maxPoints: DASHBOARD_CHART_MAX_POINTS,
     });
     state.lastDashboardSyncMs = Date.now();
   } catch (err) {
@@ -5213,11 +5847,6 @@ async function init() {
   if (!state.backendUid) {
     activateDemoMode({ showNotification: false });
   } else if (initialData) {
-    const initSnaps = Array.isArray(initialData.snapshots) ? initialData.snapshots : [];
-    cacheOverviewSnapshots(state.backendUid, initHours, initSnaps, {
-      rev: state.liveEventRev,
-      downsampled: initSnaps.length >= 2000,
-    });
     renderDashboard(initialData, { animateCharts: true, isLiveTick: false });
     if (Number(state.hours) !== initHours) {
       loadOverviewSnapshots(state.hours, { animateCharts: true, uid: state.backendUid });

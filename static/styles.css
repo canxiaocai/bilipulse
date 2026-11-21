@@ -2634,8 +2634,19 @@ html.vt-theme::view-transition-new(root) {
   }
 
   [data-stagger].is-entering {
+    --stagger-step: 32ms;
     animation: staggerClipEnter 0.44s var(--ease-out-expo) both;
-    animation-delay: calc(var(--stagger-i, 0) * 32ms);
+    animation-delay: calc(var(--stagger-i, 0) * var(--stagger-step));
+  }
+
+  .compare-bar-list > .compare-bar-item[data-stagger].is-entering {
+    animation-delay: calc(min(var(--sibling-index, 1) - 1, 16) * var(--stagger-step));
+  }
+
+  @supports (animation-delay: calc(sibling-index() * 0.1s)) {
+    .compare-bar-list > .compare-bar-item[data-stagger].is-entering {
+      animation-delay: calc(min(sibling-index() - 1, 16) * var(--stagger-step));
+    }
   }
 }
 
@@ -4127,11 +4138,13 @@ dialog.admin-auth-modal {
   initial-value: , progress-dash 3s ease-in-out infinite;
 }
 
-.scope-plot {
+.scope-plot,
+.leaderboard-pane .leaderboard-list {
   transition: opacity 140ms ease;
 }
 
-.scope-cell.is-loading .scope-plot {
+.scope-cell.is-loading .scope-plot,
+.leaderboard-pane.is-loading .leaderboard-list {
   opacity: 0.56;
 }
 
@@ -4255,7 +4268,8 @@ progress.loading-spinner:indeterminate {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .scope-plot {
+  .scope-plot,
+  .leaderboard-pane .leaderboard-list {
     transition: none;
   }
 
