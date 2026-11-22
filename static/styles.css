@@ -1186,6 +1186,20 @@ samp {
   color: var(--text-muted);
 }
 
+.follower-daily-sub-label {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.follower-daily-sub-value {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .scope-plot {
   position: relative;
   width: 100%;
@@ -4007,6 +4021,54 @@ dialog.admin-auth-modal {
     min-inline-size: 44px;
     min-block-size: 38px;
     padding: 7px 11px;
+  }
+
+  .modal-close-btn {
+    min-inline-size: 48px;
+    min-block-size: 38px;
+  }
+}
+
+@container telemetry-modal (inline-size < 540px) {
+  .modal-header-video .modal-title {
+    font-size: 14.5px;
+    line-height: 1.3;
+  }
+
+  .modal-header-video .modal-close-btn {
+    padding: 6px 11px;
+    font-size: 12px;
+  }
+
+  .modal-bili-link {
+    padding: 6px 9px;
+    font-size: 11px;
+  }
+
+  .modal-range-bar .modal-range-options {
+    min-inline-size: 100%;
+  }
+
+  .modal-range-bar .range-btn {
+    flex: 1 0 auto;
+    min-inline-size: 36px;
+    min-block-size: 30px;
+    padding: 5px 6px;
+    font-size: 11px;
+  }
+}
+
+@media (pointer: coarse) {
+  @container telemetry-modal (inline-size < 540px) {
+    .modal-range-bar .range-btn {
+      min-inline-size: 38px;
+      min-block-size: 36px;
+      padding: 6px 6px;
+    }
+
+    .modal-bili-link {
+      min-block-size: 36px;
+    }
   }
 }
 

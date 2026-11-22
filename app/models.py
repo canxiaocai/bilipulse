@@ -147,6 +147,8 @@ class SchedulerStatus(BaseModel):
 
 class FollowerDailyChange(BaseModel):
     yesterday: Optional[int] = None
+    yesterday_same_time: Optional[int] = None
+    yesterday_same_time_at: str = ""
     today: Optional[int] = None
     yesterday_date: str = ""
     today_date: str = ""

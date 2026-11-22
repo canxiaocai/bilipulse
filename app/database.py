@@ -2341,6 +2341,40 @@ class Database:
             return end_count - day_counts[0]
         return None
 
+    @staticmethod
+    def _compute_yesterday_same_time_change(
+        yesterday_points: list[tuple[int, int]],
+        today_points: list[tuple[int, int]],
+        day_before_counts: list[int],
+        tolerance_sec: int = 3600,
+    ) -> tuple[Optional[int], str]:
+        """Compute yesterday's cumulative follower change up to today's latest snapshot time of day."""
+        if not yesterday_points or not today_points:
+            return None, ""
+        target_ts = today_points[-1][0] - 86400
+        best_idx = -1
+        best_dist = tolerance_sec + 1
+        for idx, (ts, _count) in enumerate(yesterday_points):
+            dist = abs(ts - target_ts)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+        if best_idx < 0 or best_dist > tolerance_sec:
+            return None, ""
+
+        matched_ts, matched_count = yesterday_points[best_idx]
+        if day_before_counts:
+            baseline = day_before_counts[-1]
+        elif best_idx > 0:
+            baseline = yesterday_points[0][1]
+        else:
+            return None, ""
+
+        matched_time_str = datetime.fromtimestamp(matched_ts, tz=timezone.utc).astimezone(
+            BJT_TZ
+        ).strftime("%H:%M")
+        return matched_count - baseline, matched_time_str
+
     def get_follower_daily_changes(
         self, uid: str, now_ts: Optional[int] = None
     ) -> dict[str, Any]:
@@ -2360,6 +2394,8 @@ class Database:
         if not uid:
             return {
                 "yesterday": None,
+                "yesterday_same_time": None,
+                "yesterday_same_time_at": "",
                 "today": None,
                 "yesterday_date": yesterday_date,
                 "today_date": today_date,
@@ -2386,20 +2422,28 @@ class Database:
             ).fetchall()
 
         day_before_counts: list[int] = []
-        yesterday_counts: list[int] = []
-        today_counts: list[int] = []
+        yesterday_points: list[tuple[int, int]] = []
+        today_points: list[tuple[int, int]] = []
         for row in rows:
             ts = int(row["collected_at_ts"])
             count = int(row["follower_count"])
             if ts < t_yesterday:
                 day_before_counts.append(count)
             elif ts < t_today:
-                yesterday_counts.append(count)
+                yesterday_points.append((ts, count))
             else:
-                today_counts.append(count)
+                today_points.append((ts, count))
+
+        yesterday_counts = [c for _, c in yesterday_points]
+        today_counts = [c for _, c in today_points]
+        yesterday_same_time, yesterday_same_time_at = self._compute_yesterday_same_time_change(
+            yesterday_points, today_points, day_before_counts
+        )
 
         return {
             "yesterday": self._compute_day_follower_change(yesterday_counts, day_before_counts),
+            "yesterday_same_time": yesterday_same_time,
+            "yesterday_same_time_at": yesterday_same_time_at,
             "today": self._compute_day_follower_change(today_counts, yesterday_counts),
             "yesterday_date": yesterday_date,
             "today_date": today_date,

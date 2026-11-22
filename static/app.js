@@ -25,7 +25,7 @@ import {
   reorderDemoAccounts,
   buildFallbackCoverSvg,
   buildDemoAvatarSvg,
-} from "./demo-data.js?v=20261119d";
+} from "./demo-data.js?v=20261122b";
 
 const THEME_STORAGE_KEY = "bilipulse_theme";
 const DEMO_PULSE_INTERVAL_MS = 3500;
@@ -2980,6 +2980,8 @@ function renderFollowerDailyStats(daily) {
   const yDateEl = document.getElementById("kpiFollowersYesterdayDate");
   const tValEl = document.getElementById("kpiFollowersToday");
   const tDateEl = document.getElementById("kpiFollowersTodayDate");
+  const ySameRowEl = document.getElementById("kpiFollowersYesterdaySameTime");
+  const ySameValEl = document.getElementById("kpiFollowersYesterdaySameTimeValue");
 
   applyFollowerDailyCell(
     yValEl,
@@ -2995,6 +2997,40 @@ function renderFollowerDailyStats(daily) {
     daily?.today_date,
     "今日暂无足够采样数据"
   );
+
+  if (ySameRowEl && ySameValEl) {
+    const rawSameTime = daily?.yesterday_same_time;
+    if (
+      rawSameTime === null ||
+      rawSameTime === undefined ||
+      Number.isNaN(Number(rawSameTime))
+    ) {
+      ySameRowEl.classList.add("hidden");
+      ySameRowEl.removeAttribute("title");
+      ySameValEl.textContent = "--";
+    } else {
+      const num = Math.round(Number(rawSameTime));
+      const formatted = num > 0 ? `+${fmtNumber(num)}` : num < 0 ? fmtNumber(num) : "0";
+      ySameValEl.textContent = formatted;
+      ySameRowEl.classList.remove("hidden");
+
+      const datePrefix = daily?.yesterday_date ? `北京时间 ${daily.yesterday_date}` : "昨日";
+      const timeSuffix = daily?.yesterday_same_time_at
+        ? ` 截至 ${daily.yesterday_same_time_at}`
+        : " 同时刻";
+      let tooltip = `${datePrefix}${timeSuffix} 累计变化: ${formatted}`;
+      if (
+        daily?.today !== null &&
+        daily?.today !== undefined &&
+        !Number.isNaN(Number(daily.today))
+      ) {
+        const diff = Math.round(Number(daily.today)) - num;
+        const diffText = diff > 0 ? `+${fmtNumber(diff)}` : diff < 0 ? fmtNumber(diff) : "0";
+        tooltip += `（今日较昨日同时刻 ${diffText}）`;
+      }
+      ySameRowEl.title = tooltip;
+    }
+  }
 }
 
 function patchSingleAccountSummary(data) {

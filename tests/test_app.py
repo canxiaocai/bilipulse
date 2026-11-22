@@ -1228,6 +1228,8 @@ def test_follower_daily_changes_beijing_natural_days(tmp_path: Path):
     empty_res = db.get_follower_daily_changes("", now_ts=now_ts)
     assert empty_res == {
         "yesterday": None,
+        "yesterday_same_time": None,
+        "yesterday_same_time_at": "",
         "today": None,
         "yesterday_date": "2026-11-17",
         "today_date": "2026-11-18",
@@ -1239,12 +1241,14 @@ def test_follower_daily_changes_beijing_natural_days(tmp_path: Path):
     insert_at(datetime(2026, 11, 18, 0, 34, 0, tzinfo=bjt), 19977)
     res_one = db.get_follower_daily_changes(uid, now_ts=now_ts)
     assert res_one["yesterday"] is None
+    assert res_one["yesterday_same_time"] is None
     assert res_one["today"] is None
 
     # 2. Second snapshot today (still no yesterday data) -> today = 20343 - 19977 = +366
     insert_at(datetime(2026, 11, 18, 13, 42, 0, tzinfo=bjt), 20343)
     res_today_only = db.get_follower_daily_changes(uid, now_ts=now_ts)
     assert res_today_only["yesterday"] is None
+    assert res_today_only["yesterday_same_time"] is None
     assert res_today_only["today"] == 366
 
     # 3. Add yesterday snapshots (2026-11-17 01:00 and 23:55 BJT, which spans UTC date boundary!)
@@ -1256,14 +1260,39 @@ def test_follower_daily_changes_beijing_natural_days(tmp_path: Path):
     res_two_days = db.get_follower_daily_changes(uid, now_ts=now_ts)
     # Yesterday has no 2026-11-16 close -> uses yesterday first->last: 19970 - 19800 = 170
     assert res_two_days["yesterday"] == 170
+    # No yesterday snapshot within tolerance of 13:42 -> yesterday_same_time is None
+    assert res_two_days["yesterday_same_time"] is None
+    assert res_two_days["yesterday_same_time_at"] == ""
     # Today uses yesterday close (19970) -> today last (20343): 20343 - 19970 = 373
     assert res_two_days["today"] == 373
 
-    # 4. Add 2026-11-16 close (23:50 BJT) -> yesterday uses 2026-11-16 close (19750) -> 19970 - 19750 = 220
+    # 4. Add yesterday snapshot near today's latest time (13:40 vs 13:42) without day-before close
+    # Uses yesterday first (19800) -> 13:40 (19895) = +95
+    insert_at(datetime(2026, 11, 17, 13, 40, 0, tzinfo=bjt), 19895)
+    res_same_time_no_prior = db.get_follower_daily_changes(uid, now_ts=now_ts)
+    assert res_same_time_no_prior["yesterday_same_time"] == 95
+    assert res_same_time_no_prior["yesterday_same_time_at"] == "13:40"
+
+    # 5. Add 2026-11-16 close (23:50 BJT) -> yesterday uses 2026-11-16 close (19750)
+    # Yesterday full day: 19970 - 19750 = 220; yesterday same time (13:40): 19895 - 19750 = 145
     insert_at(datetime(2026, 11, 16, 23, 50, 0, tzinfo=bjt), 19750)
     res_three_days = db.get_follower_daily_changes(uid, now_ts=now_ts)
     assert res_three_days["yesterday"] == 220
+    assert res_three_days["yesterday_same_time"] == 145
+    assert res_three_days["yesterday_same_time_at"] == "13:40"
     assert res_three_days["today"] == 373
+
+    # Closer snapshot at 13:44 (2 min from 13:42 vs 2 min for 13:40 -> tie prefers earlier 13:40)
+    insert_at(datetime(2026, 11, 17, 13, 44, 0, tzinfo=bjt), 19905)
+    res_tie = db.get_follower_daily_changes(uid, now_ts=now_ts)
+    assert res_tie["yesterday_same_time"] == 145
+    assert res_tie["yesterday_same_time_at"] == "13:40"
+
+    # Strictly closer snapshot at 13:43 (1 min away) wins over 13:40 (2 min away)
+    insert_at(datetime(2026, 11, 17, 13, 43, 0, tzinfo=bjt), 19900)
+    res_closer = db.get_follower_daily_changes(uid, now_ts=now_ts)
+    assert res_closer["yesterday_same_time"] == 150
+    assert res_closer["yesterday_same_time_at"] == "13:43"
 
     # 5. Boundary check: 2026-11-18 07:30 BJT (still 2026-11-17 23:30 UTC!) belongs to 2026-11-18 BJT
     db2 = Database(db_path=tmp_path / "utc_boundary.db")
@@ -1310,19 +1339,23 @@ def test_dashboard_api_returns_follower_daily_independent_of_hours_filter(tmp_pa
     app = create_app(database=db, enable_scheduler=False)
 
     now_bjt = datetime.now(timezone.utc).astimezone(bjt)
-    today_00_10 = now_bjt.replace(hour=0, minute=10, second=0, microsecond=0)
-    yesterday_12_00 = today_00_10 - timedelta(hours=12, minutes=10)
-    yesterday_23_50 = today_00_10 - timedelta(minutes=20)
-    day_before_23_50 = yesterday_12_00 - timedelta(hours=12)
+    today_start = now_bjt.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_latest = min(now_bjt, today_start + timedelta(hours=23, minutes=40))
+    today_first = min(today_start + timedelta(minutes=10), today_latest - timedelta(seconds=10))
+    if today_first < today_start:
+        today_first = today_start
+    yesterday_same_time = today_latest - timedelta(days=1)
+    yesterday_23_50 = today_start - timedelta(minutes=10)
+    day_before_23_50 = today_start - timedelta(days=1, minutes=10)
 
     with TestClient(app) as client:
         assert client.post("/api/accounts", json={"uid": "998877", "enabled": True}).status_code == 200
         for dt, followers in [
             (day_before_23_50, 5000),
-            (yesterday_12_00, 5050),
+            (yesterday_same_time, 5050),
             (yesterday_23_50, 5120),
-            (today_00_10, 5135),
-            (now_bjt, 5160),
+            (today_first, 5135),
+            (today_latest, 5160),
         ]:
             db.insert_snapshot(
                 uid="998877",
@@ -1344,6 +1377,8 @@ def test_dashboard_api_returns_follower_daily_independent_of_hours_filter(tmp_pa
         assert dash.status_code == 200
         daily = dash.json()["follower_daily"]
         assert daily["yesterday"] == 120
+        assert daily["yesterday_same_time"] == 50
+        assert daily["yesterday_same_time_at"] == yesterday_same_time.strftime("%H:%M")
         assert daily["today"] == 40
         assert daily["timezone"] == "Asia/Shanghai"
         assert daily["today_date"] == now_bjt.strftime("%Y-%m-%d")
@@ -1352,6 +1387,7 @@ def test_dashboard_api_returns_follower_daily_independent_of_hours_filter(tmp_pa
         assert html_resp.status_code == 200
         assert "kpiFollowersYesterday" in html_resp.text
         assert "kpiFollowersToday" in html_resp.text
+        assert "kpiFollowersYesterdaySameTime" in html_resp.text
         assert "followerDailyPanel" in html_resp.text
 
 

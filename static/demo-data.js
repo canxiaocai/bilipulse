@@ -934,6 +934,13 @@ function formatBjtDate(dayStartSec) {
   return `${y}-${m}-${day}`;
 }
 
+function formatBjtTime(tsSec) {
+  const d = new Date((tsSec + BJT_OFFSET_SEC) * 1000);
+  const h = String(d.getUTCHours()).padStart(2, "0");
+  const m = String(d.getUTCMinutes()).padStart(2, "0");
+  return `${h}:${m}`;
+}
+
 function computeDayFollowerChange(dayCounts, prevDayCounts) {
   if (!dayCounts || dayCounts.length === 0) return null;
   const endVal = dayCounts[dayCounts.length - 1];
@@ -946,6 +953,43 @@ function computeDayFollowerChange(dayCounts, prevDayCounts) {
   return null;
 }
 
+function computeYesterdaySameTimeChange(
+  yesterdayPoints,
+  todayPoints,
+  dayBeforeCounts,
+  toleranceSec = 3600
+) {
+  if (!yesterdayPoints.length || !todayPoints.length) {
+    return { value: null, at: "" };
+  }
+  const targetTs = todayPoints[todayPoints.length - 1].ts - 86400;
+  let bestIdx = -1;
+  let bestDist = toleranceSec + 1;
+  for (let i = 0; i < yesterdayPoints.length; i += 1) {
+    const dist = Math.abs(yesterdayPoints[i].ts - targetTs);
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestIdx = i;
+    }
+  }
+  if (bestIdx < 0 || bestDist > toleranceSec) {
+    return { value: null, at: "" };
+  }
+  const matched = yesterdayPoints[bestIdx];
+  let baseline = null;
+  if (dayBeforeCounts.length > 0) {
+    baseline = dayBeforeCounts[dayBeforeCounts.length - 1];
+  } else if (bestIdx > 0) {
+    baseline = yesterdayPoints[0].val;
+  } else {
+    return { value: null, at: "" };
+  }
+  return {
+    value: matched.val - baseline,
+    at: formatBjtTime(matched.ts),
+  };
+}
+
 function computeDemoFollowerDaily(allSnapshots, refTsSec) {
   const todayStart = getBjtDayStartSec(refTsSec);
   const yesterdayStart = todayStart - 86400;
@@ -953,8 +997,8 @@ function computeDemoFollowerDaily(allSnapshots, refTsSec) {
   const tomorrowStart = todayStart + 86400;
 
   const dayBeforeCounts = [];
-  const yesterdayCounts = [];
-  const todayCounts = [];
+  const yesterdayPoints = [];
+  const todayPoints = [];
 
   for (const snap of allSnapshots || []) {
     if (snap.follower_count === null || snap.follower_count === undefined) continue;
@@ -965,14 +1009,24 @@ function computeDemoFollowerDaily(allSnapshots, refTsSec) {
     if (ts < yesterdayStart) {
       dayBeforeCounts.push(val);
     } else if (ts < todayStart) {
-      yesterdayCounts.push(val);
+      yesterdayPoints.push({ ts, val });
     } else {
-      todayCounts.push(val);
+      todayPoints.push({ ts, val });
     }
   }
 
+  const yesterdayCounts = yesterdayPoints.map((p) => p.val);
+  const todayCounts = todayPoints.map((p) => p.val);
+  const sameTime = computeYesterdaySameTimeChange(
+    yesterdayPoints,
+    todayPoints,
+    dayBeforeCounts
+  );
+
   return {
     yesterday: computeDayFollowerChange(yesterdayCounts, dayBeforeCounts),
+    yesterday_same_time: sameTime.value,
+    yesterday_same_time_at: sameTime.at,
     today: computeDayFollowerChange(todayCounts, yesterdayCounts),
     yesterday_date: formatBjtDate(yesterdayStart),
     today_date: formatBjtDate(todayStart),

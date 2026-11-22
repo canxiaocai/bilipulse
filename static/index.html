@@ -14,8 +14,8 @@
   </script>
   <title>B站账号实时监控</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 28 28' fill='none'%3E%3Crect width='28' height='28' fill='%2307090E'/%3E%3Crect x='2.5' y='4.5' width='23' height='19' stroke='%2300E5FF' stroke-width='2'/%3E%3Cpolyline points='5.5,16 9,16 11.2,10.5 14,20 16.8,13 19,16 22.5,16' stroke='%23FF2A7A' stroke-width='2.2' stroke-linecap='square' stroke-linejoin='miter'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/static/tokens-layout.css?v=20261121e" />
-  <link rel="stylesheet" href="/static/styles.css?v=20261121e" />
+  <link rel="stylesheet" href="/static/tokens-layout.css?v=20261122b" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261122b" />
 </head>
 <body>
   <div class="studio-shell" id="studioShell">
@@ -230,6 +230,10 @@
                         <span class="follower-daily-date mono" id="kpiFollowersTodayDate">--</span>
                       </div>
                       <div class="follower-daily-value mono is-empty" id="kpiFollowersToday">--</div>
+                      <div class="follower-daily-sub hidden" id="kpiFollowersYesterdaySameTime">
+                        <span class="follower-daily-sub-label">昨日同时刻</span>
+                        <span class="follower-daily-sub-value mono" id="kpiFollowersYesterdaySameTimeValue">--</span>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -373,7 +377,7 @@
   <!-- Native Centered Multi-Channel Video Telemetry Modal -->
   <dialog class="telemetry-modal" id="videoModal" closedby="any" aria-labelledby="modalVideoTitle">
     <div class="modal-shell">
-      <header class="modal-header">
+      <header class="modal-header modal-header-video">
         <div class="modal-identity">
           <div class="modal-cover-frame hidden" id="modalCoverWrap">
             <img id="modalVideoCover" referrerpolicy="no-referrer" alt="" />
@@ -385,7 +389,7 @@
           </div>
         </div>
 
-        <div class="modal-actions">
+        <div class="modal-actions modal-video-tools">
           <div
             class="range-bar modal-range-bar"
             id="modalRangeGroup"
@@ -404,11 +408,10 @@
               <button type="button" class="range-btn mono" data-hours="0" aria-pressed="false">全部</button>
             </div>
           </div>
-          <div class="modal-action-btns">
-            <a class="btn btn-chamfer btn-secondary mono" id="modalBiliLink" href="https://www.bilibili.com" target="_blank" rel="noopener noreferrer">B站打开 ↗</a>
-            <button type="button" class="btn btn-ghost mono" id="btnCloseModal" aria-label="关闭视频趋势波形弹窗" autofocus>关闭</button>
-          </div>
+          <a class="btn btn-chamfer btn-secondary mono modal-bili-link" id="modalBiliLink" href="https://www.bilibili.com" target="_blank" rel="noopener noreferrer">B站打开 ↗</a>
         </div>
+
+        <button type="button" class="btn btn-ghost mono modal-close-btn" id="btnCloseModal" aria-label="关闭视频趋势波形弹窗" autofocus>关闭</button>
       </header>
 
       <div class="modal-stats" id="modalStats">
@@ -496,7 +499,7 @@
         </div>
 
         <div class="modal-actions">
-          <button type="button" class="btn btn-ghost mono" id="btnCloseSettingsModal" aria-label="关闭监控设置弹窗">关闭</button>
+          <button type="button" class="btn btn-ghost mono modal-close-btn" id="btnCloseSettingsModal" aria-label="关闭监控设置弹窗">关闭</button>
         </div>
       </header>
 
@@ -604,7 +607,7 @@
         </div>
 
         <div class="modal-actions">
-          <button type="button" class="btn btn-ghost mono" id="btnCloseAccountModal" aria-label="关闭账号配置弹窗">关闭</button>
+          <button type="button" class="btn btn-ghost mono modal-close-btn" id="btnCloseAccountModal" aria-label="关闭账号配置弹窗">关闭</button>
         </div>
       </header>
 
@@ -647,7 +650,7 @@
           <h2 class="modal-title" id="confirmDeleteTitle">确认移除监控账号</h2>
         </div>
         <div class="modal-actions">
-          <button type="button" class="btn btn-ghost mono" id="btnCancelDelete" autofocus>取消</button>
+          <button type="button" class="btn btn-ghost mono modal-close-btn" id="btnCancelDelete" autofocus>取消</button>
         </div>
       </header>
 
@@ -674,7 +677,7 @@
         </div>
 
         <div class="modal-actions">
-          <button type="button" class="btn btn-ghost mono" id="btnCloseAdminAuthModal" aria-label="关闭管理员密码弹窗">关闭</button>
+          <button type="button" class="btn btn-ghost mono modal-close-btn" id="btnCloseAdminAuthModal" aria-label="关闭管理员密码弹窗">关闭</button>
         </div>
       </header>
 
@@ -733,6 +736,6 @@
   <!-- HUD Toast Notifications Stack -->
   <div class="toast-stack" id="toastStack" aria-live="polite"></div>
 
-  <script type="module" src="/static/app.js?v=20261121e"></script>
+  <script type="module" src="/static/app.js?v=20261122b"></script>
 </body>
 </html>
