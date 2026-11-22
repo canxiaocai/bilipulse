@@ -1098,22 +1098,23 @@ dialog.telemetry-modal[open]::backdrop {
 }
 
 .modal-header {
+  --modal-close-size: 38px;
   position: sticky;
   inset-block-start: 0;
   z-index: 25;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr);
   align-items: safe center;
   gap: 12px 16px;
-  padding: 14px 20px;
+  padding: 14px calc(var(--modal-close-size) + 16px) 14px 20px;
   background: var(--bg-panel);
   border-bottom: 1px solid var(--line-grid);
 }
 
 .modal-header-video {
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  grid-template-areas: "identity tools close";
-  gap: 12px 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "identity tools";
+  gap: 12px 16px;
 }
 
 .modal-identity {
@@ -1125,7 +1126,6 @@ dialog.telemetry-modal[open]::backdrop {
 
 .modal-header-video .modal-identity {
   grid-area: identity;
-  margin-inline-end: 8px;
 }
 
 .modal-cover-frame {
@@ -1182,14 +1182,27 @@ dialog.telemetry-modal[open]::backdrop {
   flex-wrap: nowrap;
 }
 
-.modal-close-btn {
-  justify-self: end;
-  flex-shrink: 0;
+.btn.modal-close-btn {
+  position: absolute;
+  inset-block-start: 0;
+  inset-inline-end: 0;
+  z-index: 2;
+  inline-size: var(--modal-close-size);
+  block-size: var(--modal-close-size);
+  padding: 0;
+  gap: 0;
+  display: inline-grid;
+  place-items: center;
+  border: 0;
+  border-inline-start: 1px solid var(--line-grid);
+  border-block-end: 1px solid var(--line-grid);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
 }
 
-.modal-header-video .modal-close-btn {
-  grid-area: close;
-  align-self: safe center;
+.btn.modal-close-btn svg {
+  inline-size: 16px;
+  block-size: 16px;
 }
 
 .modal-bili-link {
@@ -1198,21 +1211,18 @@ dialog.telemetry-modal[open]::backdrop {
 
 @container telemetry-modal (inline-size < 920px) {
   .modal-header-video {
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr);
     grid-template-areas:
-      "identity close"
-      "tools    tools";
+      "identity"
+      "tools";
     align-items: start;
-    gap: 10px 12px;
+    gap: 10px;
+    padding-inline-end: 20px;
   }
 
   .modal-header-video .modal-identity {
-    margin-inline-end: 0;
     align-items: flex-start;
-  }
-
-  .modal-header-video .modal-close-btn {
-    align-self: start;
+    padding-inline-end: calc(var(--modal-close-size) - 4px);
   }
 
   .modal-header-video .modal-video-tools {
@@ -1224,12 +1234,13 @@ dialog.telemetry-modal[open]::backdrop {
 
 @container telemetry-modal (inline-size < 540px) {
   .modal-header-video {
-    gap: 10px 10px;
+    gap: 10px;
     padding: 12px 14px;
   }
 
   .modal-header-video .modal-identity {
     gap: 10px;
+    padding-inline-end: calc(var(--modal-close-size) - 2px);
   }
 
   .modal-header-video .modal-cover-frame {
@@ -1476,11 +1487,11 @@ dialog.telemetry-modal[open]::backdrop {
   .modal-header {
     align-items: start;
     gap: 10px 12px;
-    padding: 12px 14px;
+    padding: 12px calc(var(--modal-close-size) + 12px) 12px 14px;
   }
 
-  .modal-header > .modal-actions:not(.modal-video-tools) {
-    align-self: start;
+  .modal-header.modal-header-video {
+    padding-inline-end: 14px;
   }
 
   .modal-stats {
