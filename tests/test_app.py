@@ -851,17 +851,17 @@ def test_multi_account_crud_and_switching(tmp_path: Path):
             video_online_items=[],
         )
 
-        # Dashboard query for explicit uid vs active uid
-        dash2 = client.get("/api/dashboard?hours=24")
-        assert dash2.status_code == 200
-        assert dash2.json()["settings"]["uid"] == "20002"
-        assert dash2.json()["latest"]["follower_count"] == 2222
-        assert len(dash2.json()["accounts"]) == 2
+        # Dashboard query defaults to the first account in sort order (10001), while explicit uid overrides
+        dash_default = client.get("/api/dashboard?hours=24")
+        assert dash_default.status_code == 200
+        assert dash_default.json()["settings"]["uid"] == "10001"
+        assert dash_default.json()["latest"]["follower_count"] == 1111
+        assert len(dash_default.json()["accounts"]) == 2
 
-        dash1_explicit = client.get("/api/dashboard?hours=24&uid=10001")
-        assert dash1_explicit.status_code == 200
-        assert dash1_explicit.json()["settings"]["uid"] == "10001"
-        assert dash1_explicit.json()["latest"]["follower_count"] == 1111
+        dash2_explicit = client.get("/api/dashboard?hours=24&uid=20002")
+        assert dash2_explicit.status_code == 200
+        assert dash2_explicit.json()["settings"]["uid"] == "20002"
+        assert dash2_explicit.json()["latest"]["follower_count"] == 2222
 
         # Activate account 10001
         act = client.post("/api/accounts/10001/activate")
@@ -4919,6 +4919,67 @@ def test_database_migrates_v1_multi_cid_online_counts_with_pulses_and_tiered_car
             "SELECT value FROM settings WHERE key = 'online_count_rule'"
         ).fetchone()
         assert row is not None and row[0] == "single_cid_minus_1_v2"
+
+
+def test_dashboard_defaults_to_first_sorted_account_and_falls_back_on_stale_uid(tmp_path: Path):
+    db = Database(db_path=tmp_path / "default_first.db")
+    app = create_app(database=db, enable_scheduler=False)
+
+    db.create_account("10001", account_name="FirstUP", enabled=True, set_active=True)
+    db.create_account("20002", account_name="SecondUP", enabled=True, set_active=True)
+    db.create_account("30003", account_name="ThirdUP", enabled=True, set_active=False)
+
+    for uid, followers in [("10001", 1010), ("20002", 2020), ("30003", 3030)]:
+        db.insert_snapshot(
+            uid=uid,
+            follower_count=followers,
+            following_count=1,
+            online_viewers_total=10,
+            video_count=1,
+            videos_succeeded=1,
+            extra_metrics={},
+            status="success",
+            error_message=None,
+            duration_ms=20,
+            video_online_items=[],
+        )
+
+    with TestClient(app) as client:
+        # Even though settings.uid is 20002 (and after activating 30003), default dashboard returns sort_order=0 (10001)
+        assert client.post("/api/accounts/30003/activate").status_code == 200
+
+        dash_default = client.get("/api/dashboard?hours=24")
+        assert dash_default.status_code == 200
+        assert dash_default.json()["settings"]["uid"] == "10001"
+        assert dash_default.json()["latest"]["follower_count"] == 1010
+
+        assert client.get("/api/snapshots?hours=24").json()["uid"] == "10001"
+        assert client.get("/api/videos").json()["uid"] == "10001"
+        assert client.get("/api/crawl-logs").json()["uid"] == "10001"
+
+        # Explicit valid uid (e.g., from browser localStorage) returns that account
+        dash_explicit = client.get("/api/dashboard?hours=24&uid=30003")
+        assert dash_explicit.status_code == 200
+        assert dash_explicit.json()["settings"]["uid"] == "30003"
+        assert dash_explicit.json()["latest"]["follower_count"] == 3030
+
+        # Reordering accounts changes the default #1 account for first-time visitors
+        reord = client.put("/api/accounts/reorder", json={"uids": ["20002", "30003", "10001"]})
+        assert reord.status_code == 200
+        dash_after_reorder = client.get("/api/dashboard?hours=24")
+        assert dash_after_reorder.status_code == 200
+        assert dash_after_reorder.json()["settings"]["uid"] == "20002"
+        assert dash_after_reorder.json()["latest"]["follower_count"] == 2020
+
+        # Stale/deleted uid from browser localStorage falls back cleanly to sort_order=0 (20002)
+        dash_stale = client.get("/api/dashboard?hours=24&uid=999999999")
+        assert dash_stale.status_code == 200
+        assert dash_stale.json()["settings"]["uid"] == "20002"
+        assert dash_stale.json()["latest"]["follower_count"] == 2020
+        assert client.get("/api/snapshots?hours=24&uid=999999999").json()["uid"] == "20002"
+        assert client.get("/api/videos?uid=999999999").json()["uid"] == "20002"
+        assert client.get("/api/crawl-logs?uid=999999999").json()["uid"] == "20002"
+
 
 
 

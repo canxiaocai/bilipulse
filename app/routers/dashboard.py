@@ -106,7 +106,8 @@ async def get_dashboard(
 
     def _assemble_dashboard() -> DashboardSummary:
         with db.read_session():
-            pub_settings = db.get_public_settings(uid=target_uid)
+            resolved_uid = db.resolve_dashboard_uid(target_uid)
+            pub_settings = db.get_public_settings(uid=resolved_uid)
             active_uid = pub_settings["uid"]
             accounts = (
                 db.get_accounts_summary(crawling_uid=crawl_service.crawling_uid)
@@ -118,7 +119,7 @@ async def get_dashboard(
 
             if not active_uid:
                 sched_status = scheduler_mgr.get_status(
-                    uid=target_uid,
+                    uid=None,
                     pub_settings=pub_settings,
                     latest_snapshot=None,
                 )
@@ -132,7 +133,7 @@ async def get_dashboard(
 
             latest, prev = db.get_latest_two_snapshots(active_uid)
             sched_status = scheduler_mgr.get_status(
-                uid=target_uid,
+                uid=active_uid,
                 pub_settings=pub_settings,
                 latest_snapshot=latest,
             )
@@ -205,27 +206,28 @@ async def get_chart_snapshots(
     db = request.app.state.db
 
     def _load() -> dict[str, Any]:
-        target_uid = (uid if uid is not None else db.get_setting("uid", "")).strip()
-        if not target_uid:
+        with db.read_session():
+            target_uid = db.resolve_dashboard_uid(uid)
+            if not target_uid:
+                return {
+                    "uid": "",
+                    "hours": hours,
+                    "snapshots": [],
+                    "downsampled": False,
+                    "total_in_window": 0,
+                }
+            snapshots, downsampled, total_in_window = db.get_chart_snapshots(
+                target_uid,
+                since_hours=hours if hours > 0 else None,
+                max_points=max_points,
+            )
             return {
-                "uid": "",
+                "uid": target_uid,
                 "hours": hours,
-                "snapshots": [],
-                "downsampled": False,
-                "total_in_window": 0,
+                "snapshots": snapshots,
+                "downsampled": downsampled,
+                "total_in_window": total_in_window,
             }
-        snapshots, downsampled, total_in_window = db.get_chart_snapshots(
-            target_uid,
-            since_hours=hours if hours > 0 else None,
-            max_points=max_points,
-        )
-        return {
-            "uid": target_uid,
-            "hours": hours,
-            "snapshots": snapshots,
-            "downsampled": downsampled,
-            "total_in_window": total_in_window,
-        }
 
     return await asyncio.to_thread(_load)
 
@@ -245,7 +247,7 @@ async def get_videos(
 
     def _load() -> dict[str, Any]:
         with db.read_session():
-            target_uid = (uid if uid is not None else db.get_setting("uid", "")).strip()
+            target_uid = db.resolve_dashboard_uid(uid)
             if not target_uid:
                 return {"uid": "", "videos": []}
             if lightweight:
@@ -304,9 +306,10 @@ async def get_crawl_logs(
     db = request.app.state.db
 
     def _load() -> dict[str, Any]:
-        target_uid = (uid if uid is not None else db.get_setting("uid", "")).strip()
-        if not target_uid:
-            return {"uid": "", "logs": []}
-        return {"uid": target_uid, "logs": db.get_recent_snapshots(target_uid, limit=limit)}
+        with db.read_session():
+            target_uid = db.resolve_dashboard_uid(uid)
+            if not target_uid:
+                return {"uid": "", "logs": []}
+            return {"uid": target_uid, "logs": db.get_recent_snapshots(target_uid, limit=limit)}
 
     return await asyncio.to_thread(_load)

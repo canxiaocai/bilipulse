@@ -28,6 +28,7 @@ import {
 } from "./demo-data.js?v=20261122b";
 
 const THEME_STORAGE_KEY = "bilipulse_theme";
+const ACTIVE_UID_STORAGE_KEY = "bilipulse_active_uid";
 const DEMO_PULSE_INTERVAL_MS = 3500;
 const REAL_POLL_INTERVAL_MS = 30000;
 const FALLBACK_POLL_INTERVAL_MS = 10000;
@@ -64,8 +65,6 @@ const state = {
   snapshotsLoadingTimer: null,
   accountSwitchLoadingTimer: null,
   videosExpandAbortController: null,
-  activateReqSeq: 0,
-  activateAbortController: null,
   accountPrefetchTimer: null,
   accountPrefetch: null,
   snapshotCache: new Map(),
@@ -384,6 +383,29 @@ function getStoredTheme() {
     // Ignore storage access errors
   }
   return "dark";
+}
+
+function getStoredActiveUid() {
+  try {
+    const saved = String(localStorage.getItem(ACTIVE_UID_STORAGE_KEY) || "").trim();
+    if (/^\d+$/.test(saved)) return saved;
+  } catch {
+    // Ignore storage access errors
+  }
+  return "";
+}
+
+function setStoredActiveUid(uid) {
+  const clean = String(uid || "").trim();
+  try {
+    if (/^\d+$/.test(clean)) {
+      localStorage.setItem(ACTIVE_UID_STORAGE_KEY, clean);
+    } else {
+      localStorage.removeItem(ACTIVE_UID_STORAGE_KEY);
+    }
+  } catch {
+    // Ignore storage access errors
+  }
 }
 
 function applyTheme(theme, persist = true) {
@@ -1652,37 +1674,6 @@ function cancelPendingAccountPrefetch() {
   state.accountPrefetch = null;
 }
 
-function persistActiveAccount(targetUid) {
-  if (!targetUid || state.demoMode) return;
-  if (state.adminAuth.enabled && !state.adminAuth.authenticated) return;
-
-  const seq = ++state.activateReqSeq;
-  if (state.activateAbortController) {
-    state.activateAbortController.abort();
-    state.activateAbortController = null;
-  }
-  const controller = new AbortController();
-  state.activateAbortController = controller;
-
-  // Low-priority background persistence: never blocks the critical dashboard fetch
-  apiFetch(`/api/accounts/${encodeURIComponent(targetUid)}/activate?include_accounts=false`, {
-    method: "POST",
-    priority: "low",
-    signal: controller.signal,
-  })
-    .catch((err) => {
-      if (isAbortError(err) || err?.status === 401) return;
-      if (seq === state.activateReqSeq) {
-        console.warn("Failed to persist active account:", err);
-      }
-    })
-    .finally(() => {
-      if (state.activateAbortController === controller) {
-        state.activateAbortController = null;
-      }
-    });
-}
-
 function renderAccountPill(settings) {
   const accountPill = document.getElementById("accountPill");
   if (!accountPill) return;
@@ -1852,11 +1843,9 @@ async function switchAccount(uid) {
 
   state.activeUid = targetUid;
   state.backendUid = targetUid;
+  setStoredActiveUid(targetUid);
   clearRankCaches({ resetLimits: true });
   renderAccountSidebar();
-
-  // Persist default active account in background without blocking the switch
-  persistActiveAccount(targetUid);
 
   const reqId = ++state.dashboardReqSeq;
   const reqHours = Math.max(0, Math.round(Number(state.hours) || 0));
@@ -3926,12 +3915,15 @@ function closeDialogModal(modal) {
   }
 }
 
-function populateSettingsForm(settings) {
+function populateSettingsForm(settings, { preserveActiveUid = false } = {}) {
   if (!settings) return;
   state.backendSettings = settings;
-  state.backendUid = String(settings.uid || "").trim();
-  if (state.backendUid) {
-    state.activeUid = state.backendUid;
+  const settingsUid = String(settings.uid || "").trim();
+  if (!preserveActiveUid) {
+    state.backendUid = settingsUid;
+    if (state.backendUid) {
+      state.activeUid = state.backendUid;
+    }
   }
 
   const uidEl = document.getElementById("inputUid");
@@ -3945,7 +3937,7 @@ function populateSettingsForm(settings) {
   const badge = document.getElementById("cookieStatusBadge");
 
   if (uidEl) {
-    uidEl.value = settings.uid || "";
+    uidEl.value = preserveActiveUid ? state.activeUid || settings.uid || "" : settings.uid || "";
     uidEl.setCustomValidity("");
     uidEl.setAttribute("aria-invalid", "false");
   }
@@ -4550,7 +4542,9 @@ async function loadDashboard({
     return demoData;
   }
 
-  const targetUid = String(uid !== null ? uid : state.activeUid || "").trim();
+  const targetUid = String(
+    uid !== null ? uid : state.activeUid || getStoredActiveUid() || ""
+  ).trim();
   const reqHours = Math.max(0, Math.round(Number(state.hours) || 0));
   const activeReqId = reqId !== null ? reqId : ++state.dashboardReqSeq;
   if (!silent) {
@@ -4618,10 +4612,15 @@ async function loadDashboard({
       state.backendUid = String(data.settings.uid || "").trim();
       if (state.backendUid) {
         state.activeUid = state.backendUid;
+      } else {
+        state.activeUid = "";
       }
     }
 
-    const resolvedUid = String(state.activeUid || state.backendUid || targetUid || "").trim();
+    const resolvedUid = String(state.activeUid || state.backendUid || "").trim();
+    if (targetUid && resolvedUid !== targetUid && getStoredActiveUid() === targetUid) {
+      setStoredActiveUid("");
+    }
     const fetchedSnaps = Array.isArray(data?.snapshots) ? data.snapshots : [];
 
     // If the user switched horizon while this dashboard fetch was in flight,
@@ -5537,8 +5536,20 @@ function bindEvents(settingsValidator, accountValidator) {
         { method: "DELETE" }
       );
       state.accounts = res.accounts || [];
-      state.activeUid = String(res.active_uid || "").trim();
-      state.backendUid = state.activeUid;
+      const deletedCurrent = String(state.activeUid || "") === String(uid);
+      const remainingHasActive = state.accounts.some(
+        (a) => String(a.uid || "") === String(state.activeUid || "")
+      );
+      if (deletedCurrent || !remainingHasActive) {
+        const fallbackUid = String(state.accounts[0]?.uid || res.active_uid || "").trim();
+        state.activeUid = fallbackUid;
+        state.backendUid = fallbackUid;
+        if (getStoredActiveUid() === String(uid) || !fallbackUid) {
+          setStoredActiveUid("");
+        }
+      } else {
+        state.backendUid = state.activeUid;
+      }
       state.dashboardCache.delete(uid);
       for (const [key, entry] of state.snapshotCache.entries()) {
         if (entry.uid === uid) state.snapshotCache.delete(key);
@@ -5587,7 +5598,7 @@ function bindEvents(settingsValidator, accountValidator) {
         method: "PUT",
         body: JSON.stringify({ cookie: "" }),
       });
-      populateSettingsForm(updated);
+      populateSettingsForm(updated, { preserveActiveUid: true });
       showToast("已清空服务端保存的全局账号凭证");
       await loadDashboard({ animateCharts: false });
     } catch (err) {
@@ -5606,7 +5617,7 @@ function bindEvents(settingsValidator, accountValidator) {
         method: "PUT",
         body: JSON.stringify({ admin_password: "" }),
       });
-      populateSettingsForm(updated);
+      populateSettingsForm(updated, { preserveActiveUid: true });
       showToast("已清除管理员密码保护");
       await loadDashboard({ animateCharts: false });
     } catch (err) {
@@ -5651,9 +5662,11 @@ function bindEvents(settingsValidator, accountValidator) {
             set_active: true,
           }),
         });
+        const addedUid = String(res.account?.uid || uid || res.active_uid || "").trim();
         state.accounts = res.accounts || [];
-        state.activeUid = String(res.active_uid || uid).trim();
-        state.backendUid = state.activeUid;
+        state.activeUid = addedUid;
+        state.backendUid = addedUid;
+        setStoredActiveUid(addedUid);
         invalidateAllCaches();
 
         stopDemoPulseLoop();
@@ -5729,6 +5742,9 @@ function bindEvents(settingsValidator, accountValidator) {
         body: JSON.stringify(payload),
       });
       populateSettingsForm(updated);
+      if (updated.uid && updated.uid !== prevUid) {
+        setStoredActiveUid(updated.uid);
+      }
       invalidateAllCaches();
 
       if (updated.uid) {
@@ -5798,11 +5814,13 @@ async function init() {
     document.fonts.ready.then(() => syncSlidingIndicators({ immediate: true })).catch(() => {});
   }
 
-  // Fetch initial backend state
+  // Fetch initial backend state (prefer user's last viewed account; first-time visitors get sort_order #1)
+  const storedUid = getStoredActiveUid();
   let initialData = null;
   const initHours = Math.max(0, Math.round(Number(state.hours) || 0));
   try {
     initialData = await fetchDashboardPayload({
+      uid: storedUid,
       hours: initHours,
       includeAccounts: true,
       videoLimit: LEADERBOARD_PAGE_SIZE,
@@ -5819,6 +5837,11 @@ async function init() {
   }
   if (initialData?.settings) {
     populateSettingsForm(initialData.settings);
+    const resolvedInitUid = String(initialData.settings.uid || "").trim();
+    if (storedUid && resolvedInitUid !== storedUid) {
+      // Cached account was removed on server; clear stale preference so default #1 applies
+      setStoredActiveUid("");
+    }
   }
 
   if (!state.backendUid) {

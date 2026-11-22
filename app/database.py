@@ -1003,6 +1003,37 @@ class Database:
             result[row["key"]] = row["value"]
         return result
 
+    def resolve_dashboard_uid(self, uid: Optional[str] = None) -> str:
+        """Resolve account UID for read/dashboard endpoints.
+
+        If ``uid`` is provided and exists in ``monitored_accounts``, return it.
+        Otherwise fall back to the first monitored account in display sort order
+        (``sort_order ASC, created_at ASC``), or ``""`` when no accounts exist.
+        """
+        requested = (uid or "").strip()
+        with self.read_connection() as conn:
+            if requested:
+                row = conn.execute(
+                    "SELECT uid FROM monitored_accounts WHERE uid = ?",
+                    (requested,),
+                ).fetchone()
+                if row is not None:
+                    return str(row["uid"]).strip()
+
+            first = conn.execute(
+                "SELECT uid FROM monitored_accounts ORDER BY sort_order ASC, created_at ASC LIMIT 1"
+            ).fetchone()
+            if first is not None:
+                return str(first["uid"]).strip()
+
+            if uid is None:
+                legacy = conn.execute(
+                    "SELECT value FROM settings WHERE key = 'uid'"
+                ).fetchone()
+                if legacy is not None:
+                    return str(legacy["value"]).strip()
+            return ""
+
     def get_public_settings(self, uid: Optional[str] = None) -> dict[str, Any]:
         with self.read_connection() as conn:
             rows = conn.execute("SELECT key, value FROM settings").fetchall()
