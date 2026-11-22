@@ -11,7 +11,8 @@ from app.auth import hash_password
 from app.bilibili.client import parse_online_count
 from app.config import DB_PATH, DEFAULT_SETTINGS, get_default_admin_password
 
-ONLINE_COUNT_RULE = "minus_1_per_cid_v1"
+ONLINE_COUNT_RULE = "single_cid_minus_1_v2"
+LEGACY_ONLINE_COUNT_RULE_V1 = "minus_1_per_cid_v1"
 HOT_STICKY_SECONDS = 900
 FAST_STICKY_SECONDS = 900
 FAST_ONLINE_THRESHOLD = 3
@@ -215,15 +216,44 @@ def _compute_play_rate_update(
     return (effective_play, new_rate, int(now_ts), new_fast, new_hot, new_streak)
 
 
-def _adjusted_online_from_raw(raw: str, fallback_count: int) -> int:
-    """Recompute adjusted online count (-1 per CID, floored at 0) from raw API text."""
+def _split_legacy_online_raw(raw: str) -> list[str]:
+    """Split legacy '+'-joined per-CID online_raw strings while preserving trailing '+' suffixes (e.g. '1000+')."""
     text = (raw or "").strip()
     if not text:
-        return max(0, int(fallback_count) - 1)
-    parts = [p.strip() for p in text.split("+") if p.strip()]
+        return []
+    parts: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        j = text.find("+", i)
+        if j == -1:
+            tok = text[i:].strip()
+            if tok:
+                parts.append(tok)
+            break
+        if j + 1 == n or text[j + 1] == "+":
+            tok = text[i : j + 1].strip()
+            if tok:
+                parts.append(tok)
+            i = j + 2
+        else:
+            tok = text[i:j].strip()
+            if tok:
+                parts.append(tok)
+            i = j + 1
+    return parts
+
+
+def _adjusted_online_from_raw(
+    raw: str, fallback_count: int, *, already_minus_one: bool = False
+) -> tuple[int, str]:
+    """Compute single-video adjusted online count (-1 baseline, floored at 0) and normalized raw text."""
+    parts = _split_legacy_online_raw(raw)
     if not parts:
-        return max(0, int(fallback_count) - 1)
-    return sum(max(0, parse_online_count(part) - 1) for part in parts)
+        count = max(0, int(fallback_count)) if already_minus_one else max(0, int(fallback_count) - 1)
+        return count, (raw or "").strip()
+    first_raw = parts[0]
+    return max(0, parse_online_count(first_raw) - 1), first_raw
 
 
 def _mask_cookie(cookie: str) -> str:
@@ -664,50 +694,237 @@ class Database:
 
     @staticmethod
     def _migrate_online_count_rule(conn: sqlite3.Connection, now: str) -> None:
-        """One-time migration subtracting 1 baseline viewer per CID on legacy snapshots."""
+        """One-time migration normalizing online viewer counts to whole-video single-CID minus-1 rule."""
         rule_row = conn.execute(
             "SELECT value FROM settings WHERE key = 'online_count_rule'"
         ).fetchone()
-        if rule_row and rule_row["value"] == ONLINE_COUNT_RULE:
+        current_rule = rule_row["value"] if rule_row else ""
+        if current_rule == ONLINE_COUNT_RULE:
             return
 
-        snap_cnt = conn.execute("SELECT COUNT(*) AS cnt FROM account_snapshots").fetchone()["cnt"]
-        if snap_cnt > 0:
-            video_snap_rows = conn.execute(
-                "SELECT id, online_count, online_raw FROM video_online_snapshots"
-            ).fetchall()
-            for r in video_snap_rows:
-                adjusted = _adjusted_online_from_raw(r["online_raw"], r["online_count"])
-                conn.execute(
-                    "UPDATE video_online_snapshots SET online_count = ? WHERE id = ?",
-                    (adjusted, r["id"]),
-                )
+        already_minus_one = current_rule == LEGACY_ONLINE_COUNT_RULE_V1
 
+        if already_minus_one:
+            vos_rows = conn.execute(
+                """
+                SELECT v.id, v.snapshot_id, v.bvid, v.online_count, v.online_raw,
+                       s.uid, s.collected_at_ts
+                FROM video_online_snapshots v
+                JOIN account_snapshots s ON s.id = v.snapshot_id
+                WHERE v.online_raw LIKE '%+%'
+                """
+            ).fetchall()
+        else:
+            vos_rows = conn.execute(
+                """
+                SELECT v.id, v.snapshot_id, v.bvid, v.online_count, v.online_raw,
+                       s.uid, s.collected_at_ts
+                FROM video_online_snapshots v
+                JOIN account_snapshots s ON s.id = v.snapshot_id
+                """
+            ).fetchall()
+
+        vos_updates: list[tuple[int, str, int]] = []
+        affected_bvids_by_uid: dict[str, set[str]] = {}
+        snap_polled_deltas: dict[int, dict[str, int]] = {}
+        snap_polled_delta_totals: dict[int, int] = {}
+        for r in vos_rows:
+            raw_text = r["online_raw"] or ""
+            if already_minus_one and len(_split_legacy_online_raw(raw_text)) <= 1:
+                continue
+            new_count, new_raw = _adjusted_online_from_raw(
+                raw_text, r["online_count"], already_minus_one=already_minus_one
+            )
+            old_count = int(r["online_count"])
+            if new_count != old_count or new_raw != raw_text:
+                vos_updates.append((new_count, new_raw, int(r["id"])))
+            delta = old_count - new_count
+            if delta != 0:
+                affected_bvids_by_uid.setdefault(r["uid"], set()).add(r["bvid"])
+            sid = int(r["snapshot_id"])
+            snap_polled_deltas.setdefault(sid, {})[r["bvid"]] = delta
+            snap_polled_delta_totals[sid] = snap_polled_delta_totals.get(sid, 0) + delta
+
+        if already_minus_one:
+            vps_rows = conn.execute(
+                """
+                SELECT id, uid, bvid, collected_at_ts, online_count, online_raw
+                FROM video_pulse_snapshots
+                WHERE online_raw LIKE '%+%'
+                """
+            ).fetchall()
+        else:
+            vps_rows = conn.execute(
+                """
+                SELECT id, uid, bvid, collected_at_ts, online_count, online_raw
+                FROM video_pulse_snapshots
+                """
+            ).fetchall()
+
+        vps_updates: list[tuple[int, str, int]] = []
+        pulse_events_by_uid: dict[str, list[tuple[int, int, str, int]]] = {}
+        for r in vps_rows:
+            raw_text = r["online_raw"] or ""
+            if already_minus_one and len(_split_legacy_online_raw(raw_text)) <= 1:
+                continue
+            new_count, new_raw = _adjusted_online_from_raw(
+                raw_text, r["online_count"], already_minus_one=already_minus_one
+            )
+            old_count = int(r["online_count"])
+            if new_count != old_count or new_raw != raw_text:
+                vps_updates.append((new_count, new_raw, int(r["id"])))
+            delta = old_count - new_count
+            if delta != 0:
+                affected_bvids_by_uid.setdefault(r["uid"], set()).add(r["bvid"])
+            pulse_events_by_uid.setdefault(r["uid"], []).append(
+                (int(r["collected_at_ts"]), int(r["id"]), r["bvid"], delta)
+            )
+
+        if already_minus_one:
             video_rows = conn.execute(
-                "SELECT bvid, last_online_count, last_online_raw, last_checked_at FROM videos"
+                """
+                SELECT bvid, last_online_count, last_online_raw, last_checked_at
+                FROM videos
+                WHERE last_online_raw LIKE '%+%'
+                """
             ).fetchall()
-            for r in video_rows:
-                if r["last_checked_at"] is None and not r["last_online_raw"] and r["last_online_count"] == 0:
-                    continue
-                adjusted = _adjusted_online_from_raw(r["last_online_raw"], r["last_online_count"])
-                conn.execute(
-                    "UPDATE videos SET last_online_count = ? WHERE bvid = ?",
-                    (adjusted, r["bvid"]),
-                )
+        else:
+            video_rows = conn.execute(
+                """
+                SELECT bvid, last_online_count, last_online_raw, last_checked_at
+                FROM videos
+                """
+            ).fetchall()
 
-            conn.execute(
-                """
-                UPDATE account_snapshots
-                SET online_viewers_total = (
-                    SELECT COALESCE(SUM(v.online_count), 0)
-                    FROM video_online_snapshots v
-                    WHERE v.snapshot_id = account_snapshots.id
-                )
-                WHERE EXISTS (
-                    SELECT 1 FROM video_online_snapshots v
-                    WHERE v.snapshot_id = account_snapshots.id
-                )
-                """
+        vid_updates: list[tuple[int, str, str]] = []
+        for r in video_rows:
+            raw_text = r["last_online_raw"] or ""
+            old_count = int(r["last_online_count"] or 0)
+            if r["last_checked_at"] is None and not raw_text and old_count == 0:
+                continue
+            if already_minus_one and len(_split_legacy_online_raw(raw_text)) <= 1:
+                continue
+            new_count, new_raw = _adjusted_online_from_raw(
+                raw_text, old_count, already_minus_one=already_minus_one
+            )
+            if new_count != old_count or new_raw != raw_text:
+                vid_updates.append((new_count, new_raw, r["bvid"]))
+
+        # Recompute account_snapshots.online_viewers_total before mutating video_online_snapshots
+        # so historical tiered carryover (old_total - old_sum_polled) is adjusted accurately.
+        acc_updates: list[tuple[int, int]] = []
+        if affected_bvids_by_uid:
+            existing_bvids = {
+                r["bvid"] for r in conn.execute("SELECT bvid FROM videos").fetchall()
+            }
+            for uid, aff_bvids in affected_bvids_by_uid.items():
+                snaps = conn.execute(
+                    """
+                    SELECT s.id, s.collected_at_ts, s.online_viewers_total,
+                           (SELECT COALESCE(SUM(v.online_count), 0)
+                            FROM video_online_snapshots v
+                            WHERE v.snapshot_id = s.id) AS old_sum
+                    FROM account_snapshots s
+                    WHERE s.uid = ? AND s.online_viewers_total IS NOT NULL
+                    ORDER BY s.collected_at_ts ASC, s.id ASC
+                    """,
+                    (uid,),
+                ).fetchall()
+                if not snaps:
+                    continue
+
+                aff_list = sorted(aff_bvids)
+                pulses = list(pulse_events_by_uid.get(uid, []))
+                max_seen_ts: dict[str, int] = {}
+                for ts_val, _pid, pbvid, _pdelta in pulses:
+                    if ts_val > max_seen_ts.get(pbvid, 0):
+                        max_seen_ts[pbvid] = ts_val
+
+                for i in range(0, len(aff_list), _SQLITE_CHUNK_SIZE):
+                    chunk = aff_list[i : i + _SQLITE_CHUNK_SIZE]
+                    placeholders = ",".join("?" for _ in chunk)
+                    for r in conn.execute(
+                        f"""
+                        SELECT v.snapshot_id, v.bvid, s.collected_at_ts
+                        FROM video_online_snapshots v
+                        JOIN account_snapshots s ON s.id = v.snapshot_id
+                        WHERE s.uid = ? AND v.bvid IN ({placeholders})
+                        """,
+                        [uid, *chunk],
+                    ).fetchall():
+                        snap_polled_deltas.setdefault(int(r["snapshot_id"]), {}).setdefault(
+                            r["bvid"], 0
+                        )
+                        sts_val = int(r["collected_at_ts"])
+                        if sts_val > max_seen_ts.get(r["bvid"], 0):
+                            max_seen_ts[r["bvid"]] = sts_val
+
+                    if already_minus_one:
+                        for r in conn.execute(
+                            f"""
+                            SELECT id, bvid, collected_at_ts, online_raw
+                            FROM video_pulse_snapshots
+                            WHERE uid = ? AND bvid IN ({placeholders})
+                            """,
+                            [uid, *chunk],
+                        ).fetchall():
+                            if len(_split_legacy_online_raw(r["online_raw"] or "")) <= 1:
+                                pts_val = int(r["collected_at_ts"])
+                                pulses.append((pts_val, int(r["id"]), r["bvid"], 0))
+                                if pts_val > max_seen_ts.get(r["bvid"], 0):
+                                    max_seen_ts[r["bvid"]] = pts_val
+
+                pulses.sort(key=lambda item: (item[0], item[1]))
+                latest_delta: dict[str, int] = {}
+                p_idx = 0
+                for s in snaps:
+                    sid = int(s["id"])
+                    sts = int(s["collected_at_ts"])
+                    while p_idx < len(pulses) and pulses[p_idx][0] <= sts:
+                        _, _, pbvid, pdelta = pulses[p_idx]
+                        latest_delta[pbvid] = pdelta
+                        p_idx += 1
+
+                    old_total = int(s["online_viewers_total"])
+                    old_sum = int(s["old_sum"])
+                    polled_map = snap_polled_deltas.get(sid, {})
+                    polled_delta = snap_polled_delta_totals.get(sid, 0)
+                    old_carryover = max(0, old_total - old_sum)
+                    unpolled_delta = 0
+                    if old_carryover > 0:
+                        raw_unpolled = sum(
+                            d
+                            for b, d in latest_delta.items()
+                            if b not in polled_map
+                            and d > 0
+                            and (b in existing_bvids or sts <= max_seen_ts.get(b, 0))
+                        )
+                        unpolled_delta = min(old_carryover, raw_unpolled)
+                    new_total = max(0, old_total - polled_delta - unpolled_delta)
+                    for b, d in polled_map.items():
+                        latest_delta[b] = d
+                    if new_total != old_total:
+                        acc_updates.append((new_total, sid))
+
+        if vos_updates:
+            conn.executemany(
+                "UPDATE video_online_snapshots SET online_count = ?, online_raw = ? WHERE id = ?",
+                vos_updates,
+            )
+        if vps_updates:
+            conn.executemany(
+                "UPDATE video_pulse_snapshots SET online_count = ?, online_raw = ? WHERE id = ?",
+                vps_updates,
+            )
+        if vid_updates:
+            conn.executemany(
+                "UPDATE videos SET last_online_count = ?, last_online_raw = ? WHERE bvid = ?",
+                vid_updates,
+            )
+        if acc_updates:
+            conn.executemany(
+                "UPDATE account_snapshots SET online_viewers_total = ? WHERE id = ?",
+                acc_updates,
             )
 
         conn.execute(

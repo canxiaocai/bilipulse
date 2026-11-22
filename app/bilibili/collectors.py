@@ -13,7 +13,7 @@ from app.events import LiveEventBus
 logger = logging.getLogger(__name__)
 
 VIDEO_SYNC_RULE = "owner_only_v2"
-ONLINE_COUNT_RULE = "minus_1_per_cid_v1"
+ONLINE_COUNT_RULE = "single_cid_minus_1_v2"
 
 # Adaptive 5-tier video scheduling levels (lower = higher priority)
 TIER_FAST = 0      # T0: newly published (<=24h), high online (>=3), or surging play velocity
@@ -402,7 +402,7 @@ def select_stats_refresh_bvids(
 
 
 def adjust_online_count(raw_count: int) -> int:
-    """Subtract 1 baseline viewer reported by Bilibili /x/player/online/total per CID."""
+    """Subtract 1 baseline viewer reported by Bilibili /x/player/online/total for a video."""
     return max(0, int(raw_count) - 1)
 
 
@@ -502,19 +502,21 @@ async def _fetch_video_batch(
             if not cids:
                 return None
 
-            video_online = 0
-            raw_parts: list[str] = []
-            succeeded_parts = 0
+            # Bilibili /x/player/online/total returns whole-video (BV-level) concurrent viewers
+            # in `data.total` across all parts, so query the first CID and only fall back to
+            # subsequent CIDs if an earlier CID fails.
+            video_online: Optional[int] = None
+            online_raw = ""
             hit_missing_code = False
             for part in cids:
                 if local_abort.is_set():
                     return None
                 try:
                     count, raw = await client.get_video_online_total(bvid, int(part["cid"]))
-                    video_online += adjust_online_count(count)
-                    raw_parts.append(raw)
-                    succeeded_parts += 1
+                    video_online = adjust_online_count(count)
+                    online_raw = raw
                     await asyncio.sleep(delay_sec)
+                    break
                 except BilibiliAPIError as exc:
                     errors.append(f"{bvid}(cid={part['cid']}) 在线人数失败: {exc}")
                     if exc.code == 412:
@@ -527,12 +529,10 @@ async def _fetch_video_batch(
                     errors.append(f"{bvid}(cid={part['cid']}) 在线人数失败: {exc}")
                     continue
 
-            if succeeded_parts == 0:
+            if video_online is None:
                 if hit_missing_code:
                     online_backoff_bvids.append(bvid)
                 return None
-
-            online_raw = raw_parts[0] if len(raw_parts) == 1 else "+".join(raw_parts)
             raw_like = video.get("like_count")
             has_like_stat = bool(video.get("stats_synced_at")) or (
                 raw_like is not None and int(raw_like) > 0

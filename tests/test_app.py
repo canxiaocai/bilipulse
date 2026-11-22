@@ -130,8 +130,11 @@ def test_crawl_service_sums_all_videos(tmp_path: Path):
             return [{"cid": 101, "page": 1, "part": "P1"}]
         return [{"cid": 201, "page": 1, "part": "P1"}, {"cid": 202, "page": 2, "part": "P2"}]
 
+    polled_cids: list[int] = []
+
     async def fake_online(bvid: str, cid: int):
-        mapping = {101: (12, "12"), 201: (8, "8"), 202: (5, "5")}
+        polled_cids.append(cid)
+        mapping = {101: (12, "12"), 201: (8, "8"), 202: (8, "8")}
         return mapping[cid]
 
     fake_client.get_video_cids.side_effect = fake_cids
@@ -144,14 +147,16 @@ def test_crawl_service_sums_all_videos(tmp_path: Path):
     assert result["skipped"] is False
     assert result["status"] == "success"
     assert result["follower_count"] == 54321
-    assert result["online_viewers_total"] == 22  # (12 - 1) + (8 - 1) + (5 - 1)
+    assert result["online_viewers_total"] == 18  # (12 - 1) + (8 - 1); multi-part BV1B counted once
     assert result["video_count"] == 2
     assert result["videos_succeeded"] == 2
+    assert 202 not in polled_cids  # P2 is not re-queried when P1 succeeds
     videos = {v["bvid"]: v for v in db.get_videos("123456")}
     assert videos["BV1A"]["last_online_count"] == 11
     assert videos["BV1A"]["last_online_raw"] == "12"
-    assert videos["BV1B"]["last_online_count"] == 11
-    assert videos["BV1B"]["last_online_raw"] == "8+5"
+    assert videos["BV1B"]["last_online_count"] == 7
+    assert videos["BV1B"]["last_online_raw"] == "8"
+    assert videos["BV1B"]["cid_count"] == 2
 
     pub = db.get_public_settings()
     assert pub["account_name"] == "测试UP主"
@@ -617,8 +622,11 @@ def test_online_count_subtracts_one_per_cid_and_clamps_to_zero(tmp_path: Path):
         "archive_count": 3,
     }
 
+    polled_cids: list[int] = []
+
     async def fake_online(bvid: str, cid: int):
-        mapping = {1: (0, "0"), 2: (1, "1"), 3: (1, "1"), 4: (3, "3")}
+        polled_cids.append(cid)
+        mapping = {1: (0, "0"), 2: (1, "1"), 3: (3, "3"), 4: (3, "3")}
         return mapping[cid]
 
     fake_client.get_video_online_total.side_effect = fake_online
@@ -628,12 +636,13 @@ def test_online_count_subtracts_one_per_cid_and_clamps_to_zero(tmp_path: Path):
         result = asyncio.run(service.run_crawl(force_sync_videos=False))
 
     assert result["status"] == "success"
-    assert result["online_viewers_total"] == 2  # 0 + 0 + (0 + 2)
+    assert result["online_viewers_total"] == 2  # 0 + 0 + (3 - 1)
+    assert 4 not in polled_cids
     videos = {v["bvid"]: v for v in db.get_videos("123456")}
     assert videos["BV1zero"]["last_online_count"] == 0
     assert videos["BV1one"]["last_online_count"] == 0
     assert videos["BV1multi"]["last_online_count"] == 2
-    assert videos["BV1multi"]["last_online_raw"] == "1+3"
+    assert videos["BV1multi"]["last_online_raw"] == "3"
 
 
 def test_database_migrates_legacy_online_counts_once(tmp_path: Path):
@@ -677,21 +686,23 @@ def test_database_migrates_legacy_online_counts_once(tmp_path: Path):
     migrated = Database(db_path=db_path)
     latest, _ = migrated.get_latest_two_snapshots("123")
     assert latest is not None
-    assert latest["online_viewers_total"] == 11  # (1-1) + (8-1) + (5-1)
+    assert latest["online_viewers_total"] == 7  # (1-1) + (8-1); multi-CID collapsed to whole-video count
     videos = {v["bvid"]: v for v in migrated.get_videos("123")}
     assert videos["BV1A"]["last_online_count"] == 0
-    assert videos["BV1B"]["last_online_count"] == 11
+    assert videos["BV1B"]["last_online_count"] == 7
+    assert videos["BV1B"]["last_online_raw"] == "8"
     assert migrated.get_video_history("BV1A")[0]["online_count"] == 0
-    assert migrated.get_video_history("BV1B")[0]["online_count"] == 11
+    assert migrated.get_video_history("BV1B")[0]["online_count"] == 7
+    assert migrated.get_video_history("BV1B")[0]["online_raw"] == "8"
 
     # Re-initializing again must be idempotent (must NOT subtract a second time)
     migrated_again = Database(db_path=db_path)
     latest2, _ = migrated_again.get_latest_two_snapshots("123")
     assert latest2 is not None
-    assert latest2["online_viewers_total"] == 11
+    assert latest2["online_viewers_total"] == 7
     with sqlite3.connect(db_path) as raw_conn:
         row = raw_conn.execute("SELECT value FROM settings WHERE key = 'online_count_rule'").fetchone()
-        assert row is not None and row[0] == "minus_1_per_cid_v1"
+        assert row is not None and row[0] == "single_cid_minus_1_v2"
 
 
 def test_video_history_records_play_count_and_migrates_legacy_schema(tmp_path: Path):
@@ -2374,13 +2385,16 @@ def test_collector_multi_cid_partial_fault_tolerance_and_412_circuit_breaker(tmp
         "archive_count": 2,
     }
 
+    polled_partial_cids: list[int] = []
+
     async def fake_online_partial(bvid: str, cid: int):
+        polled_partial_cids.append(cid)
         if cid == 101:
-            return (11, "11")  # adjusted -> 10
+            raise BilibiliAPIError("cid 101 timeout", code=-504)
         if cid == 102:
-            raise BilibiliAPIError("cid 102 timeout", code=-504)
+            return (11, "11")  # fallback succeeds -> adjusted 10; P3 (103) must NOT be called
         if cid == 103:
-            return (6, "6")  # adjusted -> 5
+            return (11, "11")
         raise BilibiliAPIError("cid unavailable", code=-404)
 
     fake_partial_client.get_video_online_total.side_effect = fake_online_partial
@@ -2391,11 +2405,12 @@ def test_collector_multi_cid_partial_fault_tolerance_and_412_circuit_breaker(tmp
     assert res_partial["status"] == "partial"
     assert res_partial["video_count"] == 2
     assert res_partial["videos_succeeded"] == 1
-    assert res_partial["online_viewers_total"] == 15  # 10 + 5
-    assert "BV1multi(cid=102)" in (res_partial["error_message"] or "")
+    assert res_partial["online_viewers_total"] == 10
+    assert "BV1multi(cid=101)" in (res_partial["error_message"] or "")
+    assert 103 not in polled_partial_cids
     vids_partial = {v["bvid"]: v for v in db_partial.get_videos(uid_partial)}
-    assert vids_partial["BV1multi"]["last_online_count"] == 15
-    assert vids_partial["BV1multi"]["last_online_raw"] == "11+6"
+    assert vids_partial["BV1multi"]["last_online_count"] == 10
+    assert vids_partial["BV1multi"]["last_online_raw"] == "11"
 
     # 2) HTTP 412 circuit breaker: immediately halts remaining CIDs and unstarted videos
     uid_412 = "999000"
@@ -4746,6 +4761,165 @@ def test_account_switch_fast_dashboard_and_non_invalidating_activate(tmp_path: P
         after_resp = client.get("/api/dashboard?hours=24&uid=60001&max_points=24&video_limit=5")
         assert after_resp.status_code == 200
         assert int(after_resp.headers["x-data-revision"]) == rev_before
+
+
+def test_database_migrates_v1_multi_cid_online_counts_with_pulses_and_tiered_carryover(
+    tmp_path: Path,
+):
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+    from app.database import _adjusted_online_from_raw, _split_legacy_online_raw
+
+    # 1) Legacy raw parser handles normal, trailing '+', and multi-part '++' formats
+    assert _split_legacy_online_raw("12") == ["12"]
+    assert _split_legacy_online_raw("1000+") == ["1000+"]
+    assert _split_legacy_online_raw("307+294+298+301") == ["307", "294", "298", "301"]
+    assert _split_legacy_online_raw("1000++1000+") == ["1000+", "1000+"]
+    assert _split_legacy_online_raw("1000++999") == ["1000+", "999"]
+    assert _split_legacy_online_raw("999+1000+") == ["999", "1000+"]
+    assert _adjusted_online_from_raw("1000+", 999, already_minus_one=True) == (999, "1000+")
+    assert _adjusted_online_from_raw("1000++1000+", 1998, already_minus_one=True) == (999, "1000+")
+    assert _adjusted_online_from_raw("307+294+298+301", 1196, already_minus_one=True) == (306, "307")
+
+    # 2) Simulate a v1 (minus_1_per_cid_v1) database with multi-part videos, pulses, and tiered carryover
+    db_path = tmp_path / "v1_to_v2.db"
+    db = Database(db_path=db_path)
+    uid = "344932644"
+    db.create_account(uid=uid, account_name="Suanli")
+    db.upsert_videos(
+        uid,
+        [
+            {
+                "bvid": "BV_single",
+                "aid": 1,
+                "title": "Single Part",
+                "cids": [{"cid": 101, "page": 1, "part": "P1"}],
+            },
+            {
+                "bvid": "BV_single_plus",
+                "aid": 2,
+                "title": "Single Part 1000+",
+                "cids": [{"cid": 102, "page": 1, "part": "P1"}],
+            },
+            {
+                "bvid": "BV_multi4",
+                "aid": 3,
+                "title": "Four Part Match",
+                "cids": [
+                    {"cid": 201, "page": 1, "part": "P1"},
+                    {"cid": 202, "page": 2, "part": "P2"},
+                    {"cid": 203, "page": 3, "part": "P3"},
+                    {"cid": 204, "page": 4, "part": "P4"},
+                ],
+            },
+            {
+                "bvid": "BV_multi_zero",
+                "aid": 4,
+                "title": "Dormant Multi Part",
+                "cids": [
+                    {"cid": 301, "page": 1, "part": "P1"},
+                    {"cid": 302, "page": 2, "part": "P2"},
+                ],
+            },
+        ],
+    )
+
+    t0 = datetime(2026, 11, 22, 18, 0, 0, tzinfo=timezone(timedelta(hours=8)))
+    # Snapshot 1 (non-tiered): polls all 4 videos
+    # BV_single=10 ("11"), BV_single_plus=999 ("1000+"), BV_multi4=1196 ("307+294+298+301"), BV_multi_zero=0 ("1+1")
+    # Old total = 10 + 999 + 1196 + 0 = 2205; true total = 10 + 999 + 306 + 0 = 1315
+    snap1 = db.insert_snapshot(
+        uid=uid,
+        follower_count=10000,
+        following_count=5,
+        online_viewers_total=2205,
+        video_count=4,
+        videos_succeeded=4,
+        extra_metrics={"tiered_polling": False},
+        status="success",
+        error_message=None,
+        duration_ms=200,
+        video_online_items=[
+            {"bvid": "BV_single", "online_count": 10, "online_raw": "11"},
+            {"bvid": "BV_single_plus", "online_count": 999, "online_raw": "1000+"},
+            {"bvid": "BV_multi4", "online_count": 1196, "online_raw": "307+294+298+301"},
+            {"bvid": "BV_multi_zero", "online_count": 0, "online_raw": "1+1"},
+        ],
+        collected_at=t0,
+    )
+
+    # Fast pulse at t0 + 2m: polls BV_multi4 with 4 parts returning "201+201+201+201" (old=800, true=200, delta=600)
+    db.insert_video_pulse(
+        uid=uid,
+        video_online_items=[
+            {"bvid": "BV_multi4", "online_count": 800, "online_raw": "201+201+201+201"},
+        ],
+        collected_at=t0 + timedelta(minutes=2),
+    )
+
+    # Snapshot 2 (tiered): only polls BV_single=15 ("16"); carries over BV_single_plus=999 and BV_multi4=800
+    # Old total = 15 + 999 + 800 = 1814; true total = 15 + 999 + 200 = 1214
+    snap2 = db.insert_snapshot(
+        uid=uid,
+        follower_count=10010,
+        following_count=5,
+        online_viewers_total=1814,
+        video_count=4,
+        videos_succeeded=1,
+        extra_metrics={"tiered_polling": True},
+        status="success",
+        error_message=None,
+        duration_ms=120,
+        video_online_items=[
+            {"bvid": "BV_single", "online_count": 15, "online_raw": "16"},
+        ],
+        collected_at=t0 + timedelta(minutes=5),
+    )
+
+    # Set rule back to v1 to trigger the v1 -> v2 migration
+    with db.connection() as conn:
+        conn.execute(
+            "UPDATE settings SET value = 'minus_1_per_cid_v1' WHERE key = 'online_count_rule'"
+        )
+
+    migrated = Database(db_path=db_path)
+
+    # Check account_snapshots
+    snaps = {s["id"]: s for s in migrated.get_snapshots(uid, since_hours=None)}
+    assert snaps[snap1]["online_viewers_total"] == 1315
+    assert snaps[snap2]["online_viewers_total"] == 1214
+
+    # Check videos table
+    vids = {v["bvid"]: v for v in migrated.get_videos(uid)}
+    assert vids["BV_single"]["last_online_count"] == 15
+    assert vids["BV_single"]["last_online_raw"] == "16"
+    assert vids["BV_single_plus"]["last_online_count"] == 999
+    assert vids["BV_single_plus"]["last_online_raw"] == "1000+"
+    assert vids["BV_multi4"]["last_online_count"] == 200
+    assert vids["BV_multi4"]["last_online_raw"] == "201"
+    assert vids["BV_multi_zero"]["last_online_count"] == 0
+    assert vids["BV_multi_zero"]["last_online_raw"] == "1"
+
+    # Check merged video history (video_online_snapshots + video_pulse_snapshots)
+    multi_hist = migrated.get_video_history("BV_multi4", limit=10)
+    assert [(h["online_count"], h["online_raw"]) for h in multi_hist] == [
+        (306, "307"),
+        (200, "201"),
+    ]
+    plus_hist = migrated.get_video_history("BV_single_plus", limit=10)
+    assert [(h["online_count"], h["online_raw"]) for h in plus_hist] == [(999, "1000+")]
+
+    # Re-initializing must be idempotent
+    migrated_again = Database(db_path=db_path)
+    snaps2 = {s["id"]: s for s in migrated_again.get_snapshots(uid, since_hours=None)}
+    assert snaps2[snap1]["online_viewers_total"] == 1315
+    assert snaps2[snap2]["online_viewers_total"] == 1214
+    with sqlite3.connect(db_path) as raw_conn:
+        row = raw_conn.execute(
+            "SELECT value FROM settings WHERE key = 'online_count_rule'"
+        ).fetchone()
+        assert row is not None and row[0] == "single_cid_minus_1_v2"
+
 
 
 
