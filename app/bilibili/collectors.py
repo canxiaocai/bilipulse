@@ -331,8 +331,9 @@ def select_stats_refresh_bvids(
         pubdate_val = int(v.get("pubdate") or 0)
         play_rate = float(v.get("play_rate_per_hour") or 0.0)
         synced_ts = _parse_iso_ts(v.get("stats_synced_at"))
+        needs_zone_backfill = v.get("zone_synced") == 0
 
-        if synced_ts is None:
+        if synced_ts is None or needs_zone_backfill:
             if tier <= TIER_ACTIVE or in_showcase:
                 unsynced_priority.append(v)
             else:
@@ -451,9 +452,16 @@ async def _fetch_video_batch(
                         )
                         like_val = max(0, int(stat["like_count"]))
                         coin_val = max(0, int(stat["coin_count"]))
+                        tid_val = max(0, int(stat.get("tid") or 0))
+                        tid_v2_val = max(0, int(stat.get("tid_v2") or 0))
                         video["play_count"] = max(int(video.get("play_count") or 0), play_val)
                         video["like_count"] = like_val
                         video["coin_count"] = coin_val
+                        if tid_val > 0:
+                            video["tid"] = tid_val
+                        if tid_v2_val > 0:
+                            video["tid_v2"] = tid_v2_val
+                        video["zone_synced"] = 1
                         video["stats_synced_at"] = "synced"
                         stat_updates.append(
                             {
@@ -461,6 +469,8 @@ async def _fetch_video_batch(
                                 "play_count": video["play_count"],
                                 "like_count": like_val,
                                 "coin_count": coin_val,
+                                "tid": tid_val,
+                                "tid_v2": tid_v2_val,
                             }
                         )
                         view_cids = stat.get("cids")

@@ -4981,6 +4981,216 @@ def test_dashboard_defaults_to_first_sorted_account_and_falls_back_on_stale_uid(
         assert client.get("/api/crawl-logs?uid=999999999").json()["uid"] == "20002"
 
 
+def test_video_v2_zones_resolution_client_db_backfill_and_api(tmp_path: Path):
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+    from app.bilibili.collectors import select_stats_refresh_bvids
+    from app.bilibili.zones import (
+        _DYNAMIC_V2_PRIMARY,
+        _DYNAMIC_V2_SUB,
+        merge_channel_kv,
+        resolve_video_zone,
+    )
+
+    # 1) Static V2 resolution, V1 fallback, and dynamic channelKv merging
+    assert resolve_video_zone(tid=24, tid_v2=2037) == {
+        "zone_primary": "动画",
+        "zone_sub": "同人动画",
+        "zone_version": "v2",
+    }
+    assert resolve_video_zone(tid=24, tid_v2=2023) == {
+        "zone_primary": "音乐",
+        "zone_sub": "AI音乐",
+        "zone_version": "v2",
+    }
+    assert resolve_video_zone(tid=24, tid_v2=1005) == {
+        "zone_primary": "动画",
+        "zone_sub": "",
+        "zone_version": "v2",
+    }
+    assert resolve_video_zone(tid=22, tid_v2=0) == {
+        "zone_primary": "鬼畜",
+        "zone_sub": "鬼畜调教",
+        "zone_version": "v1",
+    }
+    assert resolve_video_zone(tid=22, tid_v2=999999) == {
+        "zone_primary": "鬼畜",
+        "zone_sub": "鬼畜调教",
+        "zone_version": "v1",
+    }
+    assert resolve_video_zone(tid=0, tid_v2=0) == {
+        "zone_primary": "",
+        "zone_sub": "",
+        "zone_version": "",
+    }
+
+    try:
+        added = merge_channel_kv(
+            [
+                {
+                    "tid": 1099,
+                    "name": "实验分区",
+                    "sub": [{"tid": 2999, "name": "实验子区"}],
+                }
+            ]
+        )
+        assert added >= 2
+        assert resolve_video_zone(tid=21, tid_v2=2999) == {
+            "zone_primary": "实验分区",
+            "zone_sub": "实验子区",
+            "zone_version": "v2",
+        }
+    finally:
+        _DYNAMIC_V2_PRIMARY.pop(1099, None)
+        _DYNAMIC_V2_SUB.pop(2999, None)
+
+    # 2) BilibiliClient.get_video_stat parses tid and tid_v2 even when tname/tname_v2 are empty
+    async def _check_client():
+        async with BilibiliClient() as client:
+            with patch.object(
+                client,
+                "_request_json",
+                new=AsyncMock(
+                    return_value={
+                        "code": 0,
+                        "data": {
+                            "tid": 24,
+                            "tname": "",
+                            "tid_v2": 2037,
+                            "tname_v2": "",
+                            "stat": {"view": 5000, "like": 400, "coin": 80},
+                            "pages": [{"cid": 7788, "page": 1, "part": "P1"}],
+                        },
+                    }
+                ),
+            ):
+                stat = await client.get_video_stat("BV1zone")
+                assert stat["tid"] == 24
+                assert stat["tid_v2"] == 2037
+                assert stat["play_count"] == 5000
+
+    asyncio.run(_check_client())
+
+    # 3) Legacy DB migration adds tid/tid_v2/zone_synced=0 so existing videos backfill once
+    legacy_path = tmp_path / "legacy_zones.db"
+    now_dt = datetime.now(timezone.utc).astimezone()
+    now_ts = int(now_dt.timestamp())
+    old_pub = now_ts - 60 * 86400
+    recent_iso = (now_dt - timedelta(minutes=10)).isoformat()
+
+    conn = sqlite3.connect(str(legacy_path))
+    conn.executescript(
+        """
+        CREATE TABLE videos (
+            bvid TEXT PRIMARY KEY,
+            uid TEXT NOT NULL,
+            aid INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            pic TEXT NOT NULL DEFAULT '',
+            pubdate INTEGER NOT NULL DEFAULT 0,
+            duration INTEGER NOT NULL DEFAULT 0,
+            play_count INTEGER NOT NULL DEFAULT 0,
+            like_count INTEGER NOT NULL DEFAULT 0,
+            coin_count INTEGER NOT NULL DEFAULT 0,
+            stats_synced_at TEXT,
+            stats_play_count INTEGER,
+            stats_backoff_until_ts INTEGER NOT NULL DEFAULT 0,
+            cids_json TEXT NOT NULL DEFAULT '[]',
+            last_online_count INTEGER NOT NULL DEFAULT 0,
+            last_online_raw TEXT NOT NULL DEFAULT '',
+            last_checked_at TEXT,
+            hot_until_ts INTEGER NOT NULL DEFAULT 0,
+            fast_until_ts INTEGER NOT NULL DEFAULT 0,
+            zero_online_streak INTEGER NOT NULL DEFAULT 0,
+            play_rate_per_hour REAL NOT NULL DEFAULT 0.0,
+            last_play_ts INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO videos (
+            bvid, uid, aid, title, pubdate, duration, play_count,
+            like_count, coin_count, stats_synced_at, stats_play_count,
+            cids_json, last_online_count, last_checked_at, zero_online_streak, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "BV1legacyZ",
+            "555666",
+            999,
+            "Legacy Video",
+            old_pub,
+            180,
+            25000,
+            1200,
+            300,
+            recent_iso,
+            25000,
+            '[{"cid": 1001, "page": 1, "part": "P1"}]',
+            0,
+            recent_iso,
+            8,
+            recent_iso,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(db_path=legacy_path)
+    db.create_account("555666", account_name="ZoneUP", enabled=True, set_active=True)
+    vids_before = db.get_videos("555666")
+    assert len(vids_before) == 1
+    assert vids_before[0]["zone_synced"] == 0
+    assert vids_before[0]["zone_primary"] == ""
+    assert vids_before[0]["zone_sub"] == ""
+
+    # Migrated row should be scheduled for one-time stats/zone backfill
+    due_before = select_stats_refresh_bvids(vids_before, set(), now_ts, quota=10)
+    assert due_before == ["BV1legacyZ"]
+
+    # After stats refresh writes tid/tid_v2, zone_synced flips to 1 and stops backfilling
+    db.update_video_stats_batch(
+        [
+            {
+                "bvid": "BV1legacyZ",
+                "play_count": 25000,
+                "like_count": 1200,
+                "coin_count": 300,
+                "tid": 24,
+                "tid_v2": 2037,
+            }
+        ],
+        now_ts=now_ts,
+    )
+    vids_after = db.get_videos("555666")
+    assert vids_after[0]["zone_synced"] == 1
+    assert vids_after[0]["tid"] == 24
+    assert vids_after[0]["tid_v2"] == 2037
+    assert vids_after[0]["zone_primary"] == "动画"
+    assert vids_after[0]["zone_sub"] == "同人动画"
+    assert vids_after[0]["zone_version"] == "v2"
+    assert select_stats_refresh_bvids(vids_after, set(), now_ts, quota=10) == []
+
+    # 4) Dashboard & videos API expose zone_primary, zone_sub, zone_version
+    app = create_app(database=db, enable_scheduler=False)
+    with TestClient(app) as client:
+        dash = client.get("/api/dashboard?hours=24&uid=555666").json()
+        assert len(dash["top_videos"]) == 1
+        tv = dash["top_videos"][0]
+        assert tv["tid"] == 24
+        assert tv["tid_v2"] == 2037
+        assert tv["zone_primary"] == "动画"
+        assert tv["zone_sub"] == "同人动画"
+        assert tv["zone_version"] == "v2"
+
+        vids_resp = client.get("/api/videos?uid=555666&lightweight=true").json()
+        assert vids_resp["videos"][0]["zone_primary"] == "动画"
+        assert vids_resp["videos"][0]["zone_sub"] == "同人动画"
+
+
+
 
 
 

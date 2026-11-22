@@ -1581,7 +1581,69 @@ img.rank-thumb {
   min-inline-size: 0;
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: 5px;
+}
+
+.rank-zones {
+  display: flex;
+  align-items: center;
+  min-inline-size: 0;
+  max-inline-size: 100%;
+}
+
+.rank-zones.hidden {
+  display: none;
+}
+
+.rank-zone-badge {
+  display: inline-flex;
+  align-items: stretch;
+  min-inline-size: 0;
+  max-inline-size: 100%;
+  border: 1px solid var(--line-grid);
+  background: var(--bg-void);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.rank-zone-primary {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  background: var(--sig-violet-dim);
+  color: var(--sig-violet);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.rank-zone-sub {
+  flex: 0 1 auto;
+  min-inline-size: 0;
+  padding: 1px 7px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rank-zone-badge.has-both .rank-zone-sub {
+  border-inline-start: 1px solid var(--line-grid);
+}
+
+.rank-zone-primary.hidden,
+.rank-zone-sub.hidden {
+  display: none;
+}
+
+@media (forced-colors: active) {
+  .rank-zone-badge,
+  .rank-zone-badge.has-both .rank-zone-sub {
+    border-color: CanvasText;
+  }
+
+  .rank-zone-primary {
+    background: Canvas;
+    color: CanvasText;
+  }
 }
 
 .rank-side-metrics {

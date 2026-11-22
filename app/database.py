@@ -9,6 +9,7 @@ from typing import Any, Iterator, Optional
 
 from app.auth import hash_password
 from app.bilibili.client import parse_online_count
+from app.bilibili.zones import resolve_video_zone
 from app.config import DB_PATH, DEFAULT_SETTINGS, get_default_admin_password
 
 ONLINE_COUNT_RULE = "single_cid_minus_1_v2"
@@ -383,6 +384,9 @@ class Database:
                     play_count_7d_locked INTEGER NOT NULL DEFAULT 0,
                     like_count INTEGER NOT NULL DEFAULT 0,
                     coin_count INTEGER NOT NULL DEFAULT 0,
+                    tid INTEGER NOT NULL DEFAULT 0,
+                    tid_v2 INTEGER NOT NULL DEFAULT 0,
+                    zone_synced INTEGER NOT NULL DEFAULT 1,
                     stats_synced_at TEXT,
                     stats_play_count INTEGER,
                     stats_backoff_until_ts INTEGER NOT NULL DEFAULT 0,
@@ -512,6 +516,12 @@ class Database:
                 conn.execute(
                     "ALTER TABLE videos ADD COLUMN play_count_7d_locked INTEGER NOT NULL DEFAULT 0"
                 )
+            if "tid" not in video_cols:
+                conn.execute("ALTER TABLE videos ADD COLUMN tid INTEGER NOT NULL DEFAULT 0")
+            if "tid_v2" not in video_cols:
+                conn.execute("ALTER TABLE videos ADD COLUMN tid_v2 INTEGER NOT NULL DEFAULT 0")
+            if "zone_synced" not in video_cols:
+                conn.execute("ALTER TABLE videos ADD COLUMN zone_synced INTEGER NOT NULL DEFAULT 0")
             video_snap_cols = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(video_online_snapshots)").fetchall()
@@ -1702,6 +1712,8 @@ class Database:
                     )
 
                 stats_play_val = eff_play if synced_val is not None else None
+                tid_val = max(0, int(v.get("tid") or 0))
+                tid_v2_val = max(0, int(v.get("tid_v2") or 0))
                 params.append(
                     (
                         v["bvid"],
@@ -1717,6 +1729,9 @@ class Database:
                         play_7d_locked,
                         like_val,
                         coin_val,
+                        tid_val,
+                        tid_v2_val,
+                        1,
                         synced_val,
                         stats_play_val,
                         json.dumps(v.get("cids", []), ensure_ascii=False),
@@ -1734,10 +1749,11 @@ class Database:
                 INSERT INTO videos (
                     bvid, uid, aid, title, pic, pubdate, duration, play_count,
                     play_count_7d, play_count_7d_ts, play_count_7d_locked,
-                    like_count, coin_count, stats_synced_at, stats_play_count, cids_json,
+                    like_count, coin_count, tid, tid_v2, zone_synced,
+                    stats_synced_at, stats_play_count, cids_json,
                     hot_until_ts, fast_until_ts, zero_online_streak, play_rate_per_hour,
                     last_play_ts, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(bvid) DO UPDATE SET
                     uid=excluded.uid,
                     aid=excluded.aid,
@@ -1768,6 +1784,18 @@ class Database:
                     coin_count=CASE
                         WHEN excluded.stats_synced_at IS NOT NULL THEN excluded.coin_count
                         ELSE videos.coin_count
+                    END,
+                    tid=CASE
+                        WHEN excluded.tid > 0 THEN excluded.tid
+                        ELSE videos.tid
+                    END,
+                    tid_v2=CASE
+                        WHEN excluded.tid_v2 > 0 THEN excluded.tid_v2
+                        ELSE videos.tid_v2
+                    END,
+                    zone_synced=CASE
+                        WHEN excluded.tid_v2 > 0 THEN 1
+                        ELSE videos.zone_synced
                     END,
                     stats_synced_at=COALESCE(excluded.stats_synced_at, videos.stats_synced_at),
                     stats_play_count=COALESCE(excluded.stats_play_count, videos.stats_play_count),
@@ -1859,6 +1887,8 @@ class Database:
                     play_7d_ts = 0
                     play_7d_locked = 0
 
+                tid_val = max(0, int(item.get("tid") or 0))
+                tid_v2_val = max(0, int(item.get("tid_v2") or 0))
                 params.append(
                     (
                         eff_play,
@@ -1867,6 +1897,10 @@ class Database:
                         play_7d_locked,
                         max(0, int(item["like_count"])),
                         max(0, int(item["coin_count"])),
+                        tid_val,
+                        tid_val,
+                        tid_v2_val,
+                        tid_v2_val,
                         now,
                         eff_play,
                         0,
@@ -1895,6 +1929,9 @@ class Database:
                     play_count_7d_locked = MAX(play_count_7d_locked, ?),
                     like_count = ?,
                     coin_count = ?,
+                    tid = CASE WHEN ? > 0 THEN ? ELSE tid END,
+                    tid_v2 = CASE WHEN ? > 0 THEN ? ELSE tid_v2 END,
+                    zone_synced = 1,
                     stats_synced_at = ?,
                     stats_play_count = ?,
                     stats_backoff_until_ts = ?,
@@ -1978,7 +2015,8 @@ class Database:
                 """
                 SELECT bvid, uid, aid, title, pic, pubdate, duration, play_count,
                        play_count_7d, play_count_7d_ts, play_count_7d_locked,
-                       like_count, coin_count, stats_synced_at, stats_play_count,
+                       like_count, coin_count, tid, tid_v2, zone_synced,
+                       stats_synced_at, stats_play_count,
                        stats_backoff_until_ts, cids_json, last_online_count,
                        last_online_raw, last_checked_at, hot_until_ts, fast_until_ts,
                        zero_online_streak, play_rate_per_hour, last_play_ts, updated_at
@@ -1991,6 +2029,9 @@ class Database:
         items = []
         for r in rows:
             cids = json.loads(r["cids_json"] or "[]")
+            tid_val = int(r["tid"] or 0)
+            tid_v2_val = int(r["tid_v2"] or 0)
+            zone = resolve_video_zone(tid_val, tid_v2_val)
             display_7d, status_7d = _resolve_video_play_count_7d_view(
                 pubdate=int(r["pubdate"] or 0),
                 play_count=int(r["play_count"] or 0),
@@ -2015,6 +2056,12 @@ class Database:
                     "play_count_7d_locked": bool(r["play_count_7d_locked"]),
                     "like_count": r["like_count"],
                     "coin_count": r["coin_count"],
+                    "tid": tid_val,
+                    "tid_v2": tid_v2_val,
+                    "zone_primary": zone["zone_primary"],
+                    "zone_sub": zone["zone_sub"],
+                    "zone_version": zone["zone_version"],
+                    "zone_synced": int(r["zone_synced"] if r["zone_synced"] is not None else 1),
                     "stats_synced_at": r["stats_synced_at"],
                     "stats_play_count": r["stats_play_count"],
                     "stats_backoff_until_ts": int(r["stats_backoff_until_ts"] or 0),
@@ -2045,7 +2092,7 @@ class Database:
         select_cols = """
             bvid, uid, aid, title, pic, pubdate, duration, play_count,
             play_count_7d, play_count_7d_ts, play_count_7d_locked,
-            like_count, coin_count, stats_synced_at,
+            like_count, coin_count, tid, tid_v2, stats_synced_at,
             CASE
                 WHEN json_valid(cids_json) THEN COALESCE(json_array_length(cids_json), 0)
                 ELSE 0
@@ -2101,6 +2148,9 @@ class Database:
 
         items: list[dict[str, Any]] = []
         for r in rows:
+            tid_val = int(r["tid"] or 0)
+            tid_v2_val = int(r["tid_v2"] or 0)
+            zone = resolve_video_zone(tid_val, tid_v2_val)
             display_7d, status_7d = _resolve_video_play_count_7d_view(
                 pubdate=int(r["pubdate"] or 0),
                 play_count=int(r["play_count"] or 0),
@@ -2123,6 +2173,11 @@ class Database:
                     "play_count_7d_status": status_7d,
                     "like_count": r["like_count"],
                     "coin_count": r["coin_count"],
+                    "tid": tid_val,
+                    "tid_v2": tid_v2_val,
+                    "zone_primary": zone["zone_primary"],
+                    "zone_sub": zone["zone_sub"],
+                    "zone_version": zone["zone_version"],
                     "stats_synced_at": r["stats_synced_at"],
                     "cid_count": max(1, int(r["cid_len"] or 0)),
                     "last_online_count": r["last_online_count"],

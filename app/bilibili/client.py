@@ -1,7 +1,9 @@
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
+import re
 import threading
 import time
 import urllib.parse
@@ -10,6 +12,8 @@ from functools import reduce
 from typing import Any, Optional
 
 import httpx
+
+from app.bilibili.zones import has_known_v2_tid, merge_channel_kv
 
 logger = logging.getLogger(__name__)
 
@@ -127,9 +131,15 @@ class BilibiliClient:
 
     SESSION_TOKEN_TTL: int = 21600
     WBI_KEYS_TTL: int = 3600
+    V2_ZONE_REFRESH_TTL: int = 86400
     MAX_CREDENTIAL_CACHE_SIZE: int = 64
     _CREDENTIAL_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
     _CACHE_LOCK: threading.Lock = threading.Lock()
+    _LAST_ZONE_REFRESH_AT: float = 0.0
+    _INITIAL_STATE_RE = re.compile(
+        r"window\.__INITIAL_STATE__\s*=\s*(\{.*?\});\s*\(function",
+        re.DOTALL,
+    )
 
     def __init__(self, cookie: str = "", timeout: float = 15.0) -> None:
         self.raw_cookie = cookie.strip()
@@ -444,18 +454,51 @@ class BilibiliClient:
             return None
         return str(owner_mid).strip()
 
+    async def refresh_v2_zones_if_needed(self, bvid: str) -> int:
+        """Best-effort refresh of Bilibili V2 channelKv partition map (throttled to once per 24h)."""
+        now = time.time()
+        with self._CACHE_LOCK:
+            if (now - type(self)._LAST_ZONE_REFRESH_AT) < self.V2_ZONE_REFRESH_TTL:
+                return 0
+            type(self)._LAST_ZONE_REFRESH_AT = now
+        try:
+            resp = await self._client.get(
+                f"https://www.bilibili.com/video/{bvid}/",
+                headers={"Referer": "https://www.bilibili.com/"},
+            )
+            if resp.status_code != 200:
+                return 0
+            match = self._INITIAL_STATE_RE.search(resp.text)
+            if not match:
+                return 0
+            state = json.loads(match.group(1))
+            channel_kv = state.get("channelKv")
+            if isinstance(channel_kv, list):
+                return merge_channel_kv(channel_kv)
+        except Exception as exc:
+            logger.debug("Failed to refresh Bilibili V2 channelKv from %s: %s", bvid, exc)
+        return 0
+
     async def get_video_stat(self, bvid: str) -> dict[str, Any]:
-        """Fetch play, like, and coin counts (plus CIDs if present) via /x/web-interface/view."""
+        """Fetch play, like, coin, partition IDs (and CIDs if present) via /x/web-interface/view."""
         payload = await self._fetch_video_view_data(bvid)
         stat = payload.get("stat") or {}
+        tid = _safe_nonneg_int(payload.get("tid"))
+        tid_v2 = _safe_nonneg_int(payload.get("tid_v2"))
         result: dict[str, Any] = {
             "play_count": _safe_nonneg_int(stat.get("view")),
             "like_count": _safe_nonneg_int(stat.get("like")),
             "coin_count": _safe_nonneg_int(stat.get("coin")),
         }
+        if tid > 0:
+            result["tid"] = tid
+        if tid_v2 > 0:
+            result["tid_v2"] = tid_v2
         cids = _extract_cids_from_pages(payload.get("pages"))
         if cids:
             result["cids"] = cids
+        if tid_v2 > 0 and not has_known_v2_tid(tid_v2):
+            await self.refresh_v2_zones_if_needed(bvid)
         return result
 
     async def _get_videos_page_series_raw(
@@ -568,6 +611,7 @@ class BilibiliClient:
                     "pubdate": int(item.get("pubdate", 0)),
                     "duration": parse_duration_seconds(raw_duration),
                     "play_count": int(play_val) if str(play_val).isdigit() else 0,
+                    "tid": _safe_nonneg_int(item.get("typeid")),
                     "up_mid": up_mid,
                 }
             )

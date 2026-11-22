@@ -84,6 +84,11 @@ class VideoOut(BaseModel):
     play_count_7d_status: str = "unavailable"
     like_count: int = 0
     coin_count: int = 0
+    tid: int = 0
+    tid_v2: int = 0
+    zone_primary: str = ""
+    zone_sub: str = ""
+    zone_version: str = ""
     stats_synced_at: Optional[str] = None
     cid_count: int = 1
     last_online_count: int = 0

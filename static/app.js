@@ -2300,6 +2300,17 @@ function formatPlayCount7d(video) {
   };
 }
 
+function formatVideoZone(video) {
+  const primary = String(video?.zone_primary || "").trim();
+  const sub = String(video?.zone_sub || "").trim();
+  const version = String(video?.zone_version || "").trim();
+  const hasZone = Boolean(primary || sub);
+  const fullLabel = primary && sub ? `${primary} / ${sub}` : primary || sub;
+  const versionHint = version === "v1" ? "（旧版分区兜底）" : "";
+  const title = hasZone ? `视频分区：${fullLabel}${versionHint}` : "";
+  return { primary, sub, version, hasZone, fullLabel, title };
+}
+
 function createOrUpdateRankRow(video, rank, maxMetric, spec) {
   const bvid = String(video.bvid || "");
   const cache = state[spec.cacheKey];
@@ -2329,6 +2340,12 @@ function createOrUpdateRankRow(video, rank, maxMetric, spec) {
         <div class="rank-info-top">
           <div class="rank-info-main">
             <div class="rank-title"></div>
+            <div class="rank-zones hidden" aria-label="视频分区">
+              <span class="rank-zone-badge">
+                <span class="rank-zone-primary"></span>
+                <span class="rank-zone-sub"></span>
+              </span>
+            </div>
             <div class="rank-meta mono">
               <a class="bvid-link bvid-pill mono" href="https://www.bilibili.com/video/${encodeURIComponent(bvid)}" target="_blank" rel="noopener noreferrer">${bvidEsc}</a>
               <span class="rank-sub-metric"></span>
@@ -2388,6 +2405,30 @@ function createOrUpdateRankRow(video, rank, maxMetric, spec) {
   if (titleEl) {
     titleEl.textContent = video.title || bvid;
     titleEl.title = video.title || bvid;
+  }
+
+  const zone = formatVideoZone(video);
+  const zonesEl = row.querySelector(".rank-zones");
+  const zoneBadgeEl = row.querySelector(".rank-zone-badge");
+  const zonePrimaryEl = row.querySelector(".rank-zone-primary");
+  const zoneSubEl = row.querySelector(".rank-zone-sub");
+  if (zonesEl) {
+    zonesEl.classList.toggle("hidden", !zone.hasZone);
+    if (zone.hasZone) {
+      zonesEl.setAttribute("aria-label", `视频分区 ${zone.fullLabel}`);
+    }
+  }
+  if (zoneBadgeEl) {
+    zoneBadgeEl.title = zone.title;
+    zoneBadgeEl.classList.toggle("has-both", Boolean(zone.primary && zone.sub));
+  }
+  if (zonePrimaryEl) {
+    zonePrimaryEl.textContent = zone.primary;
+    zonePrimaryEl.classList.toggle("hidden", !zone.primary);
+  }
+  if (zoneSubEl) {
+    zoneSubEl.textContent = zone.sub;
+    zoneSubEl.classList.toggle("hidden", !zone.sub);
   }
 
   const subMetricEl = row.querySelector(".rank-sub-metric");
@@ -3654,8 +3695,13 @@ async function openVideoModal(bvid, fallbackTitle = "") {
 
   if (titleEl) titleEl.textContent = resolvedTitle;
   if (metaEl) {
+    const zone = formatVideoZone(video);
     const partInfo = video ? `${Number(video.cid_count || 1)}集 · ${fmtDuration(video.duration)}` : "单视频监控";
-    metaEl.textContent = `${bvid} · ${partInfo}${state.demoMode ? " · 示例数据" : ""}`;
+    const metaParts = [];
+    if (zone.hasZone) metaParts.push(zone.fullLabel);
+    metaParts.push(bvid, partInfo);
+    if (state.demoMode) metaParts.push("示例数据");
+    metaEl.textContent = metaParts.join(" · ");
   }
   if (linkEl) {
     linkEl.href = `https://www.bilibili.com/video/${encodeURIComponent(bvid)}`;
