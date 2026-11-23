@@ -14,8 +14,8 @@
   </script>
   <title>B站账号实时监控</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 28 28' fill='none'%3E%3Crect width='28' height='28' fill='%2307090E'/%3E%3Crect x='2.5' y='4.5' width='23' height='19' stroke='%2300E5FF' stroke-width='2'/%3E%3Cpolyline points='5.5,16 9,16 11.2,10.5 14,20 16.8,13 19,16 22.5,16' stroke='%23FF2A7A' stroke-width='2.2' stroke-linecap='square' stroke-linejoin='miter'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/static/tokens-layout.css?v=20261123b" />
-  <link rel="stylesheet" href="/static/styles.css?v=20261123b" />
+  <link rel="stylesheet" href="/static/tokens-layout.css?v=20261123c" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261123c" />
 </head>
 <body>
   <div class="studio-shell" id="studioShell">
@@ -804,9 +804,9 @@
                   autocapitalize="none"
                   spellcheck="false"
                   enterkeyhint="search"
-                  aria-describedby="zoneLookupHint"
+                  aria-describedby="zoneLookupFormats"
                   data-error="zoneLookupFieldError"
-                  placeholder="粘贴 BV1...、bilibili.com/video/... 或 b23.tv 短链"
+                  placeholder="请输入或粘贴 BV 号 / 视频链接"
                   required
                   autofocus
                 />
@@ -814,10 +814,31 @@
                   查询分区
                 </button>
               </div>
-              <p class="zone-lookup-hint" id="zoneLookupHint">
-                支持全站任意视频的 BV 号、av 号、完整链接、b23.tv 短链或分享文案；单次实时查询，不会写入监控列表。
-              </p>
               <p class="field-error mono hidden" id="zoneLookupFieldError"></p>
+              <div class="zone-format-guide" id="zoneLookupFormats">
+                <div class="zone-format-head">
+                  <span class="zone-format-title">支持的形式</span>
+                  <span class="zone-format-kicker mono">SUPPORTED FORMATS</span>
+                </div>
+                <ul class="zone-format-list">
+                  <li class="zone-format-item">
+                    <span class="zone-format-tag">BV 号</span>
+                    <code class="zone-format-sample mono">BV1xx411c7mD</code>
+                  </li>
+                  <li class="zone-format-item">
+                    <span class="zone-format-tag">视频链接</span>
+                    <code class="zone-format-sample mono">https://www.bilibili.com/video/BV1xx411c7mD</code>
+                  </li>
+                  <li class="zone-format-item">
+                    <span class="zone-format-tag">分享短链</span>
+                    <code class="zone-format-sample mono">https://b23.tv/xxxxxx</code>
+                  </li>
+                  <li class="zone-format-item">
+                    <span class="zone-format-tag">av 号</span>
+                    <code class="zone-format-sample mono">av170001</code>
+                  </li>
+                </ul>
+              </div>
             </div>
 
             <div class="test-result hidden" id="zoneLookupStatus" role="status" aria-live="polite"></div>
@@ -948,6 +969,6 @@
   <!-- HUD Toast Notifications Stack -->
   <div class="toast-stack" id="toastStack" aria-live="polite"></div>
 
-  <script type="module" src="/static/app.js?v=20261123b"></script>
+  <script type="module" src="/static/app.js?v=20261123c"></script>
 </body>
 </html>

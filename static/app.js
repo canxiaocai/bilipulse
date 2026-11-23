@@ -4523,6 +4523,7 @@ function resetZoneLookupView(
   const inputEl = document.getElementById("zoneLookupInput");
   const statusEl = document.getElementById("zoneLookupStatus");
   const resultEl = document.getElementById("zoneLookupResult");
+  const formatsEl = document.getElementById("zoneLookupFormats");
   const submitBtn = document.getElementById("btnZoneLookupSubmit");
 
   if (clearInput && inputEl) {
@@ -4536,6 +4537,9 @@ function resetZoneLookupView(
   }
   if (resultEl) {
     resultEl.classList.add("hidden");
+  }
+  if (formatsEl) {
+    formatsEl.classList.remove("hidden");
   }
   if (submitBtn) {
     submitBtn.disabled = false;
@@ -4677,6 +4681,10 @@ function renderZoneLookupResult(data) {
     openBiliEl.href = videoHref;
   }
 
+  const formatsEl = document.getElementById("zoneLookupFormats");
+  if (formatsEl) {
+    formatsEl.classList.add("hidden");
+  }
   resultEl.classList.remove("hidden");
 }
 
@@ -4684,6 +4692,7 @@ async function performZoneLookup(rawQuery) {
   const query = String(rawQuery || "").trim();
   const statusEl = document.getElementById("zoneLookupStatus");
   const resultEl = document.getElementById("zoneLookupResult");
+  const formatsEl = document.getElementById("zoneLookupFormats");
   const submitBtn = document.getElementById("btnZoneLookupSubmit");
 
   if (state.zoneLookupAbortController) {
@@ -4724,6 +4733,9 @@ async function performZoneLookup(rawQuery) {
     if (err?.name === "AbortError" || reqSeq !== state.zoneLookupReqSeq) return;
     if (resultEl) {
       resultEl.classList.add("hidden");
+    }
+    if (formatsEl) {
+      formatsEl.classList.remove("hidden");
     }
     if (statusEl) {
       statusEl.className = "test-result fail err is-err";
