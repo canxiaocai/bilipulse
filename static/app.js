@@ -7,7 +7,7 @@
 import {
   renderTelemetryChart,
   clearChartsInGroup,
-} from "./charts.js?v=20261121a";
+} from "./charts.js?v=20261123d";
 import {
   animateNumber,
   runViewTransition,
@@ -3191,6 +3191,8 @@ function fmtSignedDelta(val) {
   return fmtNumber(num);
 }
 
+const WEEKDAY_LABELS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+
 function formatBucketRangeHud(startMs, endMs, bucketLabel) {
   const d0 = new Date(startMs);
   const d1 = new Date(endMs);
@@ -3198,12 +3200,16 @@ function formatBucketRangeHud(startMs, endMs, bucketLabel) {
     return bucketLabel ? `区间 (${bucketLabel})` : "--:--";
   }
   const pad2 = (n) => String(n).padStart(2, "0");
+  const wd0 = WEEKDAY_LABELS[d0.getDay()];
+  const wd1 = WEEKDAY_LABELS[d1.getDay()];
   const md0 = `${pad2(d0.getMonth() + 1)}-${pad2(d0.getDate())}`;
   const md1 = `${pad2(d1.getMonth() + 1)}-${pad2(d1.getDate())}`;
   const hm0 = `${pad2(d0.getHours())}:${pad2(d0.getMinutes())}`;
   const hm1 = `${pad2(d1.getHours())}:${pad2(d1.getMinutes())}`;
   const rangeStr =
-    md0 === md1 ? `${md0} ${hm0} → ${hm1}` : `${md0} ${hm0} → ${md1} ${hm1}`;
+    md0 === md1
+      ? `${wd0} ${md0} ${hm0} → ${hm1}`
+      : `${wd0} ${md0} ${hm0} → ${wd1} ${md1} ${hm1}`;
   return bucketLabel ? `${rangeStr} · ${bucketLabel}` : rangeStr;
 }
 

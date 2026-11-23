@@ -1358,6 +1358,7 @@ samp {
   font-size: 10.5px;
   color: var(--text-muted);
   letter-spacing: 0.04em;
+  white-space: nowrap;
   padding-bottom: 4px;
   margin-bottom: 4px;
   border-bottom: 1px solid var(--line-subtle);

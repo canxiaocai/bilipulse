@@ -94,8 +94,10 @@ function formatAxisTime(tsMs, isMultiDay, fallbackLabel = '') {
   return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${hhmm}`;
 }
 
+const WEEKDAY_LABELS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+
 /**
- * Formats full timestamp for the floating oscilloscope HUD readout.
+ * Formats full timestamp with weekday prefix for the floating oscilloscope HUD readout.
  * @param {number} tsMs
  * @param {unknown} rawTs
  * @returns {string}
@@ -104,7 +106,8 @@ function formatHudTimestamp(tsMs, rawTs) {
   if (Number.isFinite(tsMs) && tsMs >= 86400000) {
     const d = new Date(tsMs);
     if (!Number.isNaN(d.getTime())) {
-      return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+      const weekday = WEEKDAY_LABELS[d.getDay()];
+      return `${weekday} ${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
     }
   }
   if (rawTs != null && String(rawTs).trim() !== '') {
