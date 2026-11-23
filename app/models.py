@@ -175,3 +175,30 @@ class DashboardSummary(BaseModel):
     snapshots_downsampled: bool = False
     top_videos: list[VideoOut] = Field(default_factory=list)
     accounts: list[AccountSummary] = Field(default_factory=list)
+
+
+class VideoZoneLookupOut(BaseModel):
+    bvid: str = ""
+    aid: int = 0
+    url: str = ""
+    title: str = ""
+    pic: str = ""
+    pubdate: int = 0
+    duration: int = 0
+    owner_mid: str = ""
+    owner_name: str = ""
+    owner_face: str = ""
+    play_count: int = 0
+    like_count: int = 0
+    coin_count: int = 0
+    favorite_count: int = 0
+    danmaku_count: int = 0
+    tid: int = 0
+    tname: str = ""
+    tid_v2: int = 0
+    tname_v2: str = ""
+    zone_primary: str = ""
+    zone_sub: str = ""
+    zone_version: str = ""
+    legacy_zone_primary: str = ""
+    legacy_zone_sub: str = ""

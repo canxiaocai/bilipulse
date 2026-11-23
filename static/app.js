@@ -110,6 +110,8 @@ const state = {
   activeTab: "tab-overview",
   compareSortMode: "metric",
   accountReorderSeq: 0,
+  zoneLookupReqSeq: 0,
+  zoneLookupAbortController: null,
 };
 
 /* ---------- Escaping, URL Safety & Formatters ---------- */
@@ -4362,6 +4364,382 @@ function wireAccessibleAccountForm() {
   );
 }
 
+function wireAccessibleZoneLookupForm() {
+  return wireAccessibleForm(
+    "zoneLookupForm",
+    [
+      {
+        id: "zoneLookupInput",
+        errId: "zoneLookupFieldError",
+        customValidity: true,
+        getMessage: (el) => {
+          const val = el.value.trim();
+          if (!val) return "请输入 B站视频 BV 号、av 号或完整视频链接。";
+          return "";
+        },
+      },
+    ],
+    ["zoneLookupInput"]
+  );
+}
+
+/* ---------- Copy Button (modern-web-guidance: copy-button) ---------- */
+
+const copyFeedbackTimers = new WeakMap();
+let lastCopyAnnouncement = "";
+
+function legacyCopyText(text) {
+  const field = Object.assign(document.createElement("textarea"), { value: text });
+  field.setAttribute("readonly", "");
+  field.style.cssText = "position:fixed;inset-block-start:0;opacity:0";
+  document.body.append(field);
+  field.select();
+  try {
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  } finally {
+    field.remove();
+  }
+}
+
+function reportCopyFeedback(button, ok) {
+  if (!button) return;
+  const tip = button.nextElementSibling;
+  clearTimeout(copyFeedbackTimers.get(button));
+  button.removeAttribute("data-copied");
+  button.removeAttribute("data-failed");
+
+  let message = ok ? "已复制" : "复制失败";
+  if (message === lastCopyAnnouncement) {
+    message += "\u00A0";
+  }
+  lastCopyAnnouncement = message;
+
+  if (tip) tip.textContent = "";
+  void button.offsetWidth;
+  button.setAttribute(ok ? "data-copied" : "data-failed", "");
+  if (tip) {
+    requestAnimationFrame(() => {
+      tip.textContent = message;
+    });
+  }
+  copyFeedbackTimers.set(
+    button,
+    window.setTimeout(() => {
+      button.removeAttribute("data-copied");
+      button.removeAttribute("data-failed");
+      if (tip) tip.textContent = "";
+    }, 2000)
+  );
+}
+
+async function copyFromTargetElement(button, target) {
+  if (!button || !target) return;
+  const text = target.matches("input, textarea")
+    ? String(target.value || "").trim()
+    : String(target.innerText || target.textContent || "").trim();
+  if (!text || text === "--") return;
+
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      await navigator.clipboard.writeText(text);
+    } else if (!legacyCopyText(text)) {
+      throw new Error("Copy failed");
+    }
+    reportCopyFeedback(button, true);
+  } catch {
+    if (legacyCopyText(text)) {
+      reportCopyFeedback(button, true);
+    } else {
+      reportCopyFeedback(button, false);
+    }
+  }
+}
+
+function wireCopyButtons() {
+  if ("CommandEvent" in window) {
+    document.addEventListener(
+      "command",
+      (ev) => {
+        if (typeof ev.command === "string" && ev.command.startsWith("--copy")) {
+          copyFromTargetElement(ev.source, ev.target);
+        }
+      },
+      true
+    );
+  } else {
+    document.addEventListener("click", (ev) => {
+      const button = ev.target.closest('button[command^="--copy"]');
+      if (!button) return;
+      const targetId = button.getAttribute("commandfor");
+      const target = targetId ? document.getElementById(targetId) : null;
+      if (target) {
+        copyFromTargetElement(button, target);
+      }
+    });
+  }
+}
+
+/* ---------- Standalone One-Off Video Partition Lookup Modal ---------- */
+
+function openZoneLookupModal(zoneLookupValidator) {
+  const modal = document.getElementById("zoneLookupModal");
+  const inputEl = document.getElementById("zoneLookupInput");
+  if (!modal) return;
+
+  if (inputEl && !inputEl.value.trim()) {
+    zoneLookupValidator?.resetValidation();
+  }
+  showDialogModal(modal);
+  requestAnimationFrame(() => {
+    if (inputEl) {
+      inputEl.focus();
+      if (inputEl.value) {
+        inputEl.select();
+      }
+    }
+  });
+}
+
+function closeZoneLookupModal() {
+  if (state.zoneLookupAbortController) {
+    state.zoneLookupAbortController.abort();
+    state.zoneLookupAbortController = null;
+  }
+  closeDialogModal(document.getElementById("zoneLookupModal"));
+}
+
+function resetZoneLookupView(
+  zoneLookupValidator,
+  { clearInput = true, focusInput = true } = {}
+) {
+  state.zoneLookupReqSeq += 1;
+  if (state.zoneLookupAbortController) {
+    state.zoneLookupAbortController.abort();
+    state.zoneLookupAbortController = null;
+  }
+
+  const inputEl = document.getElementById("zoneLookupInput");
+  const statusEl = document.getElementById("zoneLookupStatus");
+  const resultEl = document.getElementById("zoneLookupResult");
+  const submitBtn = document.getElementById("btnZoneLookupSubmit");
+
+  if (clearInput && inputEl) {
+    inputEl.value = "";
+  }
+  zoneLookupValidator?.resetValidation();
+
+  if (statusEl) {
+    statusEl.className = "test-result hidden";
+    statusEl.textContent = "";
+  }
+  if (resultEl) {
+    resultEl.classList.add("hidden");
+  }
+  if (submitBtn) {
+    submitBtn.disabled = false;
+    submitBtn.textContent = "查询分区";
+  }
+  if (focusInput && inputEl) {
+    inputEl.focus();
+  }
+}
+
+function renderZoneLookupResult(data) {
+  const resultEl = document.getElementById("zoneLookupResult");
+  if (!resultEl || !data) return;
+
+  const zone = formatVideoZone(data);
+  const primaryEl = document.getElementById("zoneLookupPrimary");
+  const subEl = document.getElementById("zoneLookupSub");
+  const versionChipEl = document.getElementById("zoneLookupVersionChip");
+  const pathTextEl = document.getElementById("zoneLookupPathText");
+  const idsEl = document.getElementById("zoneLookupIds");
+  const legacyRowEl = document.getElementById("zoneLookupLegacyRow");
+  const legacyTextEl = document.getElementById("zoneLookupLegacyText");
+
+  if (primaryEl) primaryEl.textContent = zone.primary || "未分类";
+  if (subEl) subEl.textContent = zone.sub || "未细分";
+
+  if (versionChipEl) {
+    if (zone.version === "v2") {
+      versionChipEl.textContent = "V2 新版分区";
+    } else if (zone.version === "v1") {
+      versionChipEl.textContent = "V1 旧版分区";
+    } else {
+      versionChipEl.textContent = "未识别分区";
+    }
+  }
+
+  if (pathTextEl) {
+    pathTextEl.textContent = zone.fullLabel || "暂无分区信息";
+  }
+
+  if (idsEl) {
+    const idParts = [];
+    if (Number(data.tid_v2) > 0) idParts.push(`tid_v2: ${data.tid_v2}`);
+    if (Number(data.tid) > 0) idParts.push(`tid: ${data.tid}`);
+    idsEl.textContent = idParts.join(" · ");
+  }
+
+  const legacyPrimary = String(data.legacy_zone_primary || "").trim();
+  const legacySub = String(data.legacy_zone_sub || "").trim();
+  const legacyLabel =
+    legacyPrimary && legacySub
+      ? `${legacyPrimary} / ${legacySub}`
+      : legacyPrimary || legacySub;
+  if (legacyRowEl && legacyTextEl) {
+    const showLegacy =
+      zone.version === "v2" && Boolean(legacyLabel) && legacyLabel !== zone.fullLabel;
+    legacyRowEl.classList.toggle("hidden", !showLegacy);
+    if (showLegacy) {
+      legacyTextEl.textContent =
+        Number(data.tid) > 0 ? `${legacyLabel} (tid: ${data.tid})` : legacyLabel;
+    }
+  }
+
+  const bvid = String(data.bvid || "").trim();
+  const videoHref =
+    safeUrl(data.url) ||
+    (bvid
+      ? `https://www.bilibili.com/video/${encodeURIComponent(bvid)}`
+      : "https://www.bilibili.com");
+
+  const coverEl = document.getElementById("zoneLookupCover");
+  if (coverEl) {
+    const fallbackLabel = bvid || String(data.aid || "");
+    coverEl.dataset.fallbackLabel = fallbackLabel;
+    if (coverEl.dataset.fallbackBound !== "1") {
+      coverEl.dataset.fallbackBound = "1";
+      coverEl.addEventListener("error", () => {
+        const fallbackUri = buildFallbackCoverSvg(coverEl.dataset.fallbackLabel || "");
+        if (coverEl.src !== fallbackUri) {
+          coverEl.src = fallbackUri;
+        }
+      });
+    }
+    coverEl.src = resolveCoverSrc(data.pic, fallbackLabel);
+    coverEl.alt = data.title || bvid || "视频封面";
+  }
+
+  const titleEl = document.getElementById("zoneLookupVideoTitle");
+  if (titleEl) {
+    titleEl.textContent = data.title || bvid || "--";
+    titleEl.href = videoHref;
+  }
+
+  const bvidLinkEl = document.getElementById("zoneLookupBvidLink");
+  if (bvidLinkEl) {
+    bvidLinkEl.textContent = bvid || (data.aid ? `av${data.aid}` : "--");
+    bvidLinkEl.href = videoHref;
+  }
+
+  const ownerLinkEl = document.getElementById("zoneLookupOwnerLink");
+  if (ownerLinkEl) {
+    const ownerName = String(data.owner_name || "").trim();
+    const ownerMid = String(data.owner_mid || "").trim();
+    ownerLinkEl.textContent = ownerName ? `UP主：${ownerName}` : "UP主：--";
+    if (ownerMid) {
+      ownerLinkEl.href = `https://space.bilibili.com/${encodeURIComponent(ownerMid)}`;
+      ownerLinkEl.classList.remove("hidden");
+    } else {
+      ownerLinkEl.href = videoHref;
+      ownerLinkEl.classList.toggle("hidden", !ownerName);
+    }
+  }
+
+  const pubdateEl = document.getElementById("zoneLookupPubdate");
+  if (pubdateEl) {
+    pubdateEl.textContent = data.pubdate ? `发布 ${fmtEpochDate(data.pubdate)}` : "";
+  }
+
+  const durationEl = document.getElementById("zoneLookupDuration");
+  if (durationEl) {
+    durationEl.textContent = data.duration ? fmtDuration(data.duration) : "";
+  }
+
+  const statBindings = [
+    ["zoneLookupPlay", data.play_count],
+    ["zoneLookupLike", data.like_count],
+    ["zoneLookupCoin", data.coin_count],
+    ["zoneLookupFav", data.favorite_count],
+  ];
+  for (const [id, val] of statBindings) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    el.textContent = fmtCompact(val);
+    el.title = fmtNumber(val);
+  }
+
+  const openBiliEl = document.getElementById("zoneLookupOpenBili");
+  if (openBiliEl) {
+    openBiliEl.href = videoHref;
+  }
+
+  resultEl.classList.remove("hidden");
+}
+
+async function performZoneLookup(rawQuery) {
+  const query = String(rawQuery || "").trim();
+  const statusEl = document.getElementById("zoneLookupStatus");
+  const resultEl = document.getElementById("zoneLookupResult");
+  const submitBtn = document.getElementById("btnZoneLookupSubmit");
+
+  if (state.zoneLookupAbortController) {
+    state.zoneLookupAbortController.abort();
+  }
+  const controller = new AbortController();
+  state.zoneLookupAbortController = controller;
+  const reqSeq = ++state.zoneLookupReqSeq;
+
+  if (submitBtn) {
+    submitBtn.disabled = true;
+    submitBtn.textContent = "查询中...";
+  }
+  if (statusEl) {
+    statusEl.className = "test-result";
+    statusEl.textContent = "正在实时查询 B站视频分区信息...";
+  }
+
+  try {
+    const data = await apiFetch(
+      `/api/video-zone/lookup?q=${encodeURIComponent(query)}`,
+      {
+        timeoutMs: 15000,
+        signal: controller.signal,
+      }
+    );
+    if (reqSeq !== state.zoneLookupReqSeq) return;
+
+    renderZoneLookupResult(data);
+    const zone = formatVideoZone(data);
+    if (statusEl) {
+      statusEl.className = "test-result ok is-ok";
+      statusEl.textContent = zone.hasZone
+        ? `查询完成：${data.bvid || ""} 所属分区为「${zone.fullLabel}」`
+        : `查询完成：已获取视频 ${data.bvid || ""}，但未返回分区标签`;
+    }
+  } catch (err) {
+    if (err?.name === "AbortError" || reqSeq !== state.zoneLookupReqSeq) return;
+    if (resultEl) {
+      resultEl.classList.add("hidden");
+    }
+    if (statusEl) {
+      statusEl.className = "test-result fail err is-err";
+      statusEl.textContent = `查询失败：${err.message || "未知异常"}`;
+    }
+  } finally {
+    if (state.zoneLookupAbortController === controller) {
+      state.zoneLookupAbortController = null;
+    }
+    if (reqSeq === state.zoneLookupReqSeq && submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = "查询分区";
+    }
+  }
+}
+
 /* ---------- Data Loaders & Mutations ---------- */
 
 async function fetchDashboardPayload({
@@ -5240,9 +5618,12 @@ function installToolbarRovingFocusFallback(bar, itemSelector) {
 
 /* ---------- Event Binding ---------- */
 
-function bindEvents(settingsValidator, accountValidator) {
+function bindEvents(settingsValidator, accountValidator, zoneLookupValidator) {
   // Theme & Action Controls
   document.getElementById("btnThemeToggle")?.addEventListener("click", toggleTheme);
+  document.getElementById("btnOpenZoneLookup")?.addEventListener("click", () =>
+    openZoneLookupModal(zoneLookupValidator)
+  );
   document.getElementById("btnLivePulse")?.addEventListener("click", toggleDemoLivePulse);
   document.getElementById("btnLoadDemo")?.addEventListener("click", () =>
     activateDemoMode({ showNotification: true })
@@ -5830,6 +6211,39 @@ function bindEvents(settingsValidator, accountValidator) {
     }
   });
 
+  // Native <dialog id="zoneLookupModal"> One-Off Video Partition Query
+  const zoneLookupModal = document.getElementById("zoneLookupModal");
+  document.getElementById("btnCloseZoneLookupModal")?.addEventListener("click", closeZoneLookupModal);
+  document.getElementById("btnZoneLookupClear")?.addEventListener("click", () =>
+    resetZoneLookupView(zoneLookupValidator, { clearInput: true, focusInput: true })
+  );
+  zoneLookupModal?.addEventListener("close", () => {
+    zoneLookupModal.returnValue = "";
+    state.zoneLookupReqSeq += 1;
+    if (state.zoneLookupAbortController) {
+      state.zoneLookupAbortController.abort();
+      state.zoneLookupAbortController = null;
+    }
+    const submitBtn = document.getElementById("btnZoneLookupSubmit");
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = "查询分区";
+    }
+  });
+  installDialogLightDismissFallback(zoneLookupModal);
+
+  const zoneLookupForm = document.getElementById("zoneLookupForm");
+  zoneLookupForm?.setAttribute("novalidate", "");
+  zoneLookupForm?.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    if (zoneLookupValidator && !zoneLookupValidator.validateAllForSubmit()) {
+      return;
+    }
+    const rawQuery = document.getElementById("zoneLookupInput")?.value.trim() || "";
+    if (!rawQuery) return;
+    await performZoneLookup(rawQuery);
+  });
+
   // Resize Sync for Sliding Rails
   let resizeRaf = 0;
   window.addEventListener("resize", () => {
@@ -5845,9 +6259,11 @@ function bindEvents(settingsValidator, accountValidator) {
 async function init() {
   applyTheme(getStoredTheme(), false);
   sidebarDrawerCtrl = setupResponsiveSidebar();
+  wireCopyButtons();
   const settingsValidator = wireAccessibleSettingsForm();
   const accountValidator = wireAccessibleAccountForm();
-  bindEvents(settingsValidator, accountValidator);
+  const zoneLookupValidator = wireAccessibleZoneLookupForm();
+  bindEvents(settingsValidator, accountValidator, zoneLookupValidator);
 
   // Sync sliding indicators immediately (no fly-in from 0,0)
   syncSlidingIndicators({ immediate: true });

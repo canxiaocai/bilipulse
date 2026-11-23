@@ -13,9 +13,69 @@ from typing import Any, Optional
 
 import httpx
 
-from app.bilibili.zones import has_known_v2_tid, merge_channel_kv
+from app.bilibili.zones import has_known_v2_tid, merge_channel_kv, resolve_video_zone
 
 logger = logging.getLogger(__name__)
+
+SHORT_VIDEO_HOSTS = frozenset({"b23.tv", "www.b23.tv", "bili2233.cn", "www.bili2233.cn"})
+_BVID_RE = re.compile(r"(?<![0-9A-Za-z])(BV[0-9A-Za-z]{10})(?![0-9A-Za-z])", re.IGNORECASE)
+_AVID_RE = re.compile(r"(?<![0-9A-Za-z])av(\d{1,15})(?![0-9A-Za-z])", re.IGNORECASE)
+_CANDIDATE_URL_RE = re.compile(
+    r"(?:https?://[^\s<>'\"）)】，,。]+|(?:www\.)?(?:bilibili\.com|b23\.tv|bili2233\.cn)/[^\s<>'\"）)】，,。]+)",
+    re.IGNORECASE,
+)
+
+
+def _is_bilibili_domain(host: str) -> bool:
+    clean = (host or "").strip().lower().rstrip(".")
+    return clean == "bilibili.com" or clean.endswith(".bilibili.com")
+
+
+def _is_allowed_short_host(host: str) -> bool:
+    return (host or "").strip().lower().rstrip(".") in SHORT_VIDEO_HOSTS
+
+
+def parse_video_identifier(raw_input: str) -> dict[str, Any]:
+    """Extract a Bilibili video bvid, aid, or allowed short link from raw user input."""
+    text = str(raw_input or "").strip()
+    if not text:
+        return {}
+
+    bvid_match = _BVID_RE.search(text)
+    if bvid_match:
+        raw_bvid = bvid_match.group(1)
+        return {"bvid": "BV" + raw_bvid[2:]}
+
+    avid_match = _AVID_RE.search(text)
+    if avid_match:
+        aid_val = _safe_nonneg_int(avid_match.group(1))
+        if aid_val > 0:
+            return {"aid": aid_val}
+
+    for url_match in _CANDIDATE_URL_RE.finditer(text):
+        candidate = url_match.group(0).rstrip(".,;:!?\"'()[]{}<>）)】")
+        normalized = candidate if re.match(r"^https?://", candidate, re.IGNORECASE) else f"https://{candidate}"
+        try:
+            parsed = urllib.parse.urlparse(normalized)
+        except ValueError:
+            continue
+        host = (parsed.hostname or "").lower()
+        if _is_bilibili_domain(host):
+            qs = urllib.parse.parse_qs(parsed.query)
+            for raw_bv in qs.get("bvid", []):
+                m = _BVID_RE.search(raw_bv)
+                if m:
+                    return {"bvid": "BV" + m.group(1)[2:]}
+            for raw_aid in qs.get("aid", []):
+                aid_val = _safe_nonneg_int(raw_aid)
+                if aid_val > 0:
+                    return {"aid": aid_val}
+        elif _is_allowed_short_host(host):
+            clean_path = (parsed.path or "").strip()
+            if clean_path and clean_path != "/":
+                return {"short_url": f"https://{host}{clean_path}"}
+
+    return {}
 
 MIXIN_KEY_ENC_TAB = [
     46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
@@ -431,19 +491,133 @@ class BilibiliClient:
             "archive_count": int(payload.get("archive_count", 0)),
         }
 
-    async def _fetch_video_view_data(self, bvid: str) -> dict[str, Any]:
-        """Fetch raw data payload from /x/web-interface/view for a video."""
+    async def _fetch_video_view_data(
+        self, bvid: Optional[str] = None, aid: Optional[int] = None
+    ) -> dict[str, Any]:
+        """Fetch raw data payload from /x/web-interface/view for a video by bvid or aid."""
+        clean_bvid = str(bvid or "").strip()
+        clean_aid = _safe_nonneg_int(aid)
+        if clean_bvid:
+            params: dict[str, Any] = {"bvid": clean_bvid}
+            label = clean_bvid
+            referer = f"https://www.bilibili.com/video/{clean_bvid}"
+        elif clean_aid > 0:
+            params = {"aid": clean_aid}
+            label = f"av{clean_aid}"
+            referer = f"https://www.bilibili.com/video/av{clean_aid}"
+        else:
+            raise ValueError("Either bvid or aid must be provided")
+
         data = await self._request_json(
             "https://api.bilibili.com/x/web-interface/view",
-            params={"bvid": bvid},
-            referer=f"https://www.bilibili.com/video/{bvid}",
+            params=params,
+            referer=referer,
         )
         if data.get("code") != 0:
             raise BilibiliAPIError(
-                f"web-interface/view error {data.get('code')} for {bvid}: {data.get('message')}",
+                f"web-interface/view error {data.get('code')} for {label}: {data.get('message')}",
                 code=data.get("code"),
             )
         return data.get("data") or {}
+
+    async def resolve_short_url(self, short_url: str, max_hops: int = 5) -> dict[str, Any]:
+        """Safely resolve a Bilibili short link (b23.tv / bili2233.cn) to a video bvid or aid."""
+        current_url = str(short_url or "").strip()
+        parsed = urllib.parse.urlparse(current_url)
+        if parsed.scheme not in ("http", "https") or not _is_allowed_short_host(parsed.hostname or ""):
+            raise BilibiliAPIError("不支持的短链接域名", code=400)
+
+        for _ in range(max(1, max_hops)):
+            resp = await self._client.get(current_url, follow_redirects=False)
+            location = resp.headers.get("location")
+            if resp.status_code in (301, 302, 303, 307, 308) and location:
+                next_url = urllib.parse.urljoin(current_url, location.strip())
+                extracted = parse_video_identifier(next_url)
+                if extracted.get("bvid") or extracted.get("aid"):
+                    return extracted
+                next_parsed = urllib.parse.urlparse(next_url)
+                next_host = next_parsed.hostname or ""
+                if next_parsed.scheme not in ("http", "https") or not (
+                    _is_allowed_short_host(next_host) or _is_bilibili_domain(next_host)
+                ):
+                    raise BilibiliAPIError("短链接未指向有效的 B站视频地址", code=400)
+                current_url = next_url
+                continue
+            break
+
+        raise BilibiliAPIError("未能从该短链接中解析出 B站视频 BV 号", code=400)
+
+    async def get_video_zone_info(
+        self,
+        *,
+        bvid: Optional[str] = None,
+        aid: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """One-off lookup of any Bilibili video's partition and metadata via /x/web-interface/view."""
+        await self.ensure_session_tokens()
+        payload = await self._fetch_video_view_data(bvid=bvid, aid=aid)
+        resolved_bvid = str(payload.get("bvid") or bvid or "").strip()
+        resolved_aid = _safe_nonneg_int(payload.get("aid") or aid)
+        tid = _safe_nonneg_int(payload.get("tid"))
+        tid_v2 = _safe_nonneg_int(payload.get("tid_v2"))
+        tname = str(payload.get("tname") or "").strip()
+        tname_v2 = str(payload.get("tname_v2") or "").strip()
+
+        if tid_v2 > 0 and not has_known_v2_tid(tid_v2) and resolved_bvid:
+            await self.refresh_v2_zones_if_needed(resolved_bvid)
+
+        zone = resolve_video_zone(
+            tid=tid,
+            tid_v2=tid_v2,
+            tname=tname,
+            tname_v2=tname_v2,
+        )
+        legacy_zone = (
+            resolve_video_zone(tid=tid, tid_v2=0, tname=tname)
+            if tid > 0
+            else {"zone_primary": "", "zone_sub": "", "zone_version": ""}
+        )
+
+        owner = payload.get("owner") or {}
+        stat = payload.get("stat") or {}
+        raw_pic = str(payload.get("pic") or "").strip()
+        if raw_pic.startswith("http://"):
+            raw_pic = "https://" + raw_pic[len("http://"):]
+        raw_owner_face = str(owner.get("face") or "").strip()
+        if raw_owner_face.startswith("http://"):
+            raw_owner_face = "https://" + raw_owner_face[len("http://"):]
+        video_url = (
+            f"https://www.bilibili.com/video/{resolved_bvid}"
+            if resolved_bvid
+            else (f"https://www.bilibili.com/video/av{resolved_aid}" if resolved_aid > 0 else "")
+        )
+
+        return {
+            "bvid": resolved_bvid,
+            "aid": resolved_aid,
+            "url": video_url,
+            "title": str(payload.get("title") or "").strip(),
+            "pic": raw_pic,
+            "pubdate": _safe_nonneg_int(payload.get("pubdate")),
+            "duration": _safe_nonneg_int(payload.get("duration")),
+            "owner_mid": str(owner.get("mid") or "").strip(),
+            "owner_name": str(owner.get("name") or "").strip(),
+            "owner_face": raw_owner_face,
+            "play_count": _safe_nonneg_int(stat.get("view")),
+            "like_count": _safe_nonneg_int(stat.get("like")),
+            "coin_count": _safe_nonneg_int(stat.get("coin")),
+            "favorite_count": _safe_nonneg_int(stat.get("favorite")),
+            "danmaku_count": _safe_nonneg_int(stat.get("danmaku")),
+            "tid": tid,
+            "tname": tname,
+            "tid_v2": tid_v2,
+            "tname_v2": tname_v2,
+            "zone_primary": zone["zone_primary"],
+            "zone_sub": zone["zone_sub"],
+            "zone_version": zone["zone_version"],
+            "legacy_zone_primary": legacy_zone["zone_primary"],
+            "legacy_zone_sub": legacy_zone["zone_sub"],
+        }
 
     async def get_video_owner_mid(self, bvid: str) -> Optional[str]:
         """Fetch the primary UP主 mid for a video via /x/web-interface/view."""

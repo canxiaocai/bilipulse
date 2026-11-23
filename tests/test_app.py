@@ -5190,6 +5190,206 @@ def test_video_v2_zones_resolution_client_db_backfill_and_api(tmp_path: Path):
         assert vids_resp["videos"][0]["zone_sub"] == "同人动画"
 
 
+def test_parse_video_identifier_formats():
+    from app.bilibili.client import parse_video_identifier
+
+    # Bare BV (normalizes leading bv -> BV while preserving base58 case)
+    assert parse_video_identifier("BV1xx411c7mD") == {"bvid": "BV1xx411c7mD"}
+    assert parse_video_identifier("  bv1Xx411c7mD  ") == {"bvid": "BV1Xx411c7mD"}
+
+    # Full desktop, mobile, query-param URLs and share text
+    assert parse_video_identifier(
+        "https://www.bilibili.com/video/BV1ab411c7mD/?spm_id_from=333.1007&p=2"
+    ) == {"bvid": "BV1ab411c7mD"}
+    assert parse_video_identifier(
+        "https://m.bilibili.com/video/BV1ab411c7mD"
+    ) == {"bvid": "BV1ab411c7mD"}
+    assert parse_video_identifier(
+        "https://www.bilibili.com/list/watchlater?bvid=BV1ab411c7mD&oid=123"
+    ) == {"bvid": "BV1ab411c7mD"}
+    assert parse_video_identifier(
+        "【超棒视频】 https://www.bilibili.com/video/BV1ab411c7mD/?share_source=copy_web"
+    ) == {"bvid": "BV1ab411c7mD"}
+
+    # av number and URL
+    assert parse_video_identifier("av170001") == {"aid": 170001}
+    assert parse_video_identifier("https://www.bilibili.com/video/av170001") == {"aid": 170001}
+    assert parse_video_identifier("https://www.bilibili.com/video/?aid=170001") == {"aid": 170001}
+
+    # Short links (b23.tv / bili2233.cn)
+    assert parse_video_identifier("https://b23.tv/BV1ab411c7mD") == {"bvid": "BV1ab411c7mD"}
+    assert parse_video_identifier("【分享】https://b23.tv/aBc1234?share_medium=android") == {
+        "short_url": "https://b23.tv/aBc1234"
+    }
+    assert parse_video_identifier("bili2233.cn/xyz789") == {
+        "short_url": "https://bili2233.cn/xyz789"
+    }
+
+    # Invalid / non-Bilibili inputs
+    assert parse_video_identifier("") == {}
+    assert parse_video_identifier("hello world") == {}
+    assert parse_video_identifier("https://example.com/video/12345") == {}
+    assert parse_video_identifier("BV1short") == {}
+
+
+def test_resolve_short_url_ssrf_and_redirect():
+    import httpx
+
+    async def _run():
+        async with BilibiliClient() as client:
+            # Valid b23.tv redirect -> bilibili.com/video/BV...
+            fake_redirect = httpx.Response(
+                302,
+                headers={"location": "https://www.bilibili.com/video/BV1ab411c7mD?p=1"},
+            )
+            with patch.object(client._client, "get", AsyncMock(return_value=fake_redirect)):
+                resolved = await client.resolve_short_url("https://b23.tv/abc1234")
+                assert resolved == {"bvid": "BV1ab411c7mD"}
+
+            # Reject disallowed initial host
+            with pytest.raises(BilibiliAPIError) as exc_info:
+                await client.resolve_short_url("https://evil.example/abc")
+            assert exc_info.value.code == 400
+
+            # Reject redirect to external non-bilibili host
+            bad_redirect = httpx.Response(
+                302,
+                headers={"location": "http://169.254.169.254/latest/meta-data/"},
+            )
+            with patch.object(client._client, "get", AsyncMock(return_value=bad_redirect)):
+                with pytest.raises(BilibiliAPIError) as exc_info2:
+                    await client.resolve_short_url("https://b23.tv/ssrf")
+                assert exc_info2.value.code == 400
+
+    asyncio.run(_run())
+
+
+def test_video_zone_lookup_client_and_stateless_api(tmp_path: Path, monkeypatch):
+    db = Database(db_path=tmp_path / "zone_lookup.db")
+    # Even when admin password is enabled, one-off public zone lookup stays accessible
+    monkeypatch.setenv("BILI_ADMIN_PASSWORD", "secret-pass")
+
+    async def _run_client_unit():
+        async with BilibiliClient() as client:
+            payload = {
+                "code": 0,
+                "data": {
+                    "bvid": "BV1ab411c7mD",
+                    "aid": 987654,
+                    "title": "AI 开发实战教程",
+                    "pic": "https://i0.hdslb.com/bfs/archive/demo.jpg",
+                    "pubdate": 1730000000,
+                    "duration": 612,
+                    "tid": 231,
+                    "tname": "计算机技术",
+                    "tid_v2": 2096,
+                    "tname_v2": "AI学习",
+                    "owner": {"mid": 424242, "name": "示例UP", "face": "https://i0.hdslb.com/f.jpg"},
+                    "stat": {
+                        "view": 123456,
+                        "like": 8900,
+                        "coin": 2100,
+                        "favorite": 4300,
+                        "danmaku": 520,
+                    },
+                },
+            }
+            with patch.object(client, "ensure_session_tokens", AsyncMock()), patch.object(
+                client, "_request_json", AsyncMock(return_value=payload)
+            ):
+                info = await client.get_video_zone_info(bvid="BV1ab411c7mD")
+                assert info["bvid"] == "BV1ab411c7mD"
+                assert info["aid"] == 987654
+                assert info["zone_primary"] == "人工智能"
+                assert info["zone_sub"] == "AI学习"
+                assert info["zone_version"] == "v2"
+                assert info["legacy_zone_primary"] == "科技"
+                assert info["legacy_zone_sub"] == "计算机技术"
+                assert info["owner_name"] == "示例UP"
+                assert info["play_count"] == 123456
+                assert info["favorite_count"] == 4300
+
+    asyncio.run(_run_client_unit())
+
+    # FastAPI endpoint tests
+    fake_client = AsyncMock()
+    fake_client.__aenter__.return_value = fake_client
+    fake_client.__aexit__.return_value = None
+    fake_client.resolve_short_url.return_value = {"bvid": "BV1ab411c7mD"}
+    fake_client.get_video_zone_info.return_value = {
+        "bvid": "BV1ab411c7mD",
+        "aid": 987654,
+        "url": "https://www.bilibili.com/video/BV1ab411c7mD",
+        "title": "AI 开发实战教程",
+        "pic": "https://i0.hdslb.com/bfs/archive/demo.jpg",
+        "pubdate": 1730000000,
+        "duration": 612,
+        "owner_mid": "424242",
+        "owner_name": "示例UP",
+        "owner_face": "",
+        "play_count": 123456,
+        "like_count": 8900,
+        "coin_count": 2100,
+        "favorite_count": 4300,
+        "danmaku_count": 520,
+        "tid": 231,
+        "tname": "计算机技术",
+        "tid_v2": 2096,
+        "tname_v2": "AI学习",
+        "zone_primary": "人工智能",
+        "zone_sub": "AI学习",
+        "zone_version": "v2",
+        "legacy_zone_primary": "科技",
+        "legacy_zone_sub": "计算机技术",
+    }
+
+    app = create_app(database=db, enable_scheduler=False)
+    with patch("app.routers.video_zone.BilibiliClient", return_value=fake_client):
+        with TestClient(app) as client:
+            # 1) Direct BV lookup (works without admin auth)
+            r1 = client.get("/api/video-zone/lookup", params={"q": "BV1ab411c7mD"})
+            assert r1.status_code == 200
+            body1 = r1.json()
+            assert body1["zone_primary"] == "人工智能"
+            assert body1["zone_sub"] == "AI学习"
+            assert body1["zone_version"] == "v2"
+            assert body1["legacy_zone_primary"] == "科技"
+            fake_client.get_video_zone_info.assert_awaited_with(bvid="BV1ab411c7mD", aid=None)
+
+            # 2) Short link lookup resolves short URL then fetches video zone
+            r2 = client.get(
+                "/api/video-zone/lookup",
+                params={"q": "【好视频】https://b23.tv/short99"},
+            )
+            assert r2.status_code == 200
+            fake_client.resolve_short_url.assert_awaited_with("https://b23.tv/short99")
+
+            # 3) Stateless one-off query: nothing persisted to accounts or videos tables
+            assert db.get_accounts_summary() == []
+            assert db.get_videos("424242") == []
+
+            # 4) Invalid input -> 400
+            r_bad = client.get("/api/video-zone/lookup", params={"q": "not-a-video"})
+            assert r_bad.status_code == 400
+
+            # 5) Not found (-404) -> 404
+            fake_client.get_video_zone_info.side_effect = BilibiliAPIError("nothing", code=-404)
+            r_404 = client.get("/api/video-zone/lookup", params={"q": "BV1ab411c7mD"})
+            assert r_404.status_code == 404
+
+            # 6) Rate limit / 412 -> 503
+            fake_client.get_video_zone_info.side_effect = BilibiliAPIError("blocked", code=412)
+            r_503 = client.get("/api/video-zone/lookup", params={"q": "BV1ab411c7mD"})
+            assert r_503.status_code == 503
+
+            # 7) Standalone entry and modal markup present in index.html
+            html = client.get("/").text
+            assert 'id="btnOpenZoneLookup"' in html
+            assert 'id="zoneLookupModal"' in html
+            assert 'action="/api/video-zone/lookup"' in html
+
+
+
 
 
 

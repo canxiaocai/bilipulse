@@ -14,8 +14,8 @@
   </script>
   <title>B站账号实时监控</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 28 28' fill='none'%3E%3Crect width='28' height='28' fill='%2307090E'/%3E%3Crect x='2.5' y='4.5' width='23' height='19' stroke='%2300E5FF' stroke-width='2'/%3E%3Cpolyline points='5.5,16 9,16 11.2,10.5 14,20 16.8,13 19,16 22.5,16' stroke='%23FF2A7A' stroke-width='2.2' stroke-linecap='square' stroke-linejoin='miter'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/static/tokens-layout.css?v=20261123a" />
-  <link rel="stylesheet" href="/static/styles.css?v=20261123a" />
+  <link rel="stylesheet" href="/static/tokens-layout.css?v=20261123b" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261123b" />
 </head>
 <body>
   <div class="studio-shell" id="studioShell">
@@ -176,6 +176,21 @@
           <div class="account-strip" id="accountPill">
             <span class="muted mono">尚未绑定监控账号</span>
           </div>
+        </div>
+
+        <div class="topbar-actions">
+          <button
+            type="button"
+            class="btn btn-chamfer btn-secondary btn-sm topbar-zone-btn"
+            id="btnOpenZoneLookup"
+            title="通过 BV 号或视频链接一次性查询任意 B站视频分区"
+          >
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true">
+              <circle cx="11" cy="11" r="7" />
+              <line x1="21" y1="21" x2="16.65" y2="16.65" />
+            </svg>
+            <span>视频分区查询</span>
+          </button>
         </div>
       </header>
 
@@ -750,9 +765,189 @@
     </div>
   </dialog>
 
+  <!-- Native Centered One-Off Bilibili Video Partition Lookup Modal -->
+  <dialog class="telemetry-modal zone-lookup-modal" id="zoneLookupModal" closedby="any" aria-labelledby="zoneLookupTitle">
+    <div class="modal-shell">
+      <header class="modal-header">
+        <div class="modal-title-group">
+          <span class="section-kicker mono">VIDEO PARTITION LOOKUP</span>
+          <h2 class="modal-title" id="zoneLookupTitle">B站视频分区查询</h2>
+        </div>
+
+        <button type="button" class="btn btn-ghost modal-close-btn" id="btnCloseZoneLookupModal" aria-label="关闭视频分区查询弹窗" title="关闭">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="square" aria-hidden="true">
+            <line x1="18" y1="6" x2="6" y2="18" />
+            <line x1="6" y1="6" x2="18" y2="18" />
+          </svg>
+        </button>
+      </header>
+
+      <div class="zone-lookup-body">
+        <search>
+          <form
+            class="blueprint-form zone-lookup-form"
+            id="zoneLookupForm"
+            action="/api/video-zone/lookup"
+            method="GET"
+            aria-labelledby="zoneLookupTitle"
+            novalidate
+          >
+            <div class="form-field full">
+              <label for="zoneLookupInput">BV 号或视频链接 <span class="req" aria-hidden="true">*</span></label>
+              <div class="zone-lookup-input-row">
+                <input
+                  type="search"
+                  id="zoneLookupInput"
+                  name="q"
+                  autocomplete="off"
+                  autocorrect="off"
+                  autocapitalize="none"
+                  spellcheck="false"
+                  enterkeyhint="search"
+                  aria-describedby="zoneLookupHint"
+                  data-error="zoneLookupFieldError"
+                  placeholder="粘贴 BV1...、bilibili.com/video/... 或 b23.tv 短链"
+                  required
+                  autofocus
+                />
+                <button type="submit" class="btn btn-chamfer btn-primary zone-lookup-submit" id="btnZoneLookupSubmit">
+                  查询分区
+                </button>
+              </div>
+              <p class="zone-lookup-hint" id="zoneLookupHint">
+                支持全站任意视频的 BV 号、av 号、完整链接、b23.tv 短链或分享文案；单次实时查询，不会写入监控列表。
+              </p>
+              <p class="field-error mono hidden" id="zoneLookupFieldError"></p>
+            </div>
+
+            <div class="test-result hidden" id="zoneLookupStatus" role="status" aria-live="polite"></div>
+          </form>
+        </search>
+
+        <section class="zone-lookup-result hidden" id="zoneLookupResult" aria-label="视频分区查询结果">
+          <div class="zone-lookup-hero">
+            <span class="fiducial fiducial-tl" aria-hidden="true"></span>
+            <span class="fiducial fiducial-tr" aria-hidden="true"></span>
+
+            <div class="zone-lookup-hero-head">
+              <div class="zone-lookup-hero-title">
+                <span class="scope-kicker mono">所属分区</span>
+                <span class="status-chip mono" id="zoneLookupVersionChip">V2 新版分区</span>
+              </div>
+
+              <span class="copy">
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-sm copy-button zone-copy-btn"
+                  id="btnCopyZoneResult"
+                  command="--copy"
+                  commandfor="zoneLookupPathText"
+                >
+                  <svg class="icon-copy" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true">
+                    <rect x="9" y="9" width="12" height="12" />
+                    <path d="M5 15H3V3h12v2" />
+                  </svg>
+                  <svg class="icon-check" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="square" aria-hidden="true">
+                    <polyline points="20 6 9 17 4 12" />
+                  </svg>
+                  <span>复制分区</span>
+                </button>
+                <span class="tip mono" role="status"></span>
+              </span>
+            </div>
+
+            <div class="zone-lookup-tier-grid">
+              <div class="zone-lookup-tier-cell zone-tier-primary">
+                <span class="zone-tier-label mono">一级分区</span>
+                <strong class="zone-tier-val" id="zoneLookupPrimary">--</strong>
+              </div>
+              <div class="zone-lookup-tier-cell zone-tier-sub">
+                <span class="zone-tier-label mono">二级分区</span>
+                <strong class="zone-tier-val" id="zoneLookupSub">--</strong>
+              </div>
+            </div>
+
+            <div class="zone-lookup-meta-bar mono">
+              <span class="zone-lookup-path" id="zoneLookupPathText">--</span>
+              <span class="zone-lookup-ids muted" id="zoneLookupIds"></span>
+            </div>
+
+            <div class="zone-lookup-legacy hidden" id="zoneLookupLegacyRow">
+              <span class="muted">旧版 V1 分区对照：</span>
+              <span class="mono" id="zoneLookupLegacyText">--</span>
+            </div>
+          </div>
+
+          <div class="zone-lookup-video">
+            <div class="zone-lookup-cover-frame">
+              <img id="zoneLookupCover" referrerpolicy="no-referrer" alt="" />
+            </div>
+            <div class="zone-lookup-video-info">
+              <a
+                class="zone-lookup-video-title"
+                id="zoneLookupVideoTitle"
+                href="https://www.bilibili.com"
+                target="_blank"
+                rel="noopener noreferrer"
+              >--</a>
+              <div class="zone-lookup-video-meta mono">
+                <a
+                  class="bvid-link bvid-pill mono"
+                  id="zoneLookupBvidLink"
+                  href="https://www.bilibili.com"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >--</a>
+                <a
+                  class="zone-lookup-owner-link"
+                  id="zoneLookupOwnerLink"
+                  href="https://space.bilibili.com"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >--</a>
+                <span class="muted" id="zoneLookupPubdate">--</span>
+                <span class="muted" id="zoneLookupDuration">--:--</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="zone-lookup-stats mono">
+            <div class="zone-lookup-stat-cell">
+              <span class="muted">播放</span>
+              <strong id="zoneLookupPlay">--</strong>
+            </div>
+            <div class="zone-lookup-stat-cell">
+              <span class="muted">点赞</span>
+              <strong id="zoneLookupLike">--</strong>
+            </div>
+            <div class="zone-lookup-stat-cell">
+              <span class="muted">投币</span>
+              <strong id="zoneLookupCoin">--</strong>
+            </div>
+            <div class="zone-lookup-stat-cell">
+              <span class="muted">收藏</span>
+              <strong id="zoneLookupFav">--</strong>
+            </div>
+          </div>
+
+          <div class="zone-lookup-footer">
+            <button type="button" class="btn btn-ghost btn-sm" id="btnZoneLookupClear">清空结果</button>
+            <a
+              class="btn btn-chamfer btn-secondary btn-sm mono"
+              id="zoneLookupOpenBili"
+              href="https://www.bilibili.com"
+              target="_blank"
+              rel="noopener noreferrer"
+            >B站打开视频 ↗</a>
+          </div>
+        </section>
+      </div>
+    </div>
+  </dialog>
+
   <!-- HUD Toast Notifications Stack -->
   <div class="toast-stack" id="toastStack" aria-live="polite"></div>
 
-  <script type="module" src="/static/app.js?v=20261123a"></script>
+  <script type="module" src="/static/app.js?v=20261123b"></script>
 </body>
 </html>

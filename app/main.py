@@ -15,6 +15,7 @@ from app.routers.accounts import router as accounts_router
 from app.routers.admin import router as admin_router
 from app.routers.dashboard import router as dashboard_router
 from app.routers.settings import router as settings_router
+from app.routers.video_zone import router as video_zone_router
 from app.scheduler import SchedulerManager
 
 logging.basicConfig(
@@ -61,6 +62,7 @@ def create_app(
     application.include_router(accounts_router)
     application.include_router(dashboard_router)
     application.include_router(settings_router)
+    application.include_router(video_zone_router)
 
     if STATIC_DIR.exists():
         application.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
