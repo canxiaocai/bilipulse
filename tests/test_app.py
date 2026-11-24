@@ -5459,3 +5459,256 @@ def test_scheduled_crawl_not_starved_by_fast_pulse(tmp_path: Path):
 
     asyncio.run(verify_stagger_and_wait())
 
+
+def test_shared_ssl_context_and_crawl_all_client_reuse(tmp_path: Path):
+    ctx1 = BilibiliClient._get_ssl_context()
+    ctx2 = BilibiliClient._get_ssl_context()
+    assert ctx1 is ctx2
+
+    db = Database(db_path=tmp_path / "reuse.db")
+    db.create_account("6001", enabled=True, set_active=True)
+    db.create_account("6002", enabled=True, set_active=False)
+    db.update_settings({"cookie": "SESSDATA=shared_pool_token"})
+
+    created_cookies: list[str] = []
+
+    def make_client(cookie: str = "", **kwargs):
+        created_cookies.append(cookie)
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.__aexit__.return_value = None
+        client.get_relation_stat.return_value = {"follower": 500, "following": 2}
+        client.get_account_card.return_value = {
+            "name": "PoolUP",
+            "face": "https://example.com/a.jpg",
+            "follower": 500,
+            "archive_count": 0,
+        }
+        client.get_all_videos.return_value = []
+        return client
+
+    svc = CrawlService(db)
+    with patch("app.bilibili.collectors.BilibiliClient", side_effect=make_client):
+        res = asyncio.run(svc.run_crawl_all(force_sync_videos=False))
+    assert res["skipped"] is False
+    assert res["total"] == 2
+    # Both accounts share the same cookie, so only one client instance is created for the batch
+    assert created_cookies == ["SESSDATA=shared_pool_token"]
+
+    # When an account has a distinct cookie override, a separate isolated client is created
+    db.update_account("6002", cookie="SESSDATA=isolated_6002")
+    created_cookies.clear()
+    with patch("app.bilibili.collectors.BilibiliClient", side_effect=make_client):
+        res2 = asyncio.run(svc.run_crawl_all(force_sync_videos=False))
+    assert res2["total"] == 2
+    assert created_cookies == ["SESSDATA=shared_pool_token", "SESSDATA=isolated_6002"]
+
+
+def test_online_404_backoff_stops_recent_video_retry_loop(tmp_path: Path):
+    from datetime import datetime, timedelta, timezone
+
+    uid = "7001"
+    db = Database(db_path=tmp_path / "online_404_backoff.db")
+    now_dt = datetime.now(timezone.utc).astimezone()
+    now_ts = int(now_dt.timestamp())
+
+    db.create_account(uid, enabled=True, set_active=True)
+    db.update_settings(
+        {
+            "interval_minutes": "5",
+            "request_delay_ms": "50",
+            f"last_video_sync_ts_{uid}": str(now_ts),
+            f"last_full_video_sync_ts_{uid}": str(now_ts),
+            f"video_sync_rule_{uid}": VIDEO_SYNC_RULE,
+            f"last_archive_count_{uid}": "1",
+        }
+    )
+    # Newly published (<1h old -> T0 fast tier) with prior online_count=5
+    db.upsert_videos(
+        uid,
+        [
+            {
+                "bvid": "BV_gone_recent",
+                "aid": 700101,
+                "title": "Deleted Recent Video",
+                "pubdate": now_ts - 1800,
+                "play_count": 100,
+                "like_count": 10,
+                "coin_count": 2,
+                "cids": [{"cid": 77001, "page": 1, "part": "P1"}],
+            }
+        ],
+        now_ts=now_ts - 600,
+    )
+    with db.connection() as conn:
+        conn.execute(
+            "UPDATE videos SET last_online_count = 5, last_checked_at = ? WHERE bvid = 'BV_gone_recent'",
+            ((now_dt - timedelta(minutes=10)).isoformat(),),
+        )
+
+    online_calls: list[str] = []
+
+    def make_client(cookie: str = "", **kwargs):
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.__aexit__.return_value = None
+        client.get_relation_stat.return_value = {"follower": 1000, "following": 5}
+        client.get_account_card.return_value = {
+            "name": "RecentUP",
+            "face": "",
+            "follower": 1000,
+            "archive_count": 1,
+        }
+
+        async def online_404(bvid: str, cid: int):
+            online_calls.append(bvid)
+            raise BilibiliAPIError(f"online/total error -404 for {bvid}/{cid}: 啥都木有", code=-404)
+
+        client.get_video_online_total.side_effect = online_404
+        client.get_video_stat.return_value = {"play_count": 100, "like_count": 10, "coin_count": 2}
+        return client
+
+    svc = CrawlService(db)
+    with patch("app.bilibili.collectors.BilibiliClient", side_effect=make_client):
+        with patch("app.bilibili.collectors.asyncio.sleep", new=AsyncMock()):
+            res1 = asyncio.run(svc.run_crawl(uid=uid, force_sync_videos=False))
+            assert res1["status"] == "partial"
+            assert online_calls == ["BV_gone_recent"]
+
+            v_after = {v["bvid"]: v for v in db.get_videos(uid)}["BV_gone_recent"]
+            assert v_after["online_backoff_until_ts"] > now_ts
+            assert v_after["last_online_count"] == 0
+
+            # Subsequent regular crawl AND fast pulse MUST skip the backed-off recent video
+            online_calls.clear()
+            res2 = asyncio.run(svc.run_crawl(uid=uid, force_sync_videos=False))
+            assert res2["status"] == "success"
+            assert res2["online_viewers_total"] == 0
+            assert online_calls == []
+
+            pulse_res = asyncio.run(svc.run_fast_pulse())
+            assert pulse_res["skipped"] is False
+            assert pulse_res["videos_polled"] == 0
+            assert online_calls == []
+
+
+def test_fast_pulse_round_robin_fairness_prevents_tail_account_starvation(tmp_path: Path):
+    from datetime import datetime, timedelta, timezone
+
+    db = Database(db_path=tmp_path / "fair_pulse.db")
+    now_dt = datetime.now(timezone.utc).astimezone()
+    now_ts = int(now_dt.timestamp())
+    stale_iso = (now_dt - timedelta(minutes=10)).isoformat()
+
+    uids = ["8001", "8002", "8003"]
+    for idx, uid in enumerate(uids):
+        db.create_account(uid, enabled=True, set_active=(idx == 0))
+        vids = [
+            {
+                "bvid": f"BV_{uid}_{i}",
+                "aid": int(uid) * 100 + i,
+                "title": f"Hot {uid}-{i}",
+                "pubdate": now_ts - 3600,
+                "play_count": 1000 + i * 100,
+                "like_count": 10,
+                "coin_count": 2,
+                "cids": [{"cid": int(uid) * 1000 + i, "page": 1, "part": "P1"}],
+            }
+            for i in range(6)
+        ]
+        db.upsert_videos(uid, vids, now_ts=now_ts - 600)
+        with db.connection() as conn:
+            for i in range(6):
+                conn.execute(
+                    """
+                    UPDATE videos
+                    SET last_online_count = ?, last_checked_at = ?, stats_synced_at = ?
+                    WHERE bvid = ?
+                    """,
+                    (20 - i, stale_iso, stale_iso, f"BV_{uid}_{i}"),
+                )
+
+    db.update_settings({"interval_minutes": "5", "request_delay_ms": "50"})
+
+    polled_by_uid: dict[str, list[str]] = {u: [] for u in uids}
+    stats_by_uid: dict[str, list[str]] = {u: [] for u in uids}
+
+    def make_client(cookie: str = "", **kwargs):
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.__aexit__.return_value = None
+
+        async def online_ok(bvid: str, cid: int):
+            uid_part = bvid.split("_")[1]
+            polled_by_uid[uid_part].append(bvid)
+            return (11, "11")
+
+        async def stat_ok(bvid: str):
+            uid_part = bvid.split("_")[1]
+            stats_by_uid[uid_part].append(bvid)
+            return {"play_count": 2000, "like_count": 50, "coin_count": 10}
+
+        client.get_video_online_total.side_effect = online_ok
+        client.get_video_stat.side_effect = stat_ok
+        return client
+
+    svc = CrawlService(db)
+    with patch("app.bilibili.collectors.BilibiliClient", side_effect=make_client):
+        with patch("app.bilibili.collectors.asyncio.sleep", new=AsyncMock()):
+            res = asyncio.run(svc.run_fast_pulse(max_videos=9, stats_quota=6))
+
+    assert res["skipped"] is False
+    assert res["accounts_touched"] == 3
+    assert res["videos_polled"] == 9
+    assert res["stats_refreshed"] == 6
+    # Every account—including tail account 8003—must get its fair 3 online + 2 stats share
+    for uid in uids:
+        assert len(polled_by_uid[uid]) == 3
+        assert len(stats_by_uid[uid]) == 2
+
+
+def test_db_profile_noop_index_cleanup_revision_headers_and_favicon(tmp_path: Path):
+    db = Database(db_path=tmp_path / "hygiene.db")
+
+    # Redundant idx_snapshots_uid_ts must not exist; idx_snapshots_uid_ts_id must exist
+    with db.read_connection() as conn:
+        idx_names = {
+            r["name"]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'account_snapshots'"
+            ).fetchall()
+        }
+    assert "idx_snapshots_uid_ts" not in idx_names
+    assert "idx_snapshots_uid_ts_id" in idx_names
+
+    # No-op profile update must not rewrite updated_at
+    db.create_account("9001", enabled=True, account_name="SameName", account_face="https://a/1.jpg")
+    first_updated = db.get_account("9001")["updated_at"]
+    db.update_account_profile("9001", account_name="SameName", account_face="https://a/1.jpg")
+    assert db.get_account("9001")["updated_at"] == first_updated
+    db.update_account_profile("9001", account_name="NewName", account_face="https://a/1.jpg")
+    assert db.get_account("9001")["account_name"] == "NewName"
+
+    # Mutation endpoints emit X-Data-Revision and /favicon.ico serves SVG cleanly
+    app = create_app(database=db, enable_scheduler=False)
+    with TestClient(app) as client:
+        fav = client.get("/favicon.ico")
+        assert fav.status_code == 200
+        assert "image/svg+xml" in fav.headers.get("content-type", "")
+
+        r_set = client.put("/api/settings", json={"interval_minutes": 4})
+        assert r_set.status_code == 200
+        rev1 = int(r_set.headers.get("X-Data-Revision", "0"))
+        assert rev1 > 1
+
+        r_add = client.post("/api/accounts", json={"uid": "9002", "enabled": True})
+        assert r_add.status_code == 200
+        rev2 = int(r_add.headers.get("X-Data-Revision", "0"))
+        assert rev2 > rev1
+
+        r_del = client.delete("/api/accounts/9002")
+        assert r_del.status_code == 200
+        rev3 = int(r_del.headers.get("X-Data-Revision", "0"))
+        assert rev3 > rev2
+
+

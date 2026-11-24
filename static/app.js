@@ -4990,6 +4990,8 @@ async function loadDashboard({
   const reqHours = Math.max(0, Math.round(Number(state.hours) || 0));
   const activeReqId = reqId !== null ? reqId : ++state.dashboardReqSeq;
   if (!silent) {
+    clearLiveRefreshTimer();
+    state.liveRefreshPending = false;
     cancelPendingOverviewSnapshots();
     if (state.dashboardAbortController) {
       state.dashboardAbortController.abort();
@@ -5169,14 +5171,16 @@ function scheduleAccountsSummaryRefresh(delayMs = 1200) {
   }, Math.max(0, Number(delayMs) || 0));
 }
 
-async function refreshLiveData({ force = false } = {}) {
+async function refreshLiveData({ force = false, queueIfInFlight = true } = {}) {
   if (state.demoMode) return;
   if (document.hidden && !force) {
     state.liveSyncDirty = true;
     return;
   }
   if (state.liveRefreshInFlight) {
-    state.liveRefreshPending = true;
+    if (queueIfInFlight) {
+      state.liveRefreshPending = true;
+    }
     return;
   }
 
@@ -5231,7 +5235,7 @@ function syncFallbackPollInterval() {
     if (!state.liveEventConnected) {
       connectLiveEventStream();
     }
-    refreshLiveData();
+    refreshLiveData({ queueIfInFlight: false });
   }, targetMs);
 }
 
@@ -5323,6 +5327,8 @@ function connectLiveEventStream() {
     }
 
     const serverRev = Number(payload.rev || 0);
+    const isAlreadySeenRev =
+      Number.isFinite(serverRev) && serverRev > 0 && serverRev <= state.liveEventRev;
     if (Number.isFinite(serverRev) && serverRev > state.liveEventRev) {
       state.liveEventRev = serverRev;
     }
@@ -5351,6 +5357,9 @@ function connectLiveEventStream() {
       }
     } else if (payload.kind === "accounts_changed" || payload.kind === "settings_changed") {
       invalidateAllCaches();
+      if (isAlreadySeenRev) {
+        return;
+      }
     }
 
     if (
@@ -5404,34 +5413,37 @@ function connectLiveEventStream() {
 }
 
 function bindLiveSyncLifecycle() {
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState !== "visible" || state.demoMode) return;
-    connectLiveEventStream();
-    refreshLiveData();
-  });
-
-  window.addEventListener("focus", () => {
-    if (state.demoMode || document.hidden) return;
+  const triggerResumeSync = () => {
     connectLiveEventStream();
     if (
       state.liveSyncDirty ||
       !state.liveEventConnected ||
       Date.now() - state.lastDashboardSyncMs >= FOCUS_SYNC_MIN_GAP_MS
     ) {
-      refreshLiveData();
+      refreshLiveData({ queueIfInFlight: false });
     }
+  };
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible" || state.demoMode) return;
+    triggerResumeSync();
+  });
+
+  window.addEventListener("focus", () => {
+    if (state.demoMode || document.hidden) return;
+    triggerResumeSync();
   });
 
   window.addEventListener("online", () => {
     if (state.demoMode) return;
     connectLiveEventStream();
-    refreshLiveData();
+    refreshLiveData({ queueIfInFlight: false });
   });
 
   window.addEventListener("pageshow", (ev) => {
     if (!ev.persisted || state.demoMode) return;
     connectLiveEventStream();
-    refreshLiveData();
+    refreshLiveData({ queueIfInFlight: false });
   });
 
   window.addEventListener("beforeunload", () => {

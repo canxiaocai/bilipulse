@@ -122,6 +122,7 @@ async def update_settings(
     event_bus = getattr(request.app.state, "event_bus", None)
     if event_bus is not None:
         event_bus.publish("settings_changed", uid=new_uid)
+        response.headers["X-Data-Revision"] = str(event_bus.revision)
     if (
         new_uid
         and new_uid != old_uid

@@ -1,4 +1,6 @@
 import asyncio
+from contextlib import AsyncExitStack
+import json
 import logging
 import time
 from abc import ABC, abstractmethod
@@ -62,6 +64,7 @@ STATS_UNCHANGED_TTL_BY_TIER: dict[int, int] = {
 STATS_BACKOFF_ERROR_CODES = frozenset({-404, 62002, 62004, 62012, -403})
 ONLINE_BACKOFF_ERROR_CODES = frozenset({-404, 62002, 62004, 62012})
 STATS_BACKOFF_SECONDS = 24 * 3600
+ONLINE_BACKOFF_SECONDS = 24 * 3600
 
 # Budgets & sync intervals
 TIERED_VIDEO_THRESHOLD = 80
@@ -72,6 +75,58 @@ STATS_REFRESH_QUOTA = 30
 FAST_PULSE_MAX_VIDEOS = 100
 FAST_PULSE_STATS_QUOTA = 24
 FULL_VIDEO_SYNC_INTERVAL_SEC = 6 * 3600
+
+
+def _get_video_cids_list(video: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return parsed CIDs list for a video dict, decoding cids_json lazily if needed."""
+    cids = video.get("cids")
+    if isinstance(cids, list):
+        return cids
+    raw_json = video.get("cids_json")
+    if not raw_json or raw_json == "[]":
+        video["cids"] = []
+        return []
+    try:
+        parsed = json.loads(raw_json)
+        result = parsed if isinstance(parsed, list) else []
+    except (ValueError, TypeError):
+        result = []
+    video["cids"] = result
+    return result
+
+
+def _load_crawl_videos(db: Database, uid: str) -> list[dict[str, Any]]:
+    """Load minimal video rows for crawling, falling back to get_videos for custom stubs."""
+    if hasattr(db, "get_crawl_videos"):
+        return db.get_crawl_videos(uid)
+    return db.get_videos(uid)
+
+
+def _allocate_round_robin(
+    items_by_uid: list[tuple[str, list[Any]]],
+    max_total: int,
+) -> dict[str, list[Any]]:
+    """Distribute a global budget fairly across accounts in round-robin waves preserving per-account priority."""
+    budget = max(0, int(max_total))
+    allocated: dict[str, list[Any]] = {uid: [] for uid, _ in items_by_uid}
+    if budget <= 0 or not items_by_uid:
+        return allocated
+
+    active: list[tuple[str, list[Any], int]] = [
+        (uid, items, 0) for uid, items in items_by_uid if items
+    ]
+    remaining = budget
+    while remaining > 0 and active:
+        next_active: list[tuple[str, list[Any], int]] = []
+        for uid, items, idx in active:
+            if remaining <= 0:
+                break
+            allocated[uid].append(items[idx])
+            remaining -= 1
+            if idx + 1 < len(items):
+                next_active.append((uid, items, idx + 1))
+        active = next_active
+    return allocated
 
 
 def _parse_iso_ts(raw: Any) -> Optional[float]:
@@ -209,13 +264,20 @@ def select_polled_videos(
         return [], set(), False
 
     tier_by_bvid, _ = summarize_video_tiers(videos, now_ts)
-    priority_bvids = {bvid for bvid, tier in tier_by_bvid.items() if tier <= TIER_ACTIVE}
+    priority_bvids = {
+        v["bvid"]
+        for v in videos
+        if tier_by_bvid[v["bvid"]] <= TIER_ACTIVE
+        and (force_active or int(v.get("online_backoff_until_ts") or 0) <= now_ts)
+    }
 
     active_due: list[dict[str, Any]] = []
     background_due: list[dict[str, Any]] = []
 
     for v in videos:
         bvid = v["bvid"]
+        if not force_active and int(v.get("online_backoff_until_ts") or 0) > now_ts:
+            continue
         tier = tier_by_bvid[bvid]
         if tier <= TIER_ACTIVE:
             if force_active or is_video_online_due(
@@ -266,6 +328,7 @@ def select_fast_pulse_videos(
         v
         for v in videos
         if tier_by_bvid[v["bvid"]] == TIER_FAST
+        and int(v.get("online_backoff_until_ts") or 0) <= now_ts
         and is_video_online_due(v, TIER_FAST, now_ts, base_interval_sec=120)
     ]
     due_fast.sort(
@@ -474,7 +537,7 @@ async def _fetch_video_batch(
                             }
                         )
                         view_cids = stat.get("cids")
-                        if not video.get("cids") and isinstance(view_cids, list) and view_cids:
+                        if not _get_video_cids_list(video) and isinstance(view_cids, list) and view_cids:
                             video["cids"] = view_cids
                             await asyncio.to_thread(db.update_video_cids, bvid, view_cids)
                         await asyncio.sleep(delay_sec)
@@ -491,11 +554,12 @@ async def _fetch_video_batch(
             if bvid not in online_set:
                 return None
 
-            cids = video.get("cids") or []
+            cids = _get_video_cids_list(video)
             if not cids:
                 try:
                     cids = await client.get_video_cids(bvid)
                     if cids:
+                        video["cids"] = cids
                         await asyncio.to_thread(db.update_video_cids, bvid, cids)
                     await asyncio.sleep(delay_sec)
                 except BilibiliAPIError as exc:
@@ -616,24 +680,30 @@ class AccountFollowerCollector(BaseCollector):
     name = "account_follower"
 
     async def collect(self, ctx: CrawlContext) -> None:
-        stat = await ctx.client.get_relation_stat(ctx.uid)
-        ctx.follower_count = stat["follower"]
-        ctx.following_count = stat["following"]
+        stat_res, card_res = await asyncio.gather(
+            ctx.client.get_relation_stat(ctx.uid),
+            ctx.client.get_account_card(ctx.uid),
+            return_exceptions=True,
+        )
+        if isinstance(stat_res, BaseException):
+            raise stat_res
+        ctx.follower_count = stat_res["follower"]
+        ctx.following_count = stat_res["following"]
 
-        try:
-            card = await ctx.client.get_account_card(ctx.uid)
-            if await ctx.check_deleted():
-                return
-            if card.get("name") or card.get("face"):
-                await asyncio.to_thread(
-                    ctx.db.update_account_profile,
-                    ctx.uid,
-                    account_name=card.get("name") or None,
-                    account_face=card.get("face") or None,
-                )
-            ctx.extra_metrics["archive_count_reported"] = card.get("archive_count", 0)
-        except Exception as exc:
-            logger.warning("Failed to fetch account card for %s: %s", ctx.uid, exc)
+        if isinstance(card_res, BaseException):
+            logger.warning("Failed to fetch account card for %s: %s", ctx.uid, card_res)
+            return
+
+        if await ctx.check_deleted():
+            return
+        if card_res.get("name") or card_res.get("face"):
+            await asyncio.to_thread(
+                ctx.db.update_account_profile,
+                ctx.uid,
+                account_name=card_res.get("name") or None,
+                account_face=card_res.get("face") or None,
+            )
+        ctx.extra_metrics["archive_count_reported"] = card_res.get("archive_count", 0)
 
 
 class AllVideosOnlineCollector(BaseCollector):
@@ -650,7 +720,7 @@ class AllVideosOnlineCollector(BaseCollector):
             max(5, int(ctx.settings.get("video_sync_interval_minutes", "30") or 30)) * 60
         )
 
-        cached_videos = await asyncio.to_thread(ctx.db.get_videos, ctx.uid)
+        cached_videos = await asyncio.to_thread(_load_crawl_videos, ctx.db, ctx.uid)
         now_ts = time.time()
         last_sync_ts = int(ctx.settings.get(f"last_video_sync_ts_{ctx.uid}", "0") or 0)
         rule_matches = ctx.settings.get(f"video_sync_rule_{ctx.uid}", "") == VIDEO_SYNC_RULE
@@ -726,7 +796,7 @@ class AllVideosOnlineCollector(BaseCollector):
                     sync_updates[f"last_archive_count_{ctx.uid}"] = str(reported_count)
                 await asyncio.to_thread(ctx.db.update_settings, sync_updates)
                 ctx.settings.update({k: str(v) for k, v in sync_updates.items()})
-                cached_videos = await asyncio.to_thread(ctx.db.get_videos, ctx.uid)
+                cached_videos = await asyncio.to_thread(_load_crawl_videos, ctx.db, ctx.uid)
             except Exception as exc:
                 msg = f"同步视频列表失败: {exc}"
                 logger.warning(msg)
@@ -803,7 +873,12 @@ class AllVideosOnlineCollector(BaseCollector):
                 ctx.db.set_video_stats_backoff_batch, stats_backoff_bvids, backoff_until
             )
         if online_backoff_bvids:
-            await asyncio.to_thread(ctx.db.set_video_online_backoff_batch, online_backoff_bvids)
+            online_backoff_until = int(time.time()) + ONLINE_BACKOFF_SECONDS
+            await asyncio.to_thread(
+                ctx.db.set_video_online_backoff_batch,
+                online_backoff_bvids,
+                backoff_until_ts=online_backoff_until,
+            )
 
         unpolled_carryover = sum(
             max(0, int(v.get("last_online_count") or 0))
@@ -834,6 +909,8 @@ class CrawlService:
         self.event_bus = event_bus
         self._lock = asyncio.Lock()
         self.crawling_uid: Optional[str] = None
+        self._active_batch_client: Optional[BilibiliClient] = None
+        self._active_batch_settings: Optional[dict[str, str]] = None
 
     def _emit(self, kind: str, *, uid: Optional[str] = None, **extra: Any) -> None:
         if self.event_bus is not None:
@@ -856,25 +933,39 @@ class CrawlService:
         return any(acc["uid"] == clean_uid for acc in enabled_accounts)
 
     async def _crawl_single_uid(
-        self, uid: str, force_sync_videos: bool = False
+        self,
+        uid: str,
+        force_sync_videos: bool = False,
     ) -> dict[str, Any]:
         target_uid = uid.strip()
         if not target_uid:
             return {"skipped": True, "reason": "尚未配置 B站 UID"}
 
-        settings = await asyncio.to_thread(self.db.get_all_settings)
-        cookie = await asyncio.to_thread(self.db.get_effective_cookie, target_uid)
-        was_monitored = (await asyncio.to_thread(self.db.get_account, target_uid)) is not None
+        shared_client = self._active_batch_client
+        shared_settings = self._active_batch_settings
+
+        def _load_meta() -> tuple[dict[str, str], str, bool]:
+            with self.db.read_session():
+                s = (
+                    dict(shared_settings)
+                    if shared_settings is not None
+                    else self.db.get_all_settings()
+                )
+                c = "" if shared_client is not None else self.db.get_effective_cookie(target_uid)
+                mon = self.db.get_account(target_uid) is not None
+                return s, c, mon
+
+        settings, cookie, was_monitored = await asyncio.to_thread(_load_meta)
 
         started = time.perf_counter()
         self.crawling_uid = target_uid
         self._emit("crawl_started", uid=target_uid)
         snapshot_emitted = False
         try:
-            async with BilibiliClient(cookie=cookie) as client:
+            async def _run_collectors(active_client: BilibiliClient) -> CrawlContext:
                 ctx = CrawlContext(
                     uid=target_uid,
-                    client=client,
+                    client=active_client,
                     db=self.db,
                     settings=settings,
                     force_sync_videos=force_sync_videos,
@@ -893,6 +984,13 @@ class CrawlService:
                         err = f"[{collector.name}] 未预期异常: {exc}"
                         logger.exception(err)
                         ctx.errors.append(err)
+                return ctx
+
+            if shared_client is not None:
+                ctx = await _run_collectors(shared_client)
+            else:
+                async with BilibiliClient(cookie=cookie) as client:
+                    ctx = await _run_collectors(client)
 
             if await ctx.check_deleted():
                 logger.info("Skipping snapshot persistence for deleted UID %s", target_uid)
@@ -1010,25 +1108,47 @@ class CrawlService:
             return {"skipped": True, "reason": "已有采集任务正在进行中"}
 
         async with self._lock:
-            accounts = await asyncio.to_thread(self.db.get_enabled_accounts)
+            def _load_batch_init() -> tuple[list[dict[str, Any]], dict[str, str]]:
+                with self.db.read_session():
+                    return self.db.get_enabled_accounts(), self.db.get_all_settings()
+
+            accounts, shared_settings = await asyncio.to_thread(_load_batch_init)
             if not accounts:
                 return {"skipped": True, "reason": "没有启用的监控账号"}
 
             results: list[dict[str, Any]] = []
-            for idx, acc in enumerate(accounts):
-                if not await self._is_uid_still_enabled(acc["uid"]):
-                    logger.info(
-                        "Skipping UID %s during batch crawl (deleted or paused)",
-                        acc["uid"],
-                    )
-                    continue
-                res = await self._crawl_single_uid(
-                    acc["uid"], force_sync_videos=force_sync_videos
-                )
-                if not res.get("skipped"):
-                    results.append(res)
-                if idx < len(accounts) - 1:
-                    await asyncio.sleep(0.5)
+            client_pool: dict[str, BilibiliClient] = {}
+            self._active_batch_settings = shared_settings
+            try:
+                async with AsyncExitStack() as stack:
+                    for idx, acc in enumerate(accounts):
+                        uid = acc["uid"]
+                        if not await self._is_uid_still_enabled(uid):
+                            logger.info(
+                                "Skipping UID %s during batch crawl (deleted or paused)",
+                                uid,
+                            )
+                            continue
+                        cookie = await asyncio.to_thread(self.db.get_effective_cookie, uid)
+                        client = client_pool.get(cookie)
+                        if client is None:
+                            client = await stack.enter_async_context(BilibiliClient(cookie=cookie))
+                            client_pool[cookie] = client
+                        self._active_batch_client = client
+                        try:
+                            res = await self._crawl_single_uid(
+                                uid,
+                                force_sync_videos=force_sync_videos,
+                            )
+                        finally:
+                            self._active_batch_client = None
+                        if not res.get("skipped"):
+                            results.append(res)
+                        if idx < len(accounts) - 1 and int(res.get("videos_succeeded") or 0) > 0:
+                            await asyncio.sleep(0.2)
+            finally:
+                self._active_batch_client = None
+                self._active_batch_settings = None
 
             return {
                 "skipped": False,
@@ -1047,68 +1167,109 @@ class CrawlService:
             return {"skipped": True, "reason": "已有采集任务正在进行中"}
 
         async with self._lock:
-            accounts = await asyncio.to_thread(self.db.get_enabled_accounts)
+            def _load_pulse_inputs() -> tuple[
+                list[dict[str, Any]], dict[str, str], dict[str, list[dict[str, Any]]]
+            ]:
+                with self.db.read_session():
+                    enabled = self.db.get_enabled_accounts()
+                    if not enabled:
+                        return [], {}, {}
+                    all_settings = self.db.get_all_settings()
+                    videos_map = {
+                        acc["uid"]: _load_crawl_videos(self.db, acc["uid"])
+                        for acc in enabled
+                    }
+                    return enabled, all_settings, videos_map
+
+            accounts, settings, videos_by_uid = await asyncio.to_thread(_load_pulse_inputs)
             if not accounts:
                 return {"skipped": True, "reason": "没有启用的监控账号"}
 
-            settings = await asyncio.to_thread(self.db.get_all_settings)
             delay_sec = max(
                 0.05, int(settings.get("request_delay_ms", "200") or 200) / 1000.0
             )
             started = time.perf_counter()
             now_ts = time.time()
 
-            remaining_online = max(0, int(max_videos))
-            remaining_stats = max(0, int(stats_quota))
+            # Pre-scan due T0 videos across all enabled accounts and allocate fairly via round-robin
+            # so active accounts lower in sort_order are never starved by earlier accounts.
+            online_budget = max(0, int(max_videos))
+            stats_budget = max(0, int(stats_quota))
+            due_online_by_uid: list[tuple[str, list[dict[str, Any]]]] = []
+            for acc in accounts:
+                uid = acc["uid"]
+                cached_videos = videos_by_uid.get(uid) or []
+                if not cached_videos:
+                    continue
+                due_fast = select_fast_pulse_videos(
+                    cached_videos, now_ts, max_videos=online_budget
+                )
+                if due_fast:
+                    due_online_by_uid.append((uid, due_fast))
+
+            allocated_online = _allocate_round_robin(due_online_by_uid, online_budget)
+
+            stats_candidates_by_uid: list[tuple[str, list[str]]] = []
+            if stats_budget > 0:
+                for uid, polled_videos in allocated_online.items():
+                    if not polled_videos:
+                        continue
+                    cached_videos = videos_by_uid.get(uid) or []
+                    fast_bvids = {v["bvid"] for v in polled_videos}
+                    cand_stats = select_stats_refresh_bvids(
+                        cached_videos,
+                        fast_bvids,
+                        now_ts,
+                        quota=stats_budget,
+                        tiers_filter={TIER_FAST},
+                    )
+                    if cand_stats:
+                        stats_candidates_by_uid.append((uid, cand_stats))
+            allocated_stats = _allocate_round_robin(stats_candidates_by_uid, stats_budget)
+
             accounts_touched = 0
             total_polled = 0
             total_succeeded = 0
             total_stats = 0
             aborted_412 = False
             global_abort = asyncio.Event()
+            client_pool: dict[str, BilibiliClient] = {}
 
             try:
-                for acc in accounts:
-                    if remaining_online <= 0 or global_abort.is_set():
-                        break
+                async with AsyncExitStack() as stack:
+                    for acc in accounts:
+                        if global_abort.is_set():
+                            break
 
-                    uid = acc["uid"]
-                    if not await self._is_uid_still_enabled(uid):
-                        continue
-                    was_monitored = (await asyncio.to_thread(self.db.get_account, uid)) is not None
-                    cached_videos = await asyncio.to_thread(self.db.get_videos, uid)
-                    if not cached_videos:
-                        continue
+                        uid = acc["uid"]
+                        polled_videos = allocated_online.get(uid) or []
+                        if not polled_videos:
+                            continue
 
-                    polled_videos = select_fast_pulse_videos(
-                        cached_videos, now_ts, max_videos=remaining_online
-                    )
-                    if not polled_videos:
-                        continue
+                        if not await self._is_uid_still_enabled(uid):
+                            continue
+                        was_monitored = (await asyncio.to_thread(self.db.get_account, uid)) is not None
+                        cached_videos = videos_by_uid.get(uid) or []
+                        if not cached_videos:
+                            continue
 
-                    fast_bvids = {v["bvid"] for v in polled_videos}
-                    stats_bvids = (
-                        select_stats_refresh_bvids(
-                            cached_videos,
-                            fast_bvids,
-                            now_ts,
-                            quota=remaining_stats,
-                            tiers_filter={TIER_FAST},
-                        )
-                        if remaining_stats > 0
-                        else []
-                    )
-                    stat_set = set(stats_bvids)
-                    by_bvid = {v["bvid"]: v for v in cached_videos}
-                    work_videos: list[dict[str, Any]] = list(polled_videos)
-                    for bvid in stats_bvids:
-                        if bvid not in fast_bvids and bvid in by_bvid:
-                            work_videos.append(by_bvid[bvid])
+                        fast_bvids = {v["bvid"] for v in polled_videos}
+                        stats_bvids = allocated_stats.get(uid) or []
+                        stat_set = set(stats_bvids)
+                        by_bvid = {v["bvid"]: v for v in cached_videos}
+                        work_videos: list[dict[str, Any]] = list(polled_videos)
+                        for bvid in stats_bvids:
+                            if bvid not in fast_bvids and bvid in by_bvid:
+                                work_videos.append(by_bvid[bvid])
 
-                    cookie = await asyncio.to_thread(self.db.get_effective_cookie, uid)
-                    self.crawling_uid = uid
-                    self._emit("crawl_started", uid=uid, pulse=True)
-                    async with BilibiliClient(cookie=cookie) as client:
+                        cookie = await asyncio.to_thread(self.db.get_effective_cookie, uid)
+                        client = client_pool.get(cookie)
+                        if client is None:
+                            client = await stack.enter_async_context(BilibiliClient(cookie=cookie))
+                            client_pool[cookie] = client
+
+                        self.crawling_uid = uid
+                        self._emit("crawl_started", uid=uid, pulse=True)
                         (
                             succeeded_items,
                             stat_updates,
@@ -1126,58 +1287,59 @@ class CrawlService:
                             abort_412=global_abort,
                         )
 
-                    if was_monitored and await asyncio.to_thread(self.db.get_account, uid) is None:
-                        logger.info("Skipping fast pulse persistence for deleted UID %s", uid)
+                        if was_monitored and await asyncio.to_thread(self.db.get_account, uid) is None:
+                            logger.info("Skipping fast pulse persistence for deleted UID %s", uid)
+                            self.crawling_uid = None
+                            self._emit("crawl_finished", uid=uid, pulse=True)
+                            continue
+
+                        if stat_updates:
+                            await asyncio.to_thread(self.db.update_video_stats_batch, stat_updates)
+                            total_stats += len(stat_updates)
+                        if stats_backoff_bvids:
+                            backoff_until = int(time.time()) + STATS_BACKOFF_SECONDS
+                            await asyncio.to_thread(
+                                self.db.set_video_stats_backoff_batch,
+                                stats_backoff_bvids,
+                                backoff_until,
+                            )
+                        if online_backoff_bvids:
+                            online_backoff_until = int(time.time()) + ONLINE_BACKOFF_SECONDS
+                            await asyncio.to_thread(
+                                self.db.set_video_online_backoff_batch,
+                                online_backoff_bvids,
+                                backoff_until_ts=online_backoff_until,
+                            )
+                        if succeeded_items:
+                            await asyncio.to_thread(
+                                self.db.insert_video_pulse, uid, succeeded_items
+                            )
+
+                        if batch_errors:
+                            logger.warning(
+                                "Fast pulse for UID %s had %d error(s): %s",
+                                uid,
+                                len(batch_errors),
+                                batch_errors[0],
+                            )
+
                         self.crawling_uid = None
-                        self._emit("crawl_finished", uid=uid, pulse=True)
-                        continue
+                        if succeeded_items or stat_updates:
+                            self._emit(
+                                "fast_pulse",
+                                uid=uid,
+                                videos_succeeded=len(succeeded_items),
+                                stats_refreshed=len(stat_updates),
+                            )
+                        else:
+                            self._emit("crawl_finished", uid=uid, pulse=True)
 
-                    if stat_updates:
-                        await asyncio.to_thread(self.db.update_video_stats_batch, stat_updates)
-                        total_stats += len(stat_updates)
-                        remaining_stats = max(0, remaining_stats - len(stat_updates))
-                    if stats_backoff_bvids:
-                        backoff_until = int(time.time()) + STATS_BACKOFF_SECONDS
-                        await asyncio.to_thread(
-                            self.db.set_video_stats_backoff_batch,
-                            stats_backoff_bvids,
-                            backoff_until,
-                        )
-                    if online_backoff_bvids:
-                        await asyncio.to_thread(
-                            self.db.set_video_online_backoff_batch, online_backoff_bvids
-                        )
-                    if succeeded_items:
-                        await asyncio.to_thread(
-                            self.db.insert_video_pulse, uid, succeeded_items
-                        )
-
-                    if batch_errors:
-                        logger.warning(
-                            "Fast pulse for UID %s had %d error(s): %s",
-                            uid,
-                            len(batch_errors),
-                            batch_errors[0],
-                        )
-
-                    self.crawling_uid = None
-                    if succeeded_items or stat_updates:
-                        self._emit(
-                            "fast_pulse",
-                            uid=uid,
-                            videos_succeeded=len(succeeded_items),
-                            stats_refreshed=len(stat_updates),
-                        )
-                    else:
-                        self._emit("crawl_finished", uid=uid, pulse=True)
-
-                    accounts_touched += 1
-                    total_polled += len(polled_videos)
-                    total_succeeded += len(succeeded_items)
-                    remaining_online = max(0, remaining_online - len(polled_videos))
-                    if hit_412:
-                        aborted_412 = True
-                        break
+                        accounts_touched += 1
+                        total_polled += len(polled_videos)
+                        total_succeeded += len(succeeded_items)
+                        if hit_412:
+                            aborted_412 = True
+                            break
             finally:
                 if self.crawling_uid is not None:
                     finished_uid = self.crawling_uid

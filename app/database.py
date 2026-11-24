@@ -288,6 +288,7 @@ class Database:
         conn = sqlite3.connect(str(self.db_path), timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("PRAGMA cache_size=-4000;")
         conn.execute("PRAGMA temp_store=MEMORY;")
         conn.execute("PRAGMA query_only=ON;")
         return conn
@@ -326,6 +327,7 @@ class Database:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON;")
         conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("PRAGMA cache_size=-4000;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("PRAGMA temp_store=MEMORY;")
         try:
@@ -365,8 +367,6 @@ class Database:
                     duration_ms INTEGER
                 );
 
-                CREATE INDEX IF NOT EXISTS idx_snapshots_uid_ts
-                    ON account_snapshots (uid, collected_at_ts DESC);
                 CREATE INDEX IF NOT EXISTS idx_snapshots_uid_ts_id
                     ON account_snapshots (uid, collected_at_ts DESC, id DESC);
 
@@ -390,6 +390,7 @@ class Database:
                     stats_synced_at TEXT,
                     stats_play_count INTEGER,
                     stats_backoff_until_ts INTEGER NOT NULL DEFAULT 0,
+                    online_backoff_until_ts INTEGER NOT NULL DEFAULT 0,
                     cids_json TEXT NOT NULL DEFAULT '[]',
                     last_online_count INTEGER NOT NULL DEFAULT 0,
                     last_online_raw TEXT NOT NULL DEFAULT '',
@@ -455,6 +456,9 @@ class Database:
                 );
                 """
             )
+            # Drop redundant prefix index superseded by idx_snapshots_uid_ts_id
+            conn.execute("DROP INDEX IF EXISTS idx_snapshots_uid_ts;")
+
             video_cols = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(videos)").fetchall()
@@ -473,6 +477,10 @@ class Database:
             if "stats_backoff_until_ts" not in video_cols:
                 conn.execute(
                     "ALTER TABLE videos ADD COLUMN stats_backoff_until_ts INTEGER NOT NULL DEFAULT 0"
+                )
+            if "online_backoff_until_ts" not in video_cols:
+                conn.execute(
+                    "ALTER TABLE videos ADD COLUMN online_backoff_until_ts INTEGER NOT NULL DEFAULT 0"
                 )
             if "hot_until_ts" not in video_cols:
                 conn.execute("ALTER TABLE videos ADD COLUMN hot_until_ts INTEGER NOT NULL DEFAULT 0")
@@ -1457,16 +1465,47 @@ class Database:
         clean_uid = str(uid).strip()
         if not clean_uid or (account_name is None and account_face is None):
             return
+        clean_name = account_name.strip() if account_name is not None else None
+        clean_face = account_face.strip() if account_face is not None else None
+
+        # Avoid opening a SQLite write transaction on every crawl when profile is unchanged.
+        with self.read_connection() as rconn:
+            acc_row = rconn.execute(
+                "SELECT account_name, account_face FROM monitored_accounts WHERE uid = ?",
+                (clean_uid,),
+            ).fetchone()
+            active_row = rconn.execute(
+                "SELECT value FROM settings WHERE key = 'uid'"
+            ).fetchone()
+            active_uid = active_row["value"].strip() if active_row else ""
+            acc_unchanged = (
+                acc_row is not None
+                and (clean_name is None or acc_row["account_name"] == clean_name)
+                and (clean_face is None or acc_row["account_face"] == clean_face)
+            )
+            if acc_unchanged:
+                if active_uid != clean_uid:
+                    return
+                s_rows = rconn.execute(
+                    "SELECT key, value FROM settings WHERE key IN ('account_name', 'account_face')"
+                ).fetchall()
+                s_vals = {r["key"]: r["value"] for r in s_rows}
+                if (
+                    (clean_name is None or s_vals.get("account_name", "") == clean_name)
+                    and (clean_face is None or s_vals.get("account_face", "") == clean_face)
+                ):
+                    return
+
         now = datetime.now(timezone.utc).astimezone().isoformat()
         with self.connection() as conn:
             fields: list[str] = []
             params: list[Any] = []
-            if account_name is not None:
+            if clean_name is not None:
                 fields.append("account_name = ?")
-                params.append(account_name.strip())
-            if account_face is not None:
+                params.append(clean_name)
+            if clean_face is not None:
                 fields.append("account_face = ?")
-                params.append(account_face.strip())
+                params.append(clean_face)
             fields.append("updated_at = ?")
             params.append(now)
             params.append(clean_uid)
@@ -1478,10 +1517,10 @@ class Database:
             active_row = conn.execute("SELECT value FROM settings WHERE key = 'uid'").fetchone()
             active_uid = active_row["value"].strip() if active_row else ""
             if active_uid == clean_uid:
-                if account_name is not None:
-                    self._upsert_setting(conn, "account_name", account_name.strip(), now)
-                if account_face is not None:
-                    self._upsert_setting(conn, "account_face", account_face.strip(), now)
+                if clean_name is not None:
+                    self._upsert_setting(conn, "account_name", clean_name, now)
+                if clean_face is not None:
+                    self._upsert_setting(conn, "account_face", clean_face, now)
 
     def set_active_account(
         self,
@@ -1964,26 +2003,37 @@ class Database:
             )
 
     def set_video_online_backoff_batch(
-        self, bvids: list[str], checked_at: Optional[datetime] = None
+        self,
+        bvids: list[str],
+        checked_at: Optional[datetime] = None,
+        backoff_until_ts: Optional[int] = None,
     ) -> None:
-        """Advance last_checked_at and zero_online_streak for missing videos so they settle into T4."""
+        """Back off missing/unavailable videos so they stop failing online polls and clear stale viewers."""
         if not bvids:
             return
         unique_bvids = list(dict.fromkeys(bvids))
         dt = checked_at or datetime.now(timezone.utc).astimezone()
         checked_iso = dt.isoformat()
+        effective_backoff_until = (
+            int(backoff_until_ts)
+            if backoff_until_ts is not None
+            else int(dt.timestamp()) + 24 * 3600
+        )
         with self.connection() as conn:
             conn.executemany(
                 """
                 UPDATE videos
                 SET last_checked_at = ?,
+                    last_online_count = 0,
+                    last_online_raw = '',
                     zero_online_streak = MAX(zero_online_streak, 6),
                     hot_until_ts = 0,
                     fast_until_ts = 0,
+                    online_backoff_until_ts = MAX(online_backoff_until_ts, ?),
                     updated_at = ?
                 WHERE bvid = ?
                 """,
-                [(checked_iso, checked_iso, bvid) for bvid in unique_bvids],
+                [(checked_iso, effective_backoff_until, checked_iso, bvid) for bvid in unique_bvids],
             )
 
     def delete_stale_videos(
@@ -2017,7 +2067,8 @@ class Database:
                        play_count_7d, play_count_7d_ts, play_count_7d_locked,
                        like_count, coin_count, tid, tid_v2, zone_synced,
                        stats_synced_at, stats_play_count,
-                       stats_backoff_until_ts, cids_json, last_online_count,
+                       stats_backoff_until_ts, online_backoff_until_ts,
+                       cids_json, last_online_count,
                        last_online_raw, last_checked_at, hot_until_ts, fast_until_ts,
                        zero_online_streak, play_rate_per_hour, last_play_ts, updated_at
                 FROM videos
@@ -2028,7 +2079,8 @@ class Database:
             ).fetchall()
         items = []
         for r in rows:
-            cids = json.loads(r["cids_json"] or "[]")
+            raw_cids = r["cids_json"]
+            cids = [] if (not raw_cids or raw_cids == "[]") else json.loads(raw_cids)
             tid_val = int(r["tid"] or 0)
             tid_v2_val = int(r["tid_v2"] or 0)
             zone = resolve_video_zone(tid_val, tid_v2_val)
@@ -2065,6 +2117,7 @@ class Database:
                     "stats_synced_at": r["stats_synced_at"],
                     "stats_play_count": r["stats_play_count"],
                     "stats_backoff_until_ts": int(r["stats_backoff_until_ts"] or 0),
+                    "online_backoff_until_ts": int(r["online_backoff_until_ts"] or 0),
                     "cids": cids,
                     "cid_count": max(1, len(cids)),
                     "last_online_count": r["last_online_count"],
@@ -2079,6 +2132,46 @@ class Database:
                 }
             )
         return items
+
+    def get_crawl_videos(self, uid: str) -> list[dict[str, Any]]:
+        """Fetch minimal video scheduling/polling fields without parsing cids_json or resolving UI zone metadata."""
+        with self.read_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT bvid, pubdate, play_count, like_count, coin_count,
+                       tid, tid_v2, zone_synced, stats_synced_at, stats_play_count,
+                       stats_backoff_until_ts, online_backoff_until_ts, cids_json,
+                       last_online_count, last_checked_at, hot_until_ts, fast_until_ts,
+                       zero_online_streak, play_rate_per_hour
+                FROM videos
+                WHERE uid = ?
+                """,
+                (uid,),
+            ).fetchall()
+        return [
+            {
+                "bvid": r["bvid"],
+                "pubdate": r["pubdate"],
+                "play_count": r["play_count"],
+                "like_count": r["like_count"],
+                "coin_count": r["coin_count"],
+                "tid": int(r["tid"] or 0),
+                "tid_v2": int(r["tid_v2"] or 0),
+                "zone_synced": int(r["zone_synced"] if r["zone_synced"] is not None else 1),
+                "stats_synced_at": r["stats_synced_at"],
+                "stats_play_count": r["stats_play_count"],
+                "stats_backoff_until_ts": int(r["stats_backoff_until_ts"] or 0),
+                "online_backoff_until_ts": int(r["online_backoff_until_ts"] or 0),
+                "cids_json": r["cids_json"] or "[]",
+                "last_online_count": r["last_online_count"],
+                "last_checked_at": r["last_checked_at"],
+                "hot_until_ts": int(r["hot_until_ts"] or 0),
+                "fast_until_ts": int(r["fast_until_ts"] or 0),
+                "zero_online_streak": int(r["zero_online_streak"] or 0),
+                "play_rate_per_hour": float(r["play_rate_per_hour"] or 0.0),
+            }
+            for r in rows
+        ]
 
     def get_dashboard_videos(
         self,
@@ -2276,7 +2369,8 @@ class Database:
                 fast_until_ts = CASE
                     WHEN ? >= ? THEN MAX(fast_until_ts, ?)
                     ELSE fast_until_ts
-                END
+                END,
+                online_backoff_until_ts = 0
             WHERE bvid = ?
             """,
             video_updates,
@@ -2923,34 +3017,47 @@ class Database:
                 return {"deleted_snapshots": 0, "retention_days": 0}
 
             cutoff_ts = int(time.time()) - resolved_days * 86400
-            cur = conn.execute(
-                """
-                DELETE FROM account_snapshots
-                WHERE collected_at_ts < ?
-                  AND id NOT IN (
-                      SELECT id FROM (
-                          SELECT id,
-                                 ROW_NUMBER() OVER (
-                                     PARTITION BY uid ORDER BY collected_at_ts DESC, id DESC
-                                 ) AS rn
-                          FROM account_snapshots
+            has_expired_acc = conn.execute(
+                "SELECT 1 FROM account_snapshots WHERE collected_at_ts < ? LIMIT 1",
+                (cutoff_ts,),
+            ).fetchone()
+            deleted_count = 0
+            if has_expired_acc is not None:
+                cur = conn.execute(
+                    """
+                    DELETE FROM account_snapshots
+                    WHERE collected_at_ts < ?
+                      AND id NOT IN (
+                          SELECT id FROM (
+                              SELECT id,
+                                     ROW_NUMBER() OVER (
+                                         PARTITION BY uid ORDER BY collected_at_ts DESC, id DESC
+                                     ) AS rn
+                              FROM account_snapshots
+                          )
+                          WHERE rn <= 2
                       )
-                      WHERE rn <= 2
-                  )
-                """,
+                    """,
+                    (cutoff_ts,),
+                )
+                deleted_count = max(0, int(cur.rowcount or 0))
+            has_expired_pulse = conn.execute(
+                "SELECT 1 FROM video_pulse_snapshots WHERE collected_at_ts < ? LIMIT 1",
                 (cutoff_ts,),
-            )
-            deleted_count = max(0, int(cur.rowcount or 0))
-            conn.execute(
-                "DELETE FROM video_pulse_snapshots WHERE collected_at_ts < ?",
-                (cutoff_ts,),
-            )
+            ).fetchone()
+            if has_expired_pulse is not None:
+                conn.execute(
+                    "DELETE FROM video_pulse_snapshots WHERE collected_at_ts < ?",
+                    (cutoff_ts,),
+                )
+            conn.execute("ANALYZE;")
             conn.execute("PRAGMA optimize;")
         return {"deleted_snapshots": deleted_count, "retention_days": resolved_days}
 
     def optimize(self) -> None:
         """Run SQLite query planner maintenance."""
         with self.connection() as conn:
+            conn.execute("ANALYZE;")
             conn.execute("PRAGMA optimize;")
 
 

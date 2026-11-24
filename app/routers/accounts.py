@@ -22,10 +22,17 @@ def _validate_uid(raw_uid: str) -> str:
     return clean_uid
 
 
-def _emit_accounts_event(request: Request, kind: str, uid: Optional[str] = None) -> None:
+def _emit_accounts_event(
+    request: Request,
+    kind: str,
+    uid: Optional[str] = None,
+    response: Optional[Response] = None,
+) -> None:
     event_bus = getattr(request.app.state, "event_bus", None)
     if event_bus is not None:
         event_bus.publish(kind, uid=uid)
+        if response is not None:
+            response.headers["X-Data-Revision"] = str(event_bus.revision)
 
 
 @router.get("/accounts", response_model=AccountsListOut)
@@ -70,7 +77,7 @@ def _schedule_account_bootstrap(
 
 
 @router.post("/accounts", dependencies=[Depends(require_admin)])
-async def create_account(request: Request, body: AccountCreate) -> dict[str, Any]:
+async def create_account(request: Request, response: Response, body: AccountCreate) -> dict[str, Any]:
     db = request.app.state.db
     scheduler_mgr = request.app.state.scheduler
     crawl_service = request.app.state.crawl_service
@@ -103,7 +110,7 @@ async def create_account(request: Request, body: AccountCreate) -> dict[str, Any
         return active_uid, accounts
 
     active_uid, accounts = await asyncio.to_thread(_load_state)
-    _emit_accounts_event(request, "accounts_changed", uid=clean_uid)
+    _emit_accounts_event(request, "accounts_changed", uid=clean_uid, response=response)
     return {
         "active_uid": active_uid,
         "account": account,
@@ -112,7 +119,9 @@ async def create_account(request: Request, body: AccountCreate) -> dict[str, Any
 
 
 @router.put("/accounts/reorder", dependencies=[Depends(require_admin)])
-async def reorder_accounts(request: Request, body: AccountReorderRequest) -> dict[str, Any]:
+async def reorder_accounts(
+    request: Request, response: Response, body: AccountReorderRequest
+) -> dict[str, Any]:
     db = request.app.state.db
     crawl_service = request.app.state.crawl_service
 
@@ -125,7 +134,7 @@ async def reorder_accounts(request: Request, body: AccountReorderRequest) -> dic
         return active_uid, accounts
 
     active_uid, accounts = await asyncio.to_thread(_reorder)
-    _emit_accounts_event(request, "accounts_changed", uid=active_uid)
+    _emit_accounts_event(request, "accounts_changed", uid=active_uid, response=response)
     return {
         "active_uid": active_uid,
         "accounts": accounts,
@@ -133,7 +142,9 @@ async def reorder_accounts(request: Request, body: AccountReorderRequest) -> dic
 
 
 @router.put("/accounts/{uid}", dependencies=[Depends(require_admin)])
-async def update_account(request: Request, uid: str, body: AccountUpdate) -> dict[str, Any]:
+async def update_account(
+    request: Request, response: Response, uid: str, body: AccountUpdate
+) -> dict[str, Any]:
     db = request.app.state.db
     scheduler_mgr = request.app.state.scheduler
     crawl_service = request.app.state.crawl_service
@@ -163,7 +174,7 @@ async def update_account(request: Request, uid: str, body: AccountUpdate) -> dic
         return active_uid, accounts
 
     active_uid, accounts = await asyncio.to_thread(_load_state)
-    _emit_accounts_event(request, "accounts_changed", uid=clean_uid)
+    _emit_accounts_event(request, "accounts_changed", uid=clean_uid, response=response)
     return {
         "active_uid": active_uid,
         "account": updated,
@@ -210,6 +221,7 @@ async def activate_account(
 @router.delete("/accounts/{uid}", dependencies=[Depends(require_admin)])
 async def delete_account(
     request: Request,
+    response: Response,
     uid: str,
     delete_data: bool = Query(default=False, description="Also delete snapshots and cached videos"),
 ) -> dict[str, Any]:
@@ -228,7 +240,7 @@ async def delete_account(
     accounts = await asyncio.to_thread(
         lambda: db.get_accounts_summary(crawling_uid=crawl_service.crawling_uid)
     )
-    _emit_accounts_event(request, "accounts_changed", uid=clean_uid)
+    _emit_accounts_event(request, "accounts_changed", uid=clean_uid, response=response)
     return {
         **result,
         "accounts": accounts,

@@ -4,6 +4,7 @@ import hmac
 import json
 import logging
 import re
+import ssl
 import threading
 import time
 import urllib.parse
@@ -195,11 +196,23 @@ class BilibiliClient:
     MAX_CREDENTIAL_CACHE_SIZE: int = 64
     _CREDENTIAL_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
     _CACHE_LOCK: threading.Lock = threading.Lock()
+    _DEFAULT_SSL_CONTEXT: Optional[ssl.SSLContext] = None
     _LAST_ZONE_REFRESH_AT: float = 0.0
     _INITIAL_STATE_RE = re.compile(
         r"window\.__INITIAL_STATE__\s*=\s*(\{.*?\});\s*\(function",
         re.DOTALL,
     )
+
+    @classmethod
+    def _get_ssl_context(cls) -> ssl.SSLContext:
+        """Return a process-wide cached SSLContext to avoid reparsing system CA certs on every client init."""
+        ctx = cls._DEFAULT_SSL_CONTEXT
+        if ctx is not None:
+            return ctx
+        with cls._CACHE_LOCK:
+            if cls._DEFAULT_SSL_CONTEXT is None:
+                cls._DEFAULT_SSL_CONTEXT = ssl.create_default_context()
+            return cls._DEFAULT_SSL_CONTEXT
 
     def __init__(self, cookie: str = "", timeout: float = 15.0) -> None:
         self.raw_cookie = cookie.strip()
@@ -218,6 +231,12 @@ class BilibiliClient:
             },
             cookies=self._cookies,
             timeout=timeout,
+            verify=self._get_ssl_context(),
+            limits=httpx.Limits(
+                max_connections=16,
+                max_keepalive_connections=8,
+                keepalive_expiry=60.0,
+            ),
             follow_redirects=True,
         )
 

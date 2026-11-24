@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app.auth import AdminVerifyRateLimiter
@@ -24,6 +24,16 @@ logging.basicConfig(
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+_FAVICON_SVG = (
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 28 28' fill='none'>"
+    "<rect width='28' height='28' fill='#07090E'/>"
+    "<rect x='2.5' y='4.5' width='23' height='19' stroke='#00E5FF' stroke-width='2'/>"
+    "<polyline points='5.5,16 9,16 11.2,10.5 14,20 16.8,13 19,16 22.5,16' "
+    "stroke='#FF2A7A' stroke-width='2.2' stroke-linecap='square' stroke-linejoin='miter'/>"
+    "</svg>"
+)
 
 
 def create_app(
@@ -63,6 +73,14 @@ def create_app(
     application.include_router(dashboard_router)
     application.include_router(settings_router)
     application.include_router(video_zone_router)
+
+    @application.get("/favicon.ico", include_in_schema=False)
+    async def serve_favicon() -> Response:
+        return Response(
+            content=_FAVICON_SVG,
+            media_type="image/svg+xml",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
 
     if STATIC_DIR.exists():
         application.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
