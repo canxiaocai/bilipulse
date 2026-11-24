@@ -1000,8 +1000,13 @@ class CrawlService:
                     return {"skipped": True, "reason": "账号已删除或已暂停"}
             return await self._crawl_single_uid(target_uid, force_sync_videos=force_sync_videos)
 
-    async def run_crawl_all(self, force_sync_videos: bool = False) -> dict[str, Any]:
-        if self._lock.locked():
+    async def run_crawl_all(
+        self,
+        force_sync_videos: bool = False,
+        *,
+        wait: bool = False,
+    ) -> dict[str, Any]:
+        if not wait and self._lock.locked():
             return {"skipped": True, "reason": "已有采集任务正在进行中"}
 
         async with self._lock:

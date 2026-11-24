@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from collections.abc import Coroutine
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -13,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 JOB_ID = "bilibili_monitor_crawl"
 FAST_PULSE_JOB_ID = "bilibili_monitor_fast_pulse"
+FAST_PULSE_STAGGER_SECONDS = 30
 RETENTION_JOB_ID = "bilibili_monitor_retention"
 RETENTION_INTERVAL_HOURS = 6
 _UNSET = object()
@@ -86,7 +88,15 @@ class SchedulerManager:
 
     async def _safe_crawl(self, force_sync_videos: bool = False) -> None:
         try:
-            await self.crawl_service.run_crawl_all(force_sync_videos=force_sync_videos)
+            result = await self.crawl_service.run_crawl_all(
+                force_sync_videos=force_sync_videos,
+                wait=True,
+            )
+            if isinstance(result, dict) and result.get("skipped"):
+                logger.info(
+                    "Scheduled crawl skipped: %s",
+                    result.get("reason", "unknown"),
+                )
         except Exception:
             logger.exception("Scheduled crawl task failed")
 
@@ -135,26 +145,59 @@ class SchedulerManager:
                 coalesce=True,
             )
 
-    def _sync_fast_pulse_job(self, interval_minutes: int, enabled_count: int) -> None:
+    def _compute_fast_pulse_start(
+        self,
+        crawl_next_run: Optional[datetime],
+    ) -> Optional[datetime]:
+        """Compute a staggered first-run timestamp for fast pulse so it never phase-locks with full crawl."""
+        if crawl_next_run is None:
+            return None
+        pulse_delta = timedelta(minutes=FAST_PULSE_INTERVAL_MINUTES)
+        stagger = timedelta(seconds=FAST_PULSE_STAGGER_SECONDS)
+        now = datetime.now(crawl_next_run.tzinfo)
+        min_first_run = now + timedelta(seconds=max(15, (FAST_PULSE_INTERVAL_MINUTES * 60) // 2))
+        candidate = crawl_next_run + stagger
+        while candidate - pulse_delta >= min_first_run:
+            candidate -= pulse_delta
+        while candidate < min_first_run:
+            candidate += pulse_delta
+        return candidate
+
+    def _sync_fast_pulse_job(
+        self,
+        interval_minutes: int,
+        enabled_count: int,
+        *,
+        crawl_next_run: Optional[datetime] = None,
+        force_realign: bool = False,
+    ) -> None:
         existing_fast = self.scheduler.get_job(FAST_PULSE_JOB_ID)
         if enabled_count <= 0 or interval_minutes <= FAST_PULSE_INTERVAL_MINUTES:
             if existing_fast:
                 self.scheduler.remove_job(FAST_PULSE_JOB_ID)
             return
 
-        if existing_fast and isinstance(existing_fast.trigger, IntervalTrigger):
-            if (
-                int(existing_fast.trigger.interval.total_seconds())
-                == FAST_PULSE_INTERVAL_MINUTES * 60
-            ):
-                return
+        if (
+            not force_realign
+            and existing_fast
+            and isinstance(existing_fast.trigger, IntervalTrigger)
+            and int(existing_fast.trigger.interval.total_seconds())
+            == FAST_PULSE_INTERVAL_MINUTES * 60
+        ):
+            return
 
         if existing_fast:
             self.scheduler.remove_job(FAST_PULSE_JOB_ID)
 
+        start_date = self._compute_fast_pulse_start(crawl_next_run)
+        trigger = (
+            IntervalTrigger(minutes=FAST_PULSE_INTERVAL_MINUTES, start_date=start_date)
+            if start_date is not None
+            else IntervalTrigger(minutes=FAST_PULSE_INTERVAL_MINUTES)
+        )
         self.scheduler.add_job(
             self._safe_fast_pulse,
-            trigger=IntervalTrigger(minutes=FAST_PULSE_INTERVAL_MINUTES),
+            trigger=trigger,
             id=FAST_PULSE_JOB_ID,
             replace_existing=True,
             max_instances=1,
@@ -182,9 +225,14 @@ class SchedulerManager:
             return
 
         interval = max(1, int(pub["interval_minutes"]))
-        self._sync_fast_pulse_job(interval, len(enabled_accounts))
         if existing and isinstance(existing.trigger, IntervalTrigger):
             if int(existing.trigger.interval.total_seconds()) == interval * 60:
+                self._sync_fast_pulse_job(
+                    interval,
+                    len(enabled_accounts),
+                    crawl_next_run=existing.next_run_time,
+                    force_realign=False,
+                )
                 logger.info(
                     "Kept existing %d minute(s) crawl schedule for %d account(s)",
                     interval,
@@ -195,13 +243,19 @@ class SchedulerManager:
         if existing:
             self.scheduler.remove_job(JOB_ID)
 
-        self.scheduler.add_job(
+        crawl_job = self.scheduler.add_job(
             self._safe_crawl,
             trigger=IntervalTrigger(minutes=interval),
             id=JOB_ID,
             replace_existing=True,
             max_instances=1,
             coalesce=True,
+        )
+        self._sync_fast_pulse_job(
+            interval,
+            len(enabled_accounts),
+            crawl_next_run=crawl_job.next_run_time,
+            force_realign=True,
         )
         logger.info(
             "Scheduled crawl every %d minute(s) for %d account(s)",

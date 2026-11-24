@@ -5389,10 +5389,73 @@ def test_video_zone_lookup_client_and_stateless_api(tmp_path: Path, monkeypatch)
             assert 'action="/api/video-zone/lookup"' in html
 
 
+def test_scheduled_crawl_not_starved_by_fast_pulse(tmp_path: Path):
+    from app.scheduler import (
+        FAST_PULSE_JOB_ID,
+        FAST_PULSE_STAGGER_SECONDS,
+        JOB_ID,
+        SchedulerManager,
+    )
 
+    db = Database(db_path=tmp_path / "starvation.db")
+    db.create_account("5001", enabled=True, set_active=True)
+    db.update_settings({"interval_minutes": "4"})
 
+    svc = CrawlService(db)
+    mgr = SchedulerManager(db, svc)
 
+    async def verify_stagger_and_wait():
+        # 1) Fast pulse job MUST be staggered away from full crawl job's phase (even when interval=4 is a multiple of 2)
+        mgr.start()
+        try:
+            crawl_job = mgr.scheduler.get_job(JOB_ID)
+            fast_job = mgr.scheduler.get_job(FAST_PULSE_JOB_ID)
+            assert crawl_job is not None
+            assert fast_job is not None
+            assert crawl_job.next_run_time is not None
+            assert fast_job.next_run_time is not None
 
+            diff_mod = (
+                int(round((fast_job.next_run_time - crawl_job.next_run_time).total_seconds()))
+                % 60
+            )
+            assert diff_mod == FAST_PULSE_STAGGER_SECONDS % 60
+        finally:
+            mgr.shutdown()
 
+        # 2) _safe_crawl (via run_crawl_all(wait=True)) waits for an in-flight lock holder instead of silently skipping
+        crawled_uids: list[str] = []
 
+        async def fake_crawl_single(uid: str, force_sync_videos: bool = False):
+            crawled_uids.append(uid)
+            return {"skipped": False, "uid": uid, "status": "success"}
+
+        svc._crawl_single_uid = fake_crawl_single  # type: ignore[method-assign]
+
+        lock_acquired = asyncio.Event()
+        release_lock = asyncio.Event()
+
+        async def hold_lock_like_fast_pulse():
+            async with svc._lock:
+                lock_acquired.set()
+                await release_lock.wait()
+
+        holder = asyncio.create_task(hold_lock_like_fast_pulse())
+        await lock_acquired.wait()
+
+        # Non-waiting run_crawl_all still skips when busy
+        skipped = await svc.run_crawl_all(wait=False)
+        assert skipped["skipped"] is True
+
+        # Scheduled _safe_crawl waits for the lock to be released and then runs
+        crawl_task = asyncio.create_task(mgr._safe_crawl())
+        await asyncio.sleep(0.05)
+        assert crawled_uids == []
+
+        release_lock.set()
+        await holder
+        await crawl_task
+        assert crawled_uids == ["5001"]
+
+    asyncio.run(verify_stagger_and_wait())
 
