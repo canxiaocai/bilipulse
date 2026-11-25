@@ -682,7 +682,7 @@ export function clearChartsInGroup(syncGroup) {
  * @param {string} [options.channelColor='var(--sig-cyan)']
  * @param {string} [options.fillId='']
  * @param {string} [options.label='数值']
- * @param {(v: number) => string} [options.formatValue]
+ * @param {(v: number, point?: { ts: unknown, tsMs: number, value: number, raw?: string }) => string} [options.formatValue]
  * @param {boolean} [options.animate=true]
  * @param {string | null} [options.syncGroup=null]
  * @param {((payload: object | null) => void) | null} [options.onHover=null]
@@ -1088,7 +1088,7 @@ export function renderTelemetryChart(container, points, options = {}) {
         const px = xs[idx];
         const py = displayYs[idx];
         const isLiveEnd = idx === n - 1;
-        const valStr = `${tag} ${formatValue(rawValues[idx])}`;
+        const valStr = `${tag} ${formatValue(rawValues[idx], normalized[idx])}`;
         const textW = estimateSvgTextWidth(valStr, 10);
         const boxPadX = 5;
         const boxW = textW + boxPadX * 2;
@@ -1313,7 +1313,7 @@ export function renderTelemetryChart(container, points, options = {}) {
       }
 
       if (hudEl && hudTimeEl && hudLabelEl && hudValueEl) {
-        const formattedVal = formatValue(pt.value);
+        const formattedVal = formatValue(pt.value, pt);
         hudTimeEl.textContent =
           pt.hudTime || formatHudTimestamp(pt.tsMs, pt.ts);
         hudLabelEl.textContent = `${label}：`;
@@ -1344,7 +1344,7 @@ export function renderTelemetryChart(container, points, options = {}) {
             value: pt.value,
             raw: pt.raw,
             formattedTime: formatHudTimestamp(pt.tsMs, pt.ts),
-            formattedValue: formatValue(pt.value),
+            formattedValue: formatValue(pt.value, pt),
           },
           index: safeIdx,
           deltaFromStart,

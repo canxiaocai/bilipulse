@@ -7,7 +7,7 @@
 import {
   renderTelemetryChart,
   clearChartsInGroup,
-} from "./charts.js?v=20261123d";
+} from "./charts.js?v=20261125a";
 import {
   animateNumber,
   runViewTransition,
@@ -145,6 +145,22 @@ function fmtNumber(val) {
     return "--";
   }
   return Math.round(Number(val)).toLocaleString("zh-CN");
+}
+
+function extractApproxOnlineLabel(raw) {
+  const text = String(raw ?? "").trim();
+  if (/^\d+(?:\.\d+)?[万亿]?\+$/.test(text)) {
+    return text;
+  }
+  return "";
+}
+
+function fmtVideoOnlineCount(count, raw = "") {
+  const approx = extractApproxOnlineLabel(raw);
+  if (approx && Number(count) > 0) {
+    return approx;
+  }
+  return fmtNumber(count);
 }
 
 function fmtCompact(val) {
@@ -2241,7 +2257,7 @@ const LEADERBOARD_SPECS = [
     cacheKey: "onlineRowCache",
     getPrimary: (v) => Math.max(0, Number(v.last_online_count || 0)),
     getSecondary: (v) => Math.max(0, Number(v.play_count || 0)),
-    formatPrimary: (val) => fmtNumber(val),
+    formatPrimary: (val, v) => fmtVideoOnlineCount(val, v?.last_online_raw),
     primaryUnit: "人正在看",
     formatSubMeta: (v) => `播放 ${fmtCompact(v.play_count)}`,
   },
@@ -2257,7 +2273,7 @@ const LEADERBOARD_SPECS = [
     getSecondary: (v) => Math.max(0, Number(v.last_online_count || 0)),
     formatPrimary: (val) => fmtCompact(val),
     primaryUnit: "次播放",
-    formatSubMeta: (v) => `${fmtNumber(v.last_online_count || 0)} 人正在看`,
+    formatSubMeta: (v) => `${fmtVideoOnlineCount(v.last_online_count || 0, v.last_online_raw)} 人正在看`,
   },
 ];
 
@@ -2494,7 +2510,7 @@ function createOrUpdateRankRow(video, rank, maxMetric, spec) {
   }
 
   const primaryValEl = row.querySelector(".rank-online-val");
-  if (primaryValEl) primaryValEl.textContent = spec.formatPrimary(metricVal);
+  if (primaryValEl) primaryValEl.textContent = spec.formatPrimary(metricVal, video);
 
   return row;
 }
@@ -3415,7 +3431,7 @@ function renderModalCharts(series, animate = true) {
       channelColor: "var(--sig-cyan)",
       fillId: "modal-video-online",
       label: "实时在线",
-      formatValue: (v) => `${fmtNumber(v)} 人`,
+      formatValue: (v, pt) => `${fmtVideoOnlineCount(v, pt?.raw)} 人`,
       animate,
       syncGroup: "video-modal",
       emptyText: "该时间窗口暂无在线人数采样点",
@@ -3503,13 +3519,30 @@ function updateModalStatsFromVideoAndPoints(bvid, series) {
   const playDeltaPoints = series?.playDeltaPoints || [];
   const likeDeltaPoints = series?.likeDeltaPoints || [];
 
-  const vals = onlinePoints.map((p) => Number(p.value)).filter((n) => Number.isFinite(n));
-  const latestPtVal = vals.length > 0 ? vals[vals.length - 1] : null;
-  const currentOnline =
-    video?.last_online_count !== undefined && video?.last_online_count !== null
-      ? Number(video.last_online_count)
-      : latestPtVal;
-  const peakOnline = vals.length > 0 ? Math.max(...vals) : null;
+  const validOnlinePoints = onlinePoints
+    .map((p) => ({ value: Number(p.value), raw: p.raw }))
+    .filter((p) => Number.isFinite(p.value));
+  const latestPt = validOnlinePoints.length > 0 ? validOnlinePoints[validOnlinePoints.length - 1] : null;
+  const hasVideoOnline =
+    video?.last_online_count !== undefined && video?.last_online_count !== null;
+  const currentOnline = hasVideoOnline
+    ? Number(video.last_online_count)
+    : latestPt
+      ? latestPt.value
+      : null;
+  const currentOnlineRaw = hasVideoOnline ? video.last_online_raw : latestPt?.raw;
+  let peakOnlinePoint = null;
+  for (const pt of validOnlinePoints) {
+    if (
+      !peakOnlinePoint ||
+      pt.value > peakOnlinePoint.value ||
+      (pt.value === peakOnlinePoint.value && Boolean(extractApproxOnlineLabel(pt.raw)))
+    ) {
+      peakOnlinePoint = pt;
+    }
+  }
+  const peakOnline = peakOnlinePoint ? peakOnlinePoint.value : null;
+  const peakOnlineRaw = peakOnlinePoint ? peakOnlinePoint.raw : "";
 
   const latestPlayVal =
     video?.play_count !== undefined && video?.play_count !== null
@@ -3537,10 +3570,14 @@ function updateModalStatsFromVideoAndPoints(bvid, series) {
       : null;
 
   if (currentEl) {
-    currentEl.textContent = Number.isFinite(currentOnline) ? `${fmtNumber(currentOnline)} 人` : "--";
+    currentEl.textContent = Number.isFinite(currentOnline)
+      ? `${fmtVideoOnlineCount(currentOnline, currentOnlineRaw)} 人`
+      : "--";
   }
   if (peakEl) {
-    peakEl.textContent = Number.isFinite(peakOnline) ? `${fmtNumber(peakOnline)} 人` : "--";
+    peakEl.textContent = Number.isFinite(peakOnline)
+      ? `${fmtVideoOnlineCount(peakOnline, peakOnlineRaw)} 人`
+      : "--";
   }
   if (playEl) {
     playEl.textContent = Number.isFinite(latestPlayVal) ? fmtNumber(latestPlayVal) : "--";
@@ -3553,7 +3590,9 @@ function updateModalStatsFromVideoAndPoints(bvid, series) {
   applySignedModalDeltaReadout(likeDeltaEl, likeDelta);
 
   if (onlineChipEl) {
-    onlineChipEl.textContent = Number.isFinite(currentOnline) ? `${fmtNumber(currentOnline)} 人` : "--";
+    onlineChipEl.textContent = Number.isFinite(currentOnline)
+      ? `${fmtVideoOnlineCount(currentOnline, currentOnlineRaw)} 人`
+      : "--";
   }
   if (playChipEl) {
     playChipEl.textContent = Number.isFinite(latestPlayVal) ? fmtNumber(latestPlayVal) : "--";
