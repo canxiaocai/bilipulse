@@ -1,5 +1,8 @@
 import asyncio
+from collections import OrderedDict
 import json
+import threading
+import time
 from typing import Any, AsyncIterator, Optional
 from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import StreamingResponse
@@ -10,6 +13,20 @@ from app.models import AdminAuthStatus, ChartSnapshotOut, DashboardSummary, Foll
 router = APIRouter(prefix="/api", tags=["dashboard"])
 
 SSE_HEARTBEAT_SECONDS = 20.0
+VIDEO_HISTORY_CACHE_MAX_ENTRIES = 256
+VIDEO_HISTORY_WINDOW_CACHE_TTL_SEC = 20.0
+VIDEO_HISTORY_ALL_CACHE_TTL_SEC = 120.0
+
+
+def _get_video_history_cache(request: Request) -> tuple[OrderedDict[Any, Any], threading.Lock]:
+    cache = getattr(request.app.state, "video_history_cache", None)
+    lock = getattr(request.app.state, "video_history_cache_lock", None)
+    if cache is None or lock is None:
+        cache = OrderedDict()
+        lock = threading.Lock()
+        request.app.state.video_history_cache = cache
+        request.app.state.video_history_cache_lock = lock
+    return cache, lock
 
 
 def _apply_no_store_headers(request: Request, response: Response) -> None:
@@ -271,28 +288,82 @@ async def get_video_history(
 ) -> dict[str, Any]:
     _apply_no_store_headers(request, response)
     db = request.app.state.db
+    event_bus = getattr(request.app.state, "event_bus", None)
+    cache, cache_lock = _get_video_history_cache(request)
 
-    def _load() -> list[dict[str, Any]]:
-        if hours is not None:
-            effective_limit = limit if limit is not None else 20000
-            effective_max_points = (
-                max_points
-                if max_points is not None
-                else (320 if limit is None else None)
-            )
-            return db.get_video_history(
+    if hours is not None:
+        effective_limit = limit if limit is not None else 20000
+        effective_max_points = (
+            max_points
+            if max_points is not None
+            else (320 if limit is None else None)
+        )
+        since_hours = hours if hours > 0 else None
+    else:
+        effective_limit = limit if limit is not None else 100
+        effective_max_points = max_points
+        since_hours = None
+
+    stamp = (
+        event_bus.revision if event_bus is not None else 0,
+        getattr(db, "write_version", 0),
+    )
+    cache_key = (bvid, hours, effective_limit, effective_max_points)
+    ttl_sec = (
+        VIDEO_HISTORY_WINDOW_CACHE_TTL_SEC
+        if since_hours is not None
+        else VIDEO_HISTORY_ALL_CACHE_TTL_SEC
+    )
+    now_mono = time.monotonic()
+
+    with cache_lock:
+        entry = cache.get(cache_key)
+        if entry is not None:
+            cached_stamp, cached_at, cached_history, cached_downsampled = entry
+            if cached_stamp == stamp and (now_mono - cached_at) < ttl_sec:
+                cache.move_to_end(cache_key)
+                return {
+                    "bvid": bvid,
+                    "hours": hours,
+                    "history": cached_history,
+                    "downsampled": cached_downsampled,
+                }
+            cache.pop(cache_key, None)
+
+    def _load() -> tuple[list[dict[str, Any]], bool]:
+        if hasattr(db, "get_video_history_with_meta"):
+            return db.get_video_history_with_meta(
                 bvid,
                 limit=effective_limit,
-                since_hours=hours if hours > 0 else None,
+                since_hours=since_hours,
                 max_points=effective_max_points,
             )
-        effective_limit = limit if limit is not None else 100
-        return db.get_video_history(
-            bvid, limit=effective_limit, max_points=max_points
+        rows = db.get_video_history(
+            bvid,
+            limit=effective_limit,
+            since_hours=since_hours,
+            max_points=effective_max_points,
         )
+        return rows, False
 
-    history = await asyncio.to_thread(_load)
-    return {"bvid": bvid, "hours": hours, "history": history}
+    history, downsampled = await asyncio.to_thread(_load)
+    end_stamp = (
+        event_bus.revision if event_bus is not None else 0,
+        getattr(db, "write_version", 0),
+    )
+    if end_stamp == stamp:
+        with cache_lock:
+            cache[cache_key] = (stamp, time.monotonic(), history, downsampled)
+            cache.move_to_end(cache_key)
+            while len(cache) > VIDEO_HISTORY_CACHE_MAX_ENTRIES:
+                cache.popitem(last=False)
+
+    return {
+        "bvid": bvid,
+        "hours": hours,
+        "history": history,
+        "downsampled": downsampled,
+    }
 
 
 @router.get("/crawl-logs")

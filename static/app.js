@@ -7,7 +7,7 @@
 import {
   renderTelemetryChart,
   clearChartsInGroup,
-} from "./charts.js?v=20261125a";
+} from "./charts.js?v=20261126a";
 import {
   animateNumber,
   runViewTransition,
@@ -40,6 +40,9 @@ const DASHBOARD_CACHE_MAX_ENTRIES = 24;
 const CACHE_SOFT_TTL_MS = 120000;
 const ACCOUNT_PREFETCH_DELAY_MS = 85;
 const ACCOUNT_SWITCH_LOADING_DELAY_MS = 120;
+const VIDEO_HISTORY_CACHE_MAX_ENTRIES = 64;
+const VIDEO_PREFETCH_DELAY_MS = 85;
+const VIDEO_MODAL_LOADING_DELAY_MS = 95;
 
 const state = {
   hours: 24,
@@ -67,8 +70,11 @@ const state = {
   videosExpandAbortController: null,
   accountPrefetchTimer: null,
   accountPrefetch: null,
+  videoHistoryPrefetchTimer: null,
+  videoHistoryPrefetch: null,
   snapshotCache: new Map(),
   dashboardCache: new Map(),
+  videoHistoryCache: new Map(),
   globalCacheEpoch: 0,
   uidCacheEpochs: new Map(),
   accountModalMode: "add",
@@ -87,6 +93,7 @@ const state = {
   modalHours: 24,
   modalReqSeq: 0,
   modalAbortController: null,
+  modalLoadingTimer: null,
   modalPoints: null,
   demoTimer: null,
   pollTimer: null,
@@ -654,6 +661,7 @@ async function exitDemoMode() {
   stopDemoPulseLoop();
   cancelPendingOverviewSnapshots();
   cancelPendingAccountPrefetch();
+  cancelPendingVideoHistoryPrefetch();
   cancelPendingVideoExpand();
   clearAllClientCaches();
   clearRankCaches({ resetLimits: true });
@@ -1692,6 +1700,17 @@ function cancelPendingAccountPrefetch() {
   state.accountPrefetch = null;
 }
 
+function cancelPendingVideoHistoryPrefetch() {
+  if (state.videoHistoryPrefetchTimer) {
+    clearTimeout(state.videoHistoryPrefetchTimer);
+    state.videoHistoryPrefetchTimer = null;
+  }
+  if (state.videoHistoryPrefetch?.controller) {
+    state.videoHistoryPrefetch.controller.abort();
+  }
+  state.videoHistoryPrefetch = null;
+}
+
 function renderAccountPill(settings) {
   const accountPill = document.getElementById("accountPill");
   if (!accountPill) return;
@@ -1850,6 +1869,7 @@ async function switchAccount(uid) {
   cancelPendingOverviewSnapshots();
   clearAccountSwitchLoading();
   cancelPendingVideoExpand();
+  cancelPendingVideoHistoryPrefetch();
   if (state.accountPrefetchTimer) {
     clearTimeout(state.accountPrefetchTimer);
     state.accountPrefetchTimer = null;
@@ -1981,6 +2001,7 @@ function invalidateAllCaches() {
 function clearAllClientCaches() {
   state.snapshotCache.clear();
   state.dashboardCache.clear();
+  state.videoHistoryCache.clear();
   state.uidCacheEpochs.clear();
   state.globalCacheEpoch += 1;
 }
@@ -3181,7 +3202,198 @@ function renderDashboard(
 const MODAL_DELTA_BUCKET_SEC = 3600;
 const MODAL_DELTA_BUCKET_MS = MODAL_DELTA_BUCKET_SEC * 1000;
 const MODAL_DELTA_JITTER_MS = 5 * 60 * 1000;
-const MODAL_HISTORY_MAX_POINTS = 2400;
+
+function getModalMaxPoints(hours) {
+  const h = Math.max(0, Math.round(Number(hours) || 0));
+  if (h > 0 && h <= 24) return 720;
+  if (h > 24 && h <= 168) return 840;
+  return 1200;
+}
+
+function getVideoHistoryCacheUid(bvid, explicitUid = "") {
+  const cleanExplicit = String(explicitUid || "").trim();
+  if (cleanExplicit) return cleanExplicit;
+  const video = (state.videos || []).find((v) => v.bvid === bvid);
+  return String(video?.uid || state.activeUid || state.backendUid || "").trim();
+}
+
+function cacheVideoHistory(bvid, hours, history, { downsampled = false, uid = "" } = {}) {
+  const cleanBvid = String(bvid || "").trim();
+  if (!cleanBvid || !Array.isArray(history)) return null;
+  const normHours = Math.max(0, Math.round(Number(hours) || 0));
+  const cleanUid = getVideoHistoryCacheUid(cleanBvid, uid);
+  const stamp = getUidCacheStamp(cleanUid);
+  const series = buildModalSeriesFromHistory(history);
+
+  for (const [key, entry] of state.videoHistoryCache.entries()) {
+    if (entry.bvid === cleanBvid && entry.stamp !== stamp) {
+      state.videoHistoryCache.delete(key);
+    }
+  }
+
+  const cacheKey = `${cleanBvid}:${normHours}`;
+  const entry = {
+    bvid: cleanBvid,
+    uid: cleanUid,
+    hours: normHours,
+    stamp,
+    downsampled: Boolean(downsampled),
+    history,
+    series,
+    fetchedAtMs: Date.now(),
+  };
+  state.videoHistoryCache.delete(cacheKey);
+  state.videoHistoryCache.set(cacheKey, entry);
+
+  while (state.videoHistoryCache.size > VIDEO_HISTORY_CACHE_MAX_ENTRIES) {
+    const oldestKey = state.videoHistoryCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    state.videoHistoryCache.delete(oldestKey);
+  }
+  return entry;
+}
+
+function getCachedVideoHistory(bvid, hours, { allowStale = false, uid = "" } = {}) {
+  const cleanBvid = String(bvid || "").trim();
+  if (!cleanBvid) return null;
+  const targetHours = Math.max(0, Math.round(Number(hours) || 0));
+  const cleanUid = getVideoHistoryCacheUid(cleanBvid, uid);
+  const currentStamp = getUidCacheStamp(cleanUid);
+  const nowMs = Date.now();
+
+  const isFreshEntry = (entry) =>
+    Boolean(entry) &&
+    entry.bvid === cleanBvid &&
+    entry.stamp === currentStamp &&
+    nowMs - entry.fetchedAtMs < CACHE_SOFT_TTL_MS;
+
+  const exact = state.videoHistoryCache.get(`${cleanBvid}:${targetHours}`);
+  if (exact) {
+    const fresh = isFreshEntry(exact);
+    if (fresh || allowStale) {
+      return {
+        history: exact.history,
+        series: exact.series,
+        downsampled: exact.downsampled,
+        isFresh: fresh,
+      };
+    }
+  }
+
+  // Lossless slice from a fresh wider non-downsampled window for the same video
+  if (targetHours > 0) {
+    let bestSuperset = null;
+    for (const entry of state.videoHistoryCache.values()) {
+      if (entry.bvid !== cleanBvid || entry.downsampled || !isFreshEntry(entry)) continue;
+      const coversTarget = entry.hours === 0 || entry.hours > targetHours;
+      if (!coversTarget) continue;
+      if (
+        !bestSuperset ||
+        (bestSuperset.hours === 0 && entry.hours > 0) ||
+        (entry.hours > 0 && bestSuperset.hours > 0 && entry.hours < bestSuperset.hours)
+      ) {
+        bestSuperset = entry;
+      }
+    }
+    if (bestSuperset) {
+      const cutoffSec = Math.floor(nowMs / 1000) - targetHours * 3600;
+      const sliced = bestSuperset.history.filter((item) => {
+        const tsSec = getSnapshotEpochSec(item);
+        return Number.isFinite(tsSec) && tsSec >= cutoffSec;
+      });
+      return {
+        history: sliced,
+        series: buildModalSeriesFromHistory(sliced),
+        downsampled: false,
+        isFresh: true,
+      };
+    }
+  }
+
+  return null;
+}
+
+function clearModalLoadingTimer() {
+  if (state.modalLoadingTimer) {
+    clearTimeout(state.modalLoadingTimer);
+    state.modalLoadingTimer = null;
+  }
+}
+
+async function fetchVideoHistoryPayload(bvid, hours, { signal, priority } = {}) {
+  const cleanBvid = String(bvid || "").trim();
+  const targetHours = Math.max(0, Math.round(Number(hours) || 0));
+  const maxPoints = getModalMaxPoints(targetHours);
+  const uid = getVideoHistoryCacheUid(cleanBvid);
+  const params = new URLSearchParams({
+    hours: String(targetHours),
+    max_points: String(maxPoints),
+  });
+  const fetchOptions = { timeoutMs: 15000 };
+  if (signal) fetchOptions.signal = signal;
+  if (priority) fetchOptions.priority = priority;
+  const res = await apiFetch(
+    `/api/videos/${encodeURIComponent(cleanBvid)}/history?${params.toString()}`,
+    fetchOptions
+  );
+  const history = Array.isArray(res?.history) ? res.history : [];
+  const downsampled = Boolean(res?.downsampled);
+  return cacheVideoHistory(cleanBvid, targetHours, history, { downsampled, uid });
+}
+
+function scheduleVideoHistoryPrefetch(bvid) {
+  const cleanBvid = String(bvid || "").trim();
+  if (!cleanBvid || state.demoMode) return;
+  if (state.modalBvid === cleanBvid) return;
+
+  const targetHours = Math.max(0, Math.round(Number(state.hours ?? 24)));
+  const cached = getCachedVideoHistory(cleanBvid, targetHours);
+  if (cached?.isFresh) return;
+
+  if (
+    state.videoHistoryPrefetch &&
+    state.videoHistoryPrefetch.bvid === cleanBvid &&
+    state.videoHistoryPrefetch.hours === targetHours
+  ) {
+    return;
+  }
+
+  if (state.videoHistoryPrefetchTimer) {
+    clearTimeout(state.videoHistoryPrefetchTimer);
+    state.videoHistoryPrefetchTimer = null;
+  }
+
+  state.videoHistoryPrefetchTimer = setTimeout(() => {
+    state.videoHistoryPrefetchTimer = null;
+    if (state.demoMode || state.modalBvid === cleanBvid) return;
+
+    const latestHours = Math.max(0, Math.round(Number(state.hours ?? 24)));
+    const fresh = getCachedVideoHistory(cleanBvid, latestHours);
+    if (fresh?.isFresh) return;
+
+    if (state.videoHistoryPrefetch?.controller) {
+      state.videoHistoryPrefetch.controller.abort();
+    }
+    const controller = new AbortController();
+    const promise = fetchVideoHistoryPayload(cleanBvid, latestHours, {
+      priority: "low",
+      signal: controller.signal,
+    })
+      .catch(() => null)
+      .finally(() => {
+        if (state.videoHistoryPrefetch?.controller === controller) {
+          state.videoHistoryPrefetch = null;
+        }
+      });
+
+    state.videoHistoryPrefetch = {
+      bvid: cleanBvid,
+      hours: latestHours,
+      controller,
+      promise,
+    };
+  }, VIDEO_PREFETCH_DELAY_MS);
+}
 
 function parseModalPointMs(rawTs, rawEpochSec) {
   if (rawEpochSec !== null && rawEpochSec !== undefined && Number.isFinite(Number(rawEpochSec))) {
@@ -3644,7 +3856,7 @@ function setModalChartsPlaceholder(message) {
 function refreshOpenDemoModal(bvid) {
   const history = getDemoVideoHistory(state, bvid, {
     hours: state.modalHours,
-    maxPoints: MODAL_HISTORY_MAX_POINTS,
+    maxPoints: getModalMaxPoints(state.modalHours),
   });
   const series = buildModalSeriesFromHistory(history);
   state.modalPoints = series;
@@ -3658,7 +3870,8 @@ async function loadVideoModalSeries(bvid, hours, { animate = true, silent = fals
   if (!bvid || !chartEl || !playChartEl) return;
 
   const reqId = ++state.modalReqSeq;
-  const targetHours = Number(hours ?? 24);
+  const targetHours = Math.max(0, Math.round(Number(hours ?? 24)));
+  clearModalLoadingTimer();
   if (state.modalAbortController) {
     state.modalAbortController.abort();
     state.modalAbortController = null;
@@ -3667,7 +3880,7 @@ async function loadVideoModalSeries(bvid, hours, { animate = true, silent = fals
   if (state.demoMode) {
     const history = getDemoVideoHistory(state, bvid, {
       hours: targetHours,
-      maxPoints: MODAL_HISTORY_MAX_POINTS,
+      maxPoints: getModalMaxPoints(targetHours),
     });
     if (state.modalBvid !== bvid || reqId !== state.modalReqSeq) return;
     const series = buildModalSeriesFromHistory(history);
@@ -3681,37 +3894,91 @@ async function loadVideoModalSeries(bvid, hours, { animate = true, silent = fals
     return;
   }
 
-  if (!silent) {
-    clearChartsInGroup("video-modal");
-    updateModalStatsFromVideoAndPoints(bvid, null);
-    setModalChartsPlaceholder("正在拉取视频趋势与每小时增量采样序列...");
+  // Cancel unrelated hover prefetch, but keep a matching in-flight prefetch to reuse it
+  if (state.videoHistoryPrefetchTimer) {
+    clearTimeout(state.videoHistoryPrefetchTimer);
+    state.videoHistoryPrefetchTimer = null;
+  }
+  let reusedPrefetch = null;
+  if (
+    state.videoHistoryPrefetch &&
+    state.videoHistoryPrefetch.bvid === bvid &&
+    state.videoHistoryPrefetch.hours === targetHours
+  ) {
+    reusedPrefetch = state.videoHistoryPrefetch;
+    state.videoHistoryPrefetch = null;
+  } else if (state.videoHistoryPrefetch) {
+    state.videoHistoryPrefetch.controller?.abort();
+    state.videoHistoryPrefetch = null;
   }
 
-  const controller = new AbortController();
-  state.modalAbortController = controller;
-  try {
-    const params = new URLSearchParams({
-      hours: String(targetHours),
-      max_points: String(MODAL_HISTORY_MAX_POINTS),
-    });
-    const res = await apiFetch(
-      `/api/videos/${encodeURIComponent(bvid)}/history?${params.toString()}`,
-      { timeoutMs: 15000, signal: controller.signal }
-    );
-    const modal = document.getElementById("videoModal");
-    if (state.modalBvid !== bvid || reqId !== state.modalReqSeq) return;
-    if (silent && (!modal || !modal.open)) return;
-    const series = buildModalSeriesFromHistory(res.history || []);
-    state.modalPoints = series;
-    updateModalStatsFromVideoAndPoints(bvid, series);
+  // Check client LRU cache (exact window or lossless wider-window slice)
+  const cached = !silent
+    ? getCachedVideoHistory(bvid, targetHours, { allowStale: true })
+    : null;
+  let paintedFromCache = false;
+  if (cached) {
+    paintedFromCache = true;
+    state.modalPoints = cached.series;
+    updateModalStatsFromVideoAndPoints(bvid, cached.series);
     requestAnimationFrame(() => {
       if (state.modalBvid === bvid && reqId === state.modalReqSeq) {
-        renderModalCharts(series, animate);
+        renderModalCharts(cached.series, animate);
+      }
+    });
+    if (cached.isFresh) {
+      return;
+    }
+  }
+
+  if (!silent && !paintedFromCache) {
+    clearChartsInGroup("video-modal");
+    updateModalStatsFromVideoAndPoints(bvid, null);
+    state.modalLoadingTimer = setTimeout(() => {
+      state.modalLoadingTimer = null;
+      if (state.modalBvid === bvid && reqId === state.modalReqSeq) {
+        setModalChartsPlaceholder("正在拉取视频趋势与每小时增量采样序列...");
+      }
+    }, VIDEO_MODAL_LOADING_DELAY_MS);
+  }
+
+  const controller = reusedPrefetch ? reusedPrefetch.controller : new AbortController();
+  state.modalAbortController = controller;
+  try {
+    let entry = null;
+    if (reusedPrefetch) {
+      entry = await reusedPrefetch.promise;
+      if (!entry && !controller.signal.aborted) {
+        const retryController = new AbortController();
+        state.modalAbortController = retryController;
+        entry = await fetchVideoHistoryPayload(bvid, targetHours, {
+          signal: retryController.signal,
+        });
+      }
+    } else {
+      entry = await fetchVideoHistoryPayload(bvid, targetHours, {
+        signal: controller.signal,
+      });
+    }
+    const modal = document.getElementById("videoModal");
+    if (state.modalBvid !== bvid || reqId !== state.modalReqSeq) return;
+    clearModalLoadingTimer();
+    if (silent && (!modal || !modal.open)) return;
+    const series = entry?.series || buildModalSeriesFromHistory([]);
+    state.modalPoints = series;
+    updateModalStatsFromVideoAndPoints(bvid, series);
+    const shouldAnimate = animate && !paintedFromCache && !silent;
+    requestAnimationFrame(() => {
+      if (state.modalBvid === bvid && reqId === state.modalReqSeq) {
+        renderModalCharts(series, shouldAnimate);
       }
     });
   } catch (err) {
+    clearModalLoadingTimer();
     if (isAbortError(err)) return;
-    if (silent || state.modalBvid !== bvid || reqId !== state.modalReqSeq) return;
+    if (silent || paintedFromCache || state.modalBvid !== bvid || reqId !== state.modalReqSeq) {
+      return;
+    }
     setModalChartsPlaceholder(`波形拉取失败: ${err.message}`);
   } finally {
     if (state.modalAbortController === controller) {
@@ -3759,9 +4026,7 @@ async function openVideoModal(bvid, fallbackTitle = "") {
     coverWrap.classList.remove("hidden");
   }
 
-  clearChartsInGroup("video-modal");
   updateModalStatsFromVideoAndPoints(bvid, null);
-  setModalChartsPlaceholder("正在拉取视频趋势与区间增量采样序列...");
 
   if (!modal.open) {
     if (typeof modal.showModal === "function") {
@@ -3782,6 +4047,11 @@ async function openVideoModal(bvid, fallbackTitle = "") {
 
 function closeVideoModal() {
   state.modalReqSeq += 1;
+  clearModalLoadingTimer();
+  if (state.modalAbortController) {
+    state.modalAbortController.abort();
+    state.modalAbortController = null;
+  }
   const modal = document.getElementById("videoModal");
   if (modal && modal.open) {
     if (typeof modal.close === "function") {
@@ -5880,7 +6150,21 @@ function bindEvents(settingsValidator, accountValidator, zoneLookupValidator) {
     }
   });
 
-  // Delegated click & keyboard trigger for Video Oscilloscope Drawer
+  // Delegated click, hover prefetch & keyboard trigger for Video Oscilloscope Drawer
+  const overviewPanelEl = document.getElementById("tab-overview");
+  overviewPanelEl?.addEventListener("pointerover", (ev) => {
+    const trigger = ev.target.closest(".rank-row");
+    if (trigger?.dataset.bvid) {
+      scheduleVideoHistoryPrefetch(trigger.dataset.bvid);
+    }
+  });
+  overviewPanelEl?.addEventListener("focusin", (ev) => {
+    const trigger = ev.target.closest(".rank-row");
+    if (trigger?.dataset.bvid) {
+      scheduleVideoHistoryPrefetch(trigger.dataset.bvid);
+    }
+  });
+
   document.addEventListener("click", (ev) => {
     if (ev.target.closest("a.bvid-link, a.bvid-pill")) return;
     const trigger = ev.target.closest(".rank-row");
@@ -5907,6 +6191,11 @@ function bindEvents(settingsValidator, accountValidator, zoneLookupValidator) {
   videoModal?.addEventListener("close", () => {
     videoModal.returnValue = "";
     state.modalReqSeq += 1;
+    clearModalLoadingTimer();
+    if (state.modalAbortController) {
+      state.modalAbortController.abort();
+      state.modalAbortController = null;
+    }
     clearChartsInGroup("video-modal");
     state.modalBvid = null;
     state.modalPoints = null;
@@ -6049,6 +6338,9 @@ function bindEvents(settingsValidator, accountValidator, zoneLookupValidator) {
       state.dashboardCache.delete(uid);
       for (const [key, entry] of state.snapshotCache.entries()) {
         if (entry.uid === uid) state.snapshotCache.delete(key);
+      }
+      for (const [key, entry] of state.videoHistoryCache.entries()) {
+        if (entry.uid === uid) state.videoHistoryCache.delete(key);
       }
       invalidateAllCaches();
       clearRankCaches({ resetLimits: true });

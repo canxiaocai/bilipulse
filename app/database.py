@@ -282,7 +282,17 @@ class Database:
         self.db_path = Path(db_path or DB_PATH)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
+        self._write_version = 0
+        self._write_version_lock = threading.Lock()
         self.init_schema()
+
+    @property
+    def write_version(self) -> int:
+        return self._write_version
+
+    def _bump_write_version(self) -> None:
+        with self._write_version_lock:
+            self._write_version += 1
 
     def _open_read_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=30.0)
@@ -333,6 +343,7 @@ class Database:
         try:
             yield conn
             conn.commit()
+            self._bump_write_version()
         except Exception:
             conn.rollback()
             raise
@@ -416,6 +427,7 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     snapshot_id INTEGER NOT NULL REFERENCES account_snapshots(id) ON DELETE CASCADE,
                     bvid TEXT NOT NULL,
+                    collected_at_ts INTEGER,
                     online_count INTEGER NOT NULL,
                     online_raw TEXT NOT NULL DEFAULT '',
                     play_count INTEGER,
@@ -424,8 +436,6 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_video_snapshots_snapshot
                     ON video_online_snapshots (snapshot_id);
-                CREATE INDEX IF NOT EXISTS idx_video_snapshots_bvid
-                    ON video_online_snapshots (bvid, id DESC);
 
                 CREATE TABLE IF NOT EXISTS video_pulse_snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -439,8 +449,6 @@ class Database:
                     like_count INTEGER
                 );
 
-                CREATE INDEX IF NOT EXISTS idx_video_pulse_bvid_ts
-                    ON video_pulse_snapshots (bvid, collected_at_ts DESC, id DESC);
                 CREATE INDEX IF NOT EXISTS idx_video_pulse_uid_ts
                     ON video_pulse_snapshots (uid, collected_at_ts DESC);
 
@@ -538,6 +546,42 @@ class Database:
                 conn.execute("ALTER TABLE video_online_snapshots ADD COLUMN play_count INTEGER")
             if "like_count" not in video_snap_cols:
                 conn.execute("ALTER TABLE video_online_snapshots ADD COLUMN like_count INTEGER")
+            if "collected_at_ts" not in video_snap_cols:
+                conn.execute(
+                    "ALTER TABLE video_online_snapshots ADD COLUMN collected_at_ts INTEGER"
+                )
+                conn.execute(
+                    """
+                    UPDATE video_online_snapshots
+                    SET collected_at_ts = (
+                        SELECT s.collected_at_ts
+                        FROM account_snapshots s
+                        WHERE s.id = video_online_snapshots.snapshot_id
+                    )
+                    WHERE collected_at_ts IS NULL
+                    """
+                )
+            # Covering indexes for zero-table-lookup video history queries (supersede legacy non-covering bvid indexes)
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_video_snapshots_bvid_ts_cover
+                    ON video_online_snapshots (
+                        bvid, collected_at_ts DESC, snapshot_id DESC,
+                        online_count, online_raw, play_count, like_count
+                    )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_video_pulse_bvid_ts_cover
+                    ON video_pulse_snapshots (
+                        bvid, collected_at_ts DESC, id DESC,
+                        online_count, online_raw, play_count, like_count
+                    )
+                """
+            )
+            conn.execute("DROP INDEX IF EXISTS idx_video_snapshots_bvid;")
+            conn.execute("DROP INDEX IF EXISTS idx_video_pulse_bvid_ts;")
             now = datetime.now(timezone.utc).astimezone().isoformat()
             conn.executemany(
                 "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
@@ -2426,7 +2470,7 @@ class Database:
                     conn, video_online_items
                 )
                 snapshot_rows: list[
-                    tuple[int, str, int, str, Optional[int], Optional[int]]
+                    tuple[int, str, int, int, str, Optional[int], Optional[int]]
                 ] = []
                 for item in video_online_items:
                     bvid = item["bvid"]
@@ -2449,6 +2493,7 @@ class Database:
                         (
                             snapshot_id,
                             bvid,
+                            collected_ts,
                             online_count,
                             online_raw,
                             play_count_val,
@@ -2459,8 +2504,8 @@ class Database:
                 conn.executemany(
                     """
                     INSERT INTO video_online_snapshots (
-                        snapshot_id, bvid, online_count, online_raw, play_count, like_count
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        snapshot_id, bvid, collected_at_ts, online_count, online_raw, play_count, like_count
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     snapshot_rows,
                 )
@@ -2938,6 +2983,114 @@ class Database:
 
         return [rows[idx] for idx in sorted(must_keep)]
 
+    def get_video_history_with_meta(
+        self,
+        bvid: str,
+        limit: Optional[int] = 100,
+        since_hours: Optional[int] = None,
+        max_points: Optional[int] = None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Fetch merged video history using covering indexes on snapshot and pulse tables."""
+        cutoff: Optional[int] = None
+        if since_hours is not None and since_hours > 0:
+            cutoff = int(time.time()) - since_hours * 3600
+
+        snap_params: list[Any] = [bvid]
+        pulse_params: list[Any] = [bvid]
+        snap_where = "WHERE bvid = ?"
+        pulse_where = "WHERE bvid = ?"
+        if cutoff is not None:
+            snap_where += " AND collected_at_ts >= ?"
+            pulse_where += " AND collected_at_ts >= ?"
+            snap_params.append(cutoff)
+            pulse_params.append(cutoff)
+
+        snap_sql = f"""
+            SELECT collected_at_ts, online_count, online_raw,
+                   play_count, like_count, snapshot_id
+            FROM video_online_snapshots
+            {snap_where}
+            ORDER BY collected_at_ts DESC, snapshot_id DESC
+        """
+        pulse_sql = f"""
+            SELECT collected_at_ts, online_count, online_raw,
+                   play_count, like_count, id
+            FROM video_pulse_snapshots
+            {pulse_where}
+            ORDER BY collected_at_ts DESC, id DESC
+        """
+        if limit is not None:
+            snap_sql += " LIMIT ?"
+            pulse_sql += " LIMIT ?"
+            snap_params.append(limit)
+            pulse_params.append(limit)
+
+        with self.read_connection() as conn:
+            snap_rows = conn.execute(snap_sql, snap_params).fetchall()
+            pulse_rows = conn.execute(pulse_sql, pulse_params).fetchall()
+
+        # Two-pointer merge of pre-sorted descending streams:
+        # key = (collected_at_ts DESC, src_rank DESC [pulse=1, snap=0], sort_id DESC)
+        merged_desc: list[tuple[int, int, str, Optional[int], Optional[int]]] = []
+        i = 0
+        j = 0
+        n_snap = len(snap_rows)
+        n_pulse = len(pulse_rows)
+        cap = limit if limit is not None else (n_snap + n_pulse)
+
+        while (i < n_snap or j < n_pulse) and len(merged_desc) < cap:
+            if i < n_snap and j < n_pulse:
+                sr = snap_rows[i]
+                pr = pulse_rows[j]
+                s_ts = int(sr[0] or 0)
+                p_ts = int(pr[0] or 0)
+                # pulse has src_rank=1 > snap src_rank=0, so pulse wins timestamp ties
+                if p_ts >= s_ts:
+                    merged_desc.append((p_ts, pr[1], pr[2], pr[3], pr[4]))
+                    j += 1
+                else:
+                    merged_desc.append((s_ts, sr[1], sr[2], sr[3], sr[4]))
+                    i += 1
+            elif i < n_snap:
+                sr = snap_rows[i]
+                merged_desc.append((int(sr[0] or 0), sr[1], sr[2], sr[3], sr[4]))
+                i += 1
+            else:
+                pr = pulse_rows[j]
+                merged_desc.append((int(pr[0] or 0), pr[1], pr[2], pr[3], pr[4]))
+                j += 1
+
+        raw_total = len(merged_desc)
+        items: list[dict[str, Any]] = [
+            {
+                "collected_at_ts": row[0],
+                "online_count": row[1],
+                "online_raw": row[2],
+                "play_count": row[3],
+                "like_count": row[4],
+            }
+            for row in reversed(merged_desc)
+        ]
+
+        downsampled = False
+        if max_points is not None and max_points > 0 and len(items) > max_points:
+            items = self._downsample_video_history(items, max_points=max_points)
+            downsampled = True
+        elif limit is not None and raw_total >= limit:
+            downsampled = True
+
+        # Format ISO timestamp strings only for the final retained points
+        local_tz = datetime.now(timezone.utc).astimezone().tzinfo
+        for item in items:
+            ts_val = int(item["collected_at_ts"] or 0)
+            item["collected_at"] = (
+                datetime.fromtimestamp(ts_val, tz=local_tz).isoformat()
+                if ts_val > 0
+                else ""
+            )
+
+        return items, downsampled
+
     def get_video_history(
         self,
         bvid: str,
@@ -2945,56 +3098,12 @@ class Database:
         since_hours: Optional[int] = None,
         max_points: Optional[int] = None,
     ) -> list[dict[str, Any]]:
-        snap_where = "WHERE v.bvid = ?"
-        pulse_where = "WHERE p.bvid = ?"
-        snap_params: list[Any] = [bvid]
-        pulse_params: list[Any] = [bvid]
-        if since_hours is not None and since_hours > 0:
-            cutoff = int(time.time()) - since_hours * 3600
-            snap_where += " AND s.collected_at_ts >= ?"
-            pulse_where += " AND p.collected_at_ts >= ?"
-            snap_params.append(cutoff)
-            pulse_params.append(cutoff)
-
-        params: list[Any] = [*snap_params, *pulse_params]
-        sql = f"""
-            SELECT collected_at, collected_at_ts, online_count, online_raw,
-                   play_count, like_count
-            FROM (
-                SELECT s.collected_at AS collected_at,
-                       s.collected_at_ts AS collected_at_ts,
-                       v.online_count AS online_count,
-                       v.online_raw AS online_raw,
-                       v.play_count AS play_count,
-                       v.like_count AS like_count,
-                       0 AS src_rank,
-                       s.id AS sort_id
-                FROM video_online_snapshots v
-                JOIN account_snapshots s ON s.id = v.snapshot_id
-                {snap_where}
-                UNION ALL
-                SELECT p.collected_at AS collected_at,
-                       p.collected_at_ts AS collected_at_ts,
-                       p.online_count AS online_count,
-                       p.online_raw AS online_raw,
-                       p.play_count AS play_count,
-                       p.like_count AS like_count,
-                       1 AS src_rank,
-                       p.id AS sort_id
-                FROM video_pulse_snapshots p
-                {pulse_where}
-            )
-            ORDER BY collected_at_ts DESC, src_rank DESC, sort_id DESC
-        """
-        if limit is not None:
-            sql += " LIMIT ?"
-            params.append(limit)
-
-        with self.read_connection() as conn:
-            rows = conn.execute(sql, params).fetchall()
-        items = [dict(r) for r in reversed(rows)]
-        if max_points is not None and max_points > 0 and len(items) > max_points:
-            return self._downsample_video_history(items, max_points=max_points)
+        items, _ = self.get_video_history_with_meta(
+            bvid,
+            limit=limit,
+            since_hours=since_hours,
+            max_points=max_points,
+        )
         return items
 
     def prune_old_snapshots(self, retention_days: Optional[int] = None) -> dict[str, int]:

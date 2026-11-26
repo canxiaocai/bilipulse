@@ -298,6 +298,42 @@ function evalHermiteY(segments, targetX, fallbackY) {
 }
 
 /**
+ * Estimates SVG spline stroke length mathematically from cubic Bezier segments
+ * without triggering an expensive SVG DOM getTotalLength() forced layout flush.
+ * @param {Array<{x0: number, y0: number, cp1y: number, cp2y: number, x1: number, y1: number}>} segments
+ * @param {number} fallbackLen
+ * @returns {number}
+ */
+function estimateSplineLength(segments, fallbackLen) {
+  if (!Array.isArray(segments) || segments.length === 0) {
+    return Math.max(0, Number(fallbackLen) || 0);
+  }
+  const steps = 4;
+  let total = 0;
+  for (let i = 0; i < segments.length; i += 1) {
+    const seg = segments[i];
+    const dx = seg.x1 - seg.x0;
+    let prevX = seg.x0;
+    let prevY = seg.y0;
+    for (let s = 1; s <= steps; s += 1) {
+      const t = s / steps;
+      const u = 1 - t;
+      const x = seg.x0 + dx * t;
+      const y =
+        u * u * u * seg.y0 +
+        3 * u * u * t * seg.cp1y +
+        3 * u * t * t * seg.cp2y +
+        t * t * t * seg.y1;
+      total += Math.hypot(x - prevX, y - prevY);
+      prevX = x;
+      prevY = y;
+    }
+  }
+  // Small margin ensures stroke-dashoffset completely conceals the trace before draw-in
+  return Math.ceil(total * 1.03);
+}
+
+/**
  * Builds an adaptively smoothed visual series (zero-phase pixel-space local-linear
  * Gaussian filter + knot resampling) while preserving real extrema, monotonicity,
  * sparse/impulse signals, and keeping raw samples untouched for HUD readouts.
@@ -627,6 +663,10 @@ function disposeInstance(inst) {
     cancelAnimationFrame(inst.resizeRaf);
     inst.resizeRaf = 0;
   }
+  if (inst.animRaf) {
+    cancelAnimationFrame(inst.animRaf);
+    inst.animRaf = 0;
+  }
   if (inst.animTimer) {
     clearTimeout(inst.animTimer);
     inst.animTimer = 0;
@@ -745,6 +785,7 @@ export function renderTelemetryChart(container, points, options = {}) {
     plotY1: 0,
     resizeObserver: null,
     resizeRaf: 0,
+    animRaf: 0,
     animTimer: 0,
     disposed: false,
     activateIndex: () => {},
@@ -766,6 +807,10 @@ export function renderTelemetryChart(container, points, options = {}) {
   const draw = (shouldAnimate) => {
     if (instance.disposed) return;
 
+    if (instance.animRaf) {
+      cancelAnimationFrame(instance.animRaf);
+      instance.animRaf = 0;
+    }
     if (instance.animTimer) {
       clearTimeout(instance.animTimer);
       instance.animTimer = 0;
@@ -1251,14 +1296,9 @@ export function renderTelemetryChart(container, points, options = {}) {
     const hudLabelEl = container.querySelector('.scope-hud-label');
     const hudValueEl = container.querySelector('.scope-hud-value');
 
-    // Animated oscilloscope trace draw-in
+    // Animated oscilloscope trace draw-in (batched via rAF to avoid forced synchronous reflows)
     if (shouldAnimate && !prefersReducedMotion() && curveEl && areaEl) {
-      let pathLen = 0;
-      try {
-        pathLen = curveEl.getTotalLength();
-      } catch (_err) {
-        pathLen = 0;
-      }
+      const pathLen = estimateSplineLength(curveSegments, plotX1 - plotX0);
 
       if (pathLen > 0) {
         curveEl.style.transition = 'none';
@@ -1267,24 +1307,29 @@ export function renderTelemetryChart(container, points, options = {}) {
         areaEl.style.transition = 'none';
         areaEl.style.opacity = '0';
 
-        // Commit initial hidden stroke state synchronously before starting transition
-        void curveEl.getBoundingClientRect();
-
-        curveEl.style.transition =
-          `stroke-dashoffset ${resolvedAnimMs}ms cubic-bezier(0.16, 1, 0.3, 1)`;
-        curveEl.style.strokeDashoffset = '0';
-        areaEl.style.transition =
-          `opacity ${resolvedAnimMs}ms cubic-bezier(0.16, 1, 0.3, 1) ${resolvedAreaDelayMs}ms`;
-        areaEl.style.opacity = '1';
-
-        instance.animTimer = setTimeout(() => {
+        instance.animRaf = requestAnimationFrame(() => {
+          instance.animRaf = 0;
           if (instance.disposed) return;
-          curveEl.style.transition = '';
-          curveEl.style.strokeDasharray = '';
-          curveEl.style.strokeDashoffset = '';
-          areaEl.style.transition = '';
-          instance.animTimer = 0;
-        }, resolvedAnimMs + resolvedAreaDelayMs + 40);
+          instance.animRaf = requestAnimationFrame(() => {
+            instance.animRaf = 0;
+            if (instance.disposed) return;
+            curveEl.style.transition =
+              `stroke-dashoffset ${resolvedAnimMs}ms cubic-bezier(0.16, 1, 0.3, 1)`;
+            curveEl.style.strokeDashoffset = '0';
+            areaEl.style.transition =
+              `opacity ${resolvedAnimMs}ms cubic-bezier(0.16, 1, 0.3, 1) ${resolvedAreaDelayMs}ms`;
+            areaEl.style.opacity = '1';
+
+            instance.animTimer = setTimeout(() => {
+              if (instance.disposed) return;
+              curveEl.style.transition = '';
+              curveEl.style.strokeDasharray = '';
+              curveEl.style.strokeDashoffset = '';
+              areaEl.style.transition = '';
+              instance.animTimer = 0;
+            }, resolvedAnimMs + resolvedAreaDelayMs + 40);
+          });
+        });
       }
     }
 

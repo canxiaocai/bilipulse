@@ -5712,3 +5712,169 @@ def test_db_profile_noop_index_cleanup_revision_headers_and_favicon(tmp_path: Pa
         assert rev3 > rev2
 
 
+def test_video_history_covering_indexes_migration_and_api_cache(tmp_path: Path):
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    # 1) Legacy DB without video_online_snapshots.collected_at_ts migrates and backfills cleanly
+    legacy_path = tmp_path / "legacy_history.db"
+    now = datetime.now(timezone.utc).astimezone()
+    t1 = now - timedelta(hours=3)
+    t2 = now - timedelta(hours=1)
+    t3 = now - timedelta(minutes=20)
+
+    conn = sqlite3.connect(str(legacy_path))
+    conn.executescript(
+        f"""
+        CREATE TABLE account_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uid TEXT NOT NULL,
+            collected_at TEXT NOT NULL,
+            collected_at_ts INTEGER NOT NULL,
+            follower_count INTEGER,
+            following_count INTEGER,
+            online_viewers_total INTEGER,
+            video_count INTEGER NOT NULL DEFAULT 0,
+            videos_succeeded INTEGER NOT NULL DEFAULT 0,
+            extra_metrics TEXT NOT NULL DEFAULT '{{}}',
+            status TEXT NOT NULL DEFAULT 'success',
+            error_message TEXT,
+            duration_ms INTEGER
+        );
+        CREATE TABLE video_online_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_id INTEGER NOT NULL REFERENCES account_snapshots(id) ON DELETE CASCADE,
+            bvid TEXT NOT NULL,
+            online_count INTEGER NOT NULL,
+            online_raw TEXT NOT NULL DEFAULT '',
+            play_count INTEGER,
+            like_count INTEGER
+        );
+        CREATE INDEX idx_video_snapshots_bvid ON video_online_snapshots (bvid, id DESC);
+        CREATE TABLE video_pulse_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uid TEXT NOT NULL,
+            bvid TEXT NOT NULL,
+            collected_at TEXT NOT NULL,
+            collected_at_ts INTEGER NOT NULL,
+            online_count INTEGER NOT NULL,
+            online_raw TEXT NOT NULL DEFAULT '',
+            play_count INTEGER,
+            like_count INTEGER
+        );
+        CREATE INDEX idx_video_pulse_bvid_ts ON video_pulse_snapshots (bvid, collected_at_ts DESC, id DESC);
+        INSERT INTO account_snapshots (id, uid, collected_at, collected_at_ts, online_viewers_total)
+        VALUES (1, '777', '{t1.isoformat()}', {int(t1.timestamp())}, 10),
+               (2, '777', '{t2.isoformat()}', {int(t2.timestamp())}, 25);
+        INSERT INTO video_online_snapshots (snapshot_id, bvid, online_count, online_raw, play_count, like_count)
+        VALUES (1, 'BV1cover', 10, '11', 1000, 50),
+               (2, 'BV1cover', 25, '26', 1400, 75);
+        INSERT INTO video_pulse_snapshots (uid, bvid, collected_at, collected_at_ts, online_count, online_raw, play_count, like_count)
+        VALUES ('777', 'BV1cover', '{t3.isoformat()}', {int(t3.timestamp())}, 33, '34', 1650, 90);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(db_path=legacy_path)
+
+    with db.read_connection() as rconn:
+        idx_names = {
+            r["name"]
+            for r in rconn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name IN ('video_online_snapshots', 'video_pulse_snapshots')"
+            ).fetchall()
+        }
+        assert "idx_video_snapshots_bvid_ts_cover" in idx_names
+        assert "idx_video_pulse_bvid_ts_cover" in idx_names
+        assert "idx_video_snapshots_bvid" not in idx_names
+        assert "idx_video_pulse_bvid_ts" not in idx_names
+
+        cutoff = int((now - timedelta(hours=24)).timestamp())
+        snap_plan = " ".join(
+            r["detail"]
+            for r in rconn.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT collected_at_ts, online_count, online_raw, play_count, like_count, snapshot_id
+                FROM video_online_snapshots
+                WHERE bvid = ? AND collected_at_ts >= ?
+                ORDER BY collected_at_ts DESC, snapshot_id DESC
+                LIMIT 20000
+                """,
+                ("BV1cover", cutoff),
+            ).fetchall()
+        )
+        pulse_plan = " ".join(
+            r["detail"]
+            for r in rconn.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT collected_at_ts, online_count, online_raw, play_count, like_count, id
+                FROM video_pulse_snapshots
+                WHERE bvid = ? AND collected_at_ts >= ?
+                ORDER BY collected_at_ts DESC, id DESC
+                LIMIT 20000
+                """,
+                ("BV1cover", cutoff),
+            ).fetchall()
+        )
+        assert "COVERING INDEX idx_video_snapshots_bvid_ts_cover" in snap_plan
+        assert "TEMP B-TREE" not in snap_plan
+        assert "COVERING INDEX idx_video_pulse_bvid_ts_cover" in pulse_plan
+        assert "TEMP B-TREE" not in pulse_plan
+
+    hist, downsampled = db.get_video_history_with_meta("BV1cover", since_hours=24, limit=100)
+    assert downsampled is False
+    assert [h["online_count"] for h in hist] == [10, 25, 33]
+    assert [h["play_count"] for h in hist] == [1000, 1400, 1650]
+    assert all(h["collected_at"] for h in hist)
+
+    # 2) API cache serves repeat requests from memory and invalidates immediately on DB write
+    app = create_app(database=db, enable_scheduler=False)
+    orig_loader = db.get_video_history_with_meta
+    call_count = 0
+
+    def counting_loader(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return orig_loader(*args, **kwargs)
+
+    db.get_video_history_with_meta = counting_loader  # type: ignore[method-assign]
+    with TestClient(app) as client:
+        r1 = client.get("/api/videos/BV1cover/history?hours=24&max_points=720")
+        assert r1.status_code == 200
+        d1 = r1.json()
+        assert d1["downsampled"] is False
+        assert len(d1["history"]) == 3
+        assert call_count == 1
+
+        # Second identical request hits cache without querying SQLite
+        r2 = client.get("/api/videos/BV1cover/history?hours=24&max_points=720")
+        assert r2.status_code == 200
+        assert len(r2.json()["history"]) == 3
+        assert call_count == 1
+
+        # Writing a new pulse immediately invalidates the cache via write_version
+        db.insert_video_pulse(
+            "777",
+            [
+                {
+                    "bvid": "BV1cover",
+                    "online_count": 41,
+                    "online_raw": "42",
+                    "play_count": 1900,
+                    "like_count": 105,
+                }
+            ],
+            collected_at=now,
+        )
+        r3 = client.get("/api/videos/BV1cover/history?hours=24&max_points=720")
+        assert r3.status_code == 200
+        h3 = r3.json()["history"]
+        assert len(h3) == 4
+        assert h3[-1]["online_count"] == 41
+        assert call_count == 2
+
+
+
