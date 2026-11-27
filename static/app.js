@@ -44,6 +44,9 @@ const VIDEO_HISTORY_CACHE_MAX_ENTRIES = 64;
 const VIDEO_PREFETCH_DELAY_MS = 85;
 const VIDEO_MODAL_LOADING_DELAY_MS = 95;
 
+const PERSONAL_EARNINGS_UID = "3690980052044072";
+const PERSONAL_EARNINGS_DEFAULT_PERIOD = "2026-p1";
+
 const state = {
   hours: 24,
   theme: "dark",
@@ -298,6 +301,7 @@ async function apiFetch(url, options = {}) {
   try {
     resp = await fetch(url, {
       cache: "no-store",
+      credentials: "same-origin",
       headers: { "Content-Type": "application/json", ...(fetchOptions.headers || {}) },
       ...fetchOptions,
       ...(signal ? { signal } : {}),
@@ -1717,8 +1721,12 @@ function renderAccountPill(settings) {
   const s = settings || {};
   if (s.uid) {
     const faceUrl = safeUrl(s.account_face) || (state.demoMode ? buildDemoAvatarSvg() : "");
+    const isPersonalEarningsOwner =
+      !state.demoMode && String(s.uid).trim() === PERSONAL_EARNINGS_UID;
     const avatarHtml = faceUrl
-      ? `<img src="${escapeHtml(faceUrl)}" referrerpolicy="no-referrer" alt="" />`
+      ? isPersonalEarningsOwner
+        ? `<button type="button" class="account-avatar-btn" id="btnOpenPersonalEarnings" aria-label="打开个人收益统计面板" title="点击查看个人收益统计"><img src="${escapeHtml(faceUrl)}" referrerpolicy="no-referrer" alt="" /></button>`
+        : `<img src="${escapeHtml(faceUrl)}" referrerpolicy="no-referrer" alt="" />`
       : "";
     const name = s.account_name || `账号 ${s.uid}`;
     const simChip = state.demoMode ? `<span class="status-chip mono">示例</span>` : "";
@@ -1737,6 +1745,12 @@ function renderAccountPill(settings) {
         },
         { once: true }
       );
+    }
+    const earningsBtn = document.getElementById("btnOpenPersonalEarnings");
+    if (earningsBtn) {
+      earningsBtn.addEventListener("click", () => {
+        ensureAdminAuthorized("查看个人收益统计", () => openEarningsModal());
+      });
     }
   } else {
     accountPill.innerHTML = `<span class="muted mono">尚未绑定监控账号</span>`;
@@ -4214,10 +4228,353 @@ async function lockAdminSession({ closeSettings = false } = {}) {
     if (closeSettings) {
       closeSettingsModal();
     }
+    closeEarningsModal();
     showToast("已锁定管理权限，下次配置需重新验证密码");
   } catch (err) {
     showToast(`锁定失败: ${err.message}`, "err");
   }
+}
+
+/* ---------- Personal Creator Earnings Modal (Owner Account Only) ---------- */
+
+let earningsLoading = false;
+
+function formatCurrencyYuan(amount) {
+  const num = Number(amount || 0);
+  if (!Number.isFinite(num)) return "¥0.00";
+  return `¥${num.toLocaleString("zh-CN", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
+
+function formatRemainingWindow(seconds) {
+  const sec = Math.max(0, Number(seconds || 0));
+  if (sec <= 0) return "已结束";
+  const days = Math.floor(sec / 86400);
+  const hours = Math.floor((sec % 86400) / 3600);
+  if (days >= 1) return `剩余 ${days} 天 ${hours} 小时`;
+  const mins = Math.max(1, Math.floor((sec % 3600) / 60));
+  return hours >= 1 ? `剩余 ${hours} 小时 ${mins} 分` : `剩余 ${mins} 分钟`;
+}
+
+function formatUnixDateShort(ts) {
+  const n = Number(ts || 0);
+  if (!Number.isFinite(n) || n <= 0) return "--";
+  const d = new Date(n * 1000);
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  return `${m}-${day} ${hh}:${mm}`;
+}
+
+function setEarningsStatus(message, tone = "info") {
+  const box = document.getElementById("earningsStatusBox");
+  if (!box) return;
+  if (!message) {
+    box.classList.add("hidden");
+    box.classList.remove("ok", "fail", "is-ok", "is-err");
+    box.textContent = "";
+    return;
+  }
+  box.textContent = message;
+  box.classList.remove("hidden", "ok", "fail", "is-ok", "is-err");
+  if (tone === "err") {
+    box.classList.add("fail", "is-err");
+  } else if (tone === "ok") {
+    box.classList.add("ok", "is-ok");
+  }
+}
+
+function renderEarningsModal(data) {
+  if (!data || typeof data !== "object") return;
+  const period = data.period || {};
+  const rules = data.rules || {};
+  const summary = data.summary || {};
+  const tiers = Array.isArray(data.tiers) ? data.tiers : [];
+  const videos = Array.isArray(data.videos) ? data.videos : [];
+
+  const periodChip = document.getElementById("earningsPeriodChip");
+  if (periodChip) {
+    const startShort = String(period.start_date || "").slice(5).replace("-", ".");
+    const endShort = String(period.end_date || "").slice(5).replace("-", ".");
+    periodChip.textContent = `${period.short_name || "第一期"} · ${startShort} — ${endShort}`;
+  }
+
+  const statusChip = document.getElementById("earningsPeriodStatusChip");
+  if (statusChip) {
+    statusChip.classList.remove("status-success", "status-warn");
+    if (period.status === "ended") {
+      statusChip.textContent = period.frozen ? "已结期 · 已定格" : "已结期";
+    } else if (period.status === "upcoming") {
+      statusChip.textContent = "未开始";
+    } else {
+      statusChip.textContent = `进行中 · ${formatRemainingWindow(period.remaining_seconds)}`;
+      statusChip.classList.add("status-success");
+    }
+  }
+
+  const tagPill = document.getElementById("earningsTagPill");
+  if (tagPill) {
+    tagPill.textContent = `# ${period.tag || "崩坏：因缘精灵创作者激励计划"}`;
+  }
+
+  const updatedMeta = document.getElementById("earningsUpdatedMeta");
+  if (updatedMeta) {
+    const timeStr = period.frozen && period.frozen_at
+      ? `定格于 ${fmtTime(period.frozen_at)}`
+      : data.computed_at
+        ? `实时更新于 ${fmtTime(data.computed_at)}`
+        : "实时统计";
+    updatedMeta.textContent = timeStr;
+  }
+
+  const cpmChip = document.getElementById("earningsCurrentCpmChip");
+  if (cpmChip) {
+    cpmChip.textContent =
+      Number(summary.current_cpm || 0) > 0
+        ? `当前档 ¥${summary.current_cpm}/千播`
+        : "已达 80 万封顶";
+  }
+
+  const estEl = document.getElementById("earningsEstPayout");
+  if (estEl) estEl.textContent = formatCurrencyYuan(summary.estimated_payout);
+
+  const capFill = document.getElementById("earningsCapBarFill");
+  const capPct = document.getElementById("earningsCapPct");
+  const pct = Math.max(0, Math.min(100, Number(summary.payout_progress_pct || 0)));
+  if (capFill) capFill.style.width = `${pct}%`;
+  if (capPct) capPct.textContent = `${pct.toFixed(1)}%`;
+
+  const settledCard = document.querySelector(".earnings-hero-settled");
+  const settledEl = document.getElementById("earningsSettledPayout");
+  const settledChip = document.getElementById("earningsSettledChip");
+  const blockersList = document.getElementById("earningsBlockersList");
+  const isReady = Boolean(summary.is_settled_ready);
+
+  if (settledCard) settledCard.classList.toggle("is-locked", !isReady);
+  if (settledEl) settledEl.textContent = formatCurrencyYuan(summary.settled_payout);
+  if (settledChip) {
+    settledChip.classList.remove("status-success", "status-warn");
+    if (isReady) {
+      settledChip.textContent = `已达标 · 解锁第 ${summary.unlocked_tier_index} 档`;
+      settledChip.classList.add("status-success");
+    } else {
+      settledChip.textContent = "待满足门槛";
+      settledChip.classList.add("status-warn");
+    }
+  }
+  if (blockersList) {
+    const blockers = Array.isArray(summary.blockers) ? summary.blockers : [];
+    if (blockers.length === 0) {
+      blockersList.classList.add("is-ready");
+      blockersList.innerHTML = `<li>✓ 稿件数量与 TOP10 均赞已达当前播放档位要求，按阶梯全额计入</li>`;
+    } else {
+      blockersList.classList.remove("is-ready");
+      blockersList.innerHTML = blockers.map((b) => `<li>${escapeHtml(b)}</li>`).join("");
+    }
+  }
+
+  // 4-cell KPI Strip
+  const minVideos = Number(rules.min_qualified_videos || 8);
+  const minPlay = Number(rules.min_video_play || 3000);
+  const qualEl = document.getElementById("earningsQualifiedCount");
+  const qualSub = document.getElementById("earningsQualifiedSub");
+  if (qualEl) {
+    qualEl.textContent = `${summary.qualified_video_count ?? 0} / ${minVideos} 条`;
+    qualEl.classList.toggle("is-ok", Boolean(summary.meets_video_count));
+  }
+  if (qualSub) {
+    qualSub.textContent = `单条 ≥ ${minPlay.toLocaleString("zh-CN")} 播放计入 · 带标签共 ${summary.matched_video_count ?? 0} 条`;
+  }
+
+  const playEl = document.getElementById("earningsTotalPlay");
+  const playSub = document.getElementById("earningsTotalPlaySub");
+  if (playEl) playEl.textContent = fmtCompact(summary.total_play ?? 0);
+  if (playSub) {
+    const extraPending = Math.max(0, Number(summary.all_matched_play || 0) - Number(summary.total_play || 0));
+    playSub.textContent =
+      extraPending > 0
+        ? `计费上限 80 万 · 待达标稿件另有 ${fmtCompact(extraPending)} 播`
+        : `计费上限 80 万播放（已计 ${fmtCompact(summary.billable_play ?? 0)}）`;
+  }
+
+  const avgLikesEl = document.getElementById("earningsAvgLikes");
+  const avgLikesSub = document.getElementById("earningsAvgLikesSub");
+  if (avgLikesEl) {
+    avgLikesEl.textContent = Number(summary.avg_top10_likes || 0).toLocaleString("zh-CN", {
+      maximumFractionDigits: 1,
+    });
+    avgLikesEl.classList.toggle("is-ok", Boolean(summary.meets_min_avg_likes));
+  }
+  if (avgLikesSub) {
+    const sampleSize = Number(summary.top_likes_sample_size || 0);
+    const tierNote =
+      Number(summary.unlocked_tier_index || 0) > 0
+        ? `已解锁至第 ${summary.unlocked_tier_index} 档`
+        : "未达第 1 档(1,000)";
+    avgLikesSub.textContent =
+      sampleSize > 0
+        ? `取前 ${sampleSize} 条有效稿件均值 · ${tierNote}`
+        : "暂无有效计入稿件";
+  }
+
+  const engEl = document.getElementById("earningsEngagement");
+  const engSub = document.getElementById("earningsEngagementSub");
+  if (engEl) engEl.textContent = `${Number(summary.engagement_rate || 0).toFixed(2)}%`;
+  if (engSub) {
+    engSub.textContent = `仅参考 · 评/赞 ${Number(summary.reply_to_like_rate || 0).toFixed(2)}%（赞 ${fmtCompact(summary.total_like ?? 0)} / 评 ${fmtCompact(summary.total_reply ?? 0)}）`;
+  }
+
+  // 3-Tier CPM Breakdown
+  const tiersGrid = document.getElementById("earningsTiersGrid");
+  if (tiersGrid) {
+    tiersGrid.innerHTML = tiers
+      .map((t) => {
+        const rangeText = `${(Number(t.play_start) / 10000).toFixed(0)}万 — ${(Number(t.play_end) / 10000).toFixed(0)}万播放`;
+        const likesTag = t.likes_unlocked
+          ? `<span class="earnings-badge earnings-badge-ok mono">均赞 ≥${Number(t.min_avg_likes).toLocaleString("zh-CN")} ✓</span>`
+          : `<span class="earnings-badge earnings-badge-pending mono">需均赞 ≥${Number(t.min_avg_likes).toLocaleString("zh-CN")}</span>`;
+        const cardCls = [
+          "earnings-tier-card",
+          t.likes_unlocked ? "is-unlocked" : "",
+          Number(t.counted_play || 0) > 0 ? "is-active" : "",
+        ]
+          .filter(Boolean)
+          .join(" ");
+        return `
+          <div class="${cardCls}">
+            <div class="earnings-tier-head">
+              <strong>${escapeHtml(t.label)}</strong>
+              <span class="earnings-tier-cpm mono">¥${escapeHtml(String(t.cpm))}/千播</span>
+            </div>
+            <div class="earnings-tier-range mono">${escapeHtml(rangeText)}</div>
+            <div class="earnings-tier-bar">
+              <div class="earnings-tier-bar-fill" style="width:${Math.max(0, Math.min(100, Number(t.progress_pct || 0)))}%"></div>
+            </div>
+            <div class="earnings-tier-foot mono">
+              <span class="muted">已计 ${fmtCompact(t.counted_play ?? 0)}</span>
+              <span class="earnings-tier-payout">${formatCurrencyYuan(t.payout)} / ¥${Number(t.max_segment_payout).toLocaleString("zh-CN")}</span>
+            </div>
+            <div>${likesTag}</div>
+          </div>
+        `;
+      })
+      .join("");
+  }
+
+  // Matched Videos List
+  const videosCountChip = document.getElementById("earningsVideosCountChip");
+  if (videosCountChip) {
+    videosCountChip.textContent = `已计入 ${summary.qualified_video_count ?? 0} · 待达标 ${summary.pending_video_count ?? 0}`;
+  }
+
+  const listEl = document.getElementById("earningsVideosList");
+  if (listEl) {
+    if (!videos.length) {
+      const unsyncedNote =
+        Number(summary.tags_unsynced_count || 0) > 0
+          ? `（当前有 ${summary.tags_unsynced_count} 条活动期稿件尚未拉取标签，可点击右上角「立即同步」）`
+          : "";
+      listEl.innerHTML = `<div class="chart-empty mono">暂未检测到活动期内带「${escapeHtml(period.tag || "")}」标签的稿件${escapeHtml(unsyncedNote)}</div>`;
+    } else {
+      listEl.innerHTML = videos
+        .map((v) => {
+          const bvid = String(v.bvid || "");
+          const href = `https://www.bilibili.com/video/${encodeURIComponent(bvid)}`;
+          const pic = safeUrl(v.pic);
+          const statusBadge = v.qualified
+            ? `<span class="earnings-badge earnings-badge-ok mono">已计入</span>`
+            : `<span class="earnings-badge earnings-badge-pending mono">待达标 · 差 ${Number(v.plays_to_qualify || 0).toLocaleString("zh-CN")} 播</span>`;
+          const topBadge = v.in_top10_likes
+            ? `<span class="earnings-badge earnings-badge-top mono">TOP10赞</span>`
+            : "";
+          const shareHtml = v.qualified
+            ? `<span class="earnings-video-share mono">预估占比 ${formatCurrencyYuan(v.allocated_estimated_payout)}</span>`
+            : `<span class="muted mono">未满 3,000 播暂不计费</span>`;
+          return `
+            <article class="earnings-video-row${v.qualified ? "" : " is-pending"}">
+              <a class="earnings-video-thumb" href="${href}" target="_blank" rel="noopener noreferrer">
+                ${pic ? `<img src="${escapeHtml(pic)}" referrerpolicy="no-referrer" loading="lazy" alt="" />` : ""}
+              </a>
+              <div class="earnings-video-main">
+                <a class="earnings-video-title" href="${href}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(v.title || bvid)}">${escapeHtml(v.title || bvid)}</a>
+                <div class="earnings-video-meta mono">
+                  ${statusBadge}
+                  ${topBadge}
+                  <a class="bvid-link bvid-pill" href="${href}" target="_blank" rel="noopener noreferrer">${escapeHtml(bvid)}</a>
+                  <span class="muted">发布 ${escapeHtml(formatUnixDateShort(v.pubdate))}</span>
+                  <span class="muted">赞 ${fmtCompact(v.like_count ?? 0)}</span>
+                  <span class="muted">评 ${fmtCompact(v.reply_count ?? 0)}</span>
+                </div>
+              </div>
+              <div class="earnings-video-metrics">
+                <span class="earnings-video-play mono">${fmtCompact(v.play_count ?? 0)} 播</span>
+                ${shareHtml}
+              </div>
+            </article>
+          `;
+        })
+        .join("");
+    }
+  }
+}
+
+async function loadPersonalEarnings({ refresh = false } = {}) {
+  if (earningsLoading) return;
+  earningsLoading = true;
+  const refreshBtn = document.getElementById("btnRefreshEarnings");
+  const refreshLabel = document.getElementById("btnRefreshEarningsLabel");
+  if (refreshBtn) refreshBtn.disabled = true;
+  if (refreshLabel) refreshLabel.textContent = refresh ? "同步中…" : "加载中…";
+
+  if (refresh) {
+    setEarningsStatus("正在从 B站同步活动期投稿标签与实时播放点赞数据…");
+  } else {
+    setEarningsStatus("");
+  }
+
+  try {
+    const query = `uid=${encodeURIComponent(PERSONAL_EARNINGS_UID)}&period=${encodeURIComponent(PERSONAL_EARNINGS_DEFAULT_PERIOD)}`;
+    const data = refresh
+      ? await apiFetch(`/api/earnings/refresh?${query}`, { method: "POST", timeoutMs: 30000 })
+      : await apiFetch(`/api/earnings?${query}`, { timeoutMs: 25000 });
+    renderEarningsModal(data);
+    if (refresh) {
+      const synced = Number(data?.sync_info?.synced_count || 0);
+      const errs = Array.isArray(data?.sync_info?.errors) ? data.sync_info.errors : [];
+      if (errs.length > 0) {
+        setEarningsStatus(`已同步 ${synced} 条视频，部分请求失败：${errs[0]}`, "err");
+      } else {
+        setEarningsStatus(`同步完成，已更新 ${synced} 条活动期稿件数据`, "ok");
+      }
+    } else {
+      setEarningsStatus("");
+    }
+  } catch (err) {
+    if (err.status === 401) {
+      closeEarningsModal();
+      ensureAdminAuthorized("查看个人收益统计", () => openEarningsModal());
+      return;
+    }
+    setEarningsStatus(`获取个人收益失败：${err.message}`, "err");
+  } finally {
+    earningsLoading = false;
+    if (refreshBtn) refreshBtn.disabled = false;
+    if (refreshLabel) refreshLabel.textContent = "立即同步";
+  }
+}
+
+function openEarningsModal() {
+  const modal = document.getElementById("earningsModal");
+  if (!modal) return;
+  showDialogModal(modal);
+  loadPersonalEarnings({ refresh: false });
+}
+
+function closeEarningsModal() {
+  closeDialogModal(document.getElementById("earningsModal"));
 }
 
 /* ---------- Settings Slide-Over Modal & Form ---------- */
@@ -5505,6 +5862,10 @@ async function refreshLiveData({ force = false, queueIfInFlight = true } = {}) {
         silent: true,
       });
     }
+    const earningsModal = document.getElementById("earningsModal");
+    if (!state.demoMode && earningsModal?.open && !earningsLoading) {
+      await loadPersonalEarnings({ refresh: false });
+    }
   } finally {
     state.liveRefreshInFlight = false;
     if (state.liveRefreshPending && !state.demoMode && !document.hidden) {
@@ -6271,9 +6632,10 @@ function bindEvents(settingsValidator, accountValidator, zoneLookupValidator) {
 
     if (submitBtn) submitBtn.disabled = true;
     try {
+      const remember = document.getElementById("adminAuthRemember")?.checked !== false;
       const res = await apiFetch("/api/admin/verify", {
         method: "POST",
-        body: JSON.stringify({ password }),
+        body: JSON.stringify({ password, remember }),
       });
       syncAdminAuthState(res);
       const pending = state.pendingAdminAction;
@@ -6297,6 +6659,17 @@ function bindEvents(settingsValidator, accountValidator, zoneLookupValidator) {
       if (submitBtn) submitBtn.disabled = false;
     }
   });
+
+  // Native <dialog id="earningsModal"> Close & Refresh
+  const earningsModal = document.getElementById("earningsModal");
+  document.getElementById("btnCloseEarningsModal")?.addEventListener("click", closeEarningsModal);
+  document.getElementById("btnRefreshEarnings")?.addEventListener("click", () => {
+    loadPersonalEarnings({ refresh: true });
+  });
+  earningsModal?.addEventListener("close", () => {
+    earningsModal.returnValue = "";
+  });
+  installDialogLightDismissFallback(earningsModal);
 
   // Native <dialog id="confirmDeleteModal"> Close & Actions
   const confirmDeleteModal = document.getElementById("confirmDeleteModal");

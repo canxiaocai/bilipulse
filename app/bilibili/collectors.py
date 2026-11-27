@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 from app.bilibili.client import BilibiliAPIError, BilibiliClient
 from app.database import Database
+from app.earnings import get_active_campaign_window, is_earnings_owner_uid
 from app.events import LiveEventBus
 
 logger = logging.getLogger(__name__)
@@ -349,6 +350,7 @@ def select_stats_refresh_bvids(
     quota: int = STATS_REFRESH_QUOTA,
     *,
     tiers_filter: Optional[set[int]] = None,
+    require_tags_window: Optional[tuple[int, int]] = None,
 ) -> list[str]:
     """Select up to `quota` BVids to refresh play/like/coin stats via /x/web-interface/view."""
     if quota <= 0 or not videos:
@@ -395,9 +397,14 @@ def select_stats_refresh_bvids(
         play_rate = float(v.get("play_rate_per_hour") or 0.0)
         synced_ts = _parse_iso_ts(v.get("stats_synced_at"))
         needs_zone_backfill = v.get("zone_synced") == 0
+        needs_tags_backfill = bool(
+            require_tags_window is not None
+            and require_tags_window[0] <= pubdate_val <= require_tags_window[1]
+            and not v.get("tags_synced_at")
+        )
 
-        if synced_ts is None or needs_zone_backfill:
-            if tier <= TIER_ACTIVE or in_showcase:
+        if synced_ts is None or needs_zone_backfill or needs_tags_backfill:
+            if tier <= TIER_ACTIVE or in_showcase or needs_tags_backfill:
                 unsynced_priority.append(v)
             else:
                 unsynced_cold.append(v)
@@ -479,6 +486,7 @@ async def _fetch_video_batch(
     stat_set: set[str],
     delay_sec: float,
     abort_412: Optional[asyncio.Event] = None,
+    tags_target_bvids: Optional[set[str]] = None,
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -508,34 +516,54 @@ async def _fetch_video_batch(
 
             if bvid in stat_set:
                 try:
-                    stat = await client.get_video_stat(bvid)
+                    use_tags_api = bool(
+                        tags_target_bvids
+                        and bvid in tags_target_bvids
+                        and hasattr(client, "get_video_stat_with_tags")
+                    )
+                    if use_tags_api:
+                        stat = await client.get_video_stat_with_tags(bvid)
+                    else:
+                        stat = await client.get_video_stat(bvid)
                     if _is_valid_stat_payload(stat):
                         play_val = max(
                             0, int(stat.get("play_count", video.get("play_count", 0)))
                         )
                         like_val = max(0, int(stat["like_count"]))
                         coin_val = max(0, int(stat["coin_count"]))
+                        reply_raw = stat.get("reply_count")
+                        reply_val = (
+                            max(0, int(reply_raw))
+                            if isinstance(reply_raw, (int, float)) and not isinstance(reply_raw, bool)
+                            else None
+                        )
                         tid_val = max(0, int(stat.get("tid") or 0))
                         tid_v2_val = max(0, int(stat.get("tid_v2") or 0))
                         video["play_count"] = max(int(video.get("play_count") or 0), play_val)
                         video["like_count"] = like_val
                         video["coin_count"] = coin_val
+                        if reply_val is not None:
+                            video["reply_count"] = reply_val
                         if tid_val > 0:
                             video["tid"] = tid_val
                         if tid_v2_val > 0:
                             video["tid_v2"] = tid_v2_val
                         video["zone_synced"] = 1
                         video["stats_synced_at"] = "synced"
-                        stat_updates.append(
-                            {
-                                "bvid": bvid,
-                                "play_count": video["play_count"],
-                                "like_count": like_val,
-                                "coin_count": coin_val,
-                                "tid": tid_val,
-                                "tid_v2": tid_v2_val,
-                            }
-                        )
+                        update_row: dict[str, Any] = {
+                            "bvid": bvid,
+                            "play_count": video["play_count"],
+                            "like_count": like_val,
+                            "coin_count": coin_val,
+                            "tid": tid_val,
+                            "tid_v2": tid_v2_val,
+                        }
+                        if reply_val is not None:
+                            update_row["reply_count"] = reply_val
+                        if isinstance(stat.get("tags"), list):
+                            update_row["tags"] = stat["tags"]
+                            video["tags_synced_at"] = "synced"
+                        stat_updates.append(update_row)
                         view_cids = stat.get("cids")
                         if not _get_video_cids_list(video) and isinstance(view_cids, list) and view_cids:
                             video["cids"] = view_cids
@@ -814,6 +842,11 @@ class AllVideosOnlineCollector(BaseCollector):
             return
 
         poll_now_ts = time.time()
+        tags_window = (
+            get_active_campaign_window(int(poll_now_ts))
+            if is_earnings_owner_uid(ctx.uid)
+            else None
+        )
         _, tier_counts = summarize_video_tiers(cached_videos, poll_now_ts)
         polled_videos, priority_bvids, is_tiered = select_polled_videos(
             cached_videos,
@@ -822,11 +855,23 @@ class AllVideosOnlineCollector(BaseCollector):
             force_active=ctx.force_sync_videos,
         )
         stats_target_order = select_stats_refresh_bvids(
-            cached_videos, priority_bvids, poll_now_ts, quota=STATS_REFRESH_QUOTA
+            cached_videos,
+            priority_bvids,
+            poll_now_ts,
+            quota=STATS_REFRESH_QUOTA,
+            require_tags_window=tags_window,
         )
 
         online_set = {v["bvid"] for v in polled_videos}
         stat_set = set(stats_target_order)
+        tags_target_bvids: Optional[set[str]] = None
+        if tags_window is not None:
+            tags_target_bvids = {
+                v["bvid"]
+                for v in cached_videos
+                if v["bvid"] in stat_set
+                and tags_window[0] <= int(v.get("pubdate") or 0) <= tags_window[1]
+            }
         by_bvid = {v["bvid"]: v for v in cached_videos}
 
         work_videos: list[dict[str, Any]] = list(polled_videos)
@@ -856,6 +901,7 @@ class AllVideosOnlineCollector(BaseCollector):
             online_set=online_set,
             stat_set=stat_set,
             delay_sec=delay_sec,
+            tags_target_bvids=tags_target_bvids,
         )
         ctx.errors.extend(batch_errors)
 

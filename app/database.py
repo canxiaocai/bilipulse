@@ -398,6 +398,9 @@ class Database:
                     play_count_7d_locked INTEGER NOT NULL DEFAULT 0,
                     like_count INTEGER NOT NULL DEFAULT 0,
                     coin_count INTEGER NOT NULL DEFAULT 0,
+                    reply_count INTEGER NOT NULL DEFAULT 0,
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    tags_synced_at TEXT,
                     tid INTEGER NOT NULL DEFAULT 0,
                     tid_v2 INTEGER NOT NULL DEFAULT 0,
                     zone_synced INTEGER NOT NULL DEFAULT 1,
@@ -464,6 +467,14 @@ class Database:
                     sort_order INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS earnings_frozen_snapshots (
+                    uid TEXT NOT NULL,
+                    period_id TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    frozen_at TEXT NOT NULL,
+                    PRIMARY KEY (uid, period_id)
                 );
                 """
             )
@@ -542,6 +553,12 @@ class Database:
                 conn.execute("ALTER TABLE videos ADD COLUMN tid_v2 INTEGER NOT NULL DEFAULT 0")
             if "zone_synced" not in video_cols:
                 conn.execute("ALTER TABLE videos ADD COLUMN zone_synced INTEGER NOT NULL DEFAULT 0")
+            if "reply_count" not in video_cols:
+                conn.execute("ALTER TABLE videos ADD COLUMN reply_count INTEGER NOT NULL DEFAULT 0")
+            if "tags_json" not in video_cols:
+                conn.execute("ALTER TABLE videos ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'")
+            if "tags_synced_at" not in video_cols:
+                conn.execute("ALTER TABLE videos ADD COLUMN tags_synced_at TEXT")
             video_snap_cols = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(video_online_snapshots)").fetchall()
@@ -1976,6 +1993,18 @@ class Database:
 
                 tid_val = max(0, int(item.get("tid") or 0))
                 tid_v2_val = max(0, int(item.get("tid_v2") or 0))
+                has_reply = item.get("reply_count") is not None
+                reply_val = max(0, int(item["reply_count"])) if has_reply else 0
+                raw_tags = item.get("tags")
+                has_tags = isinstance(raw_tags, list)
+                tags_json_val = (
+                    json.dumps(
+                        list(dict.fromkeys(str(t).strip() for t in raw_tags if str(t).strip())),
+                        ensure_ascii=False,
+                    )
+                    if has_tags
+                    else "[]"
+                )
                 params.append(
                     (
                         eff_play,
@@ -1984,6 +2013,12 @@ class Database:
                         play_7d_locked,
                         max(0, int(item["like_count"])),
                         max(0, int(item["coin_count"])),
+                        1 if has_reply else 0,
+                        reply_val,
+                        1 if has_tags else 0,
+                        tags_json_val,
+                        1 if has_tags else 0,
+                        now,
                         tid_val,
                         tid_val,
                         tid_v2_val,
@@ -2016,6 +2051,9 @@ class Database:
                     play_count_7d_locked = MAX(play_count_7d_locked, ?),
                     like_count = ?,
                     coin_count = ?,
+                    reply_count = CASE WHEN ? = 1 THEN ? ELSE reply_count END,
+                    tags_json = CASE WHEN ? = 1 THEN ? ELSE tags_json END,
+                    tags_synced_at = CASE WHEN ? = 1 THEN ? ELSE tags_synced_at END,
                     tid = CASE WHEN ? > 0 THEN ? ELSE tid END,
                     tid_v2 = CASE WHEN ? > 0 THEN ? ELSE tid_v2 END,
                     zone_synced = 1,
@@ -2113,7 +2151,8 @@ class Database:
                 """
                 SELECT bvid, uid, aid, title, pic, pubdate, duration, play_count,
                        play_count_7d, play_count_7d_ts, play_count_7d_locked,
-                       like_count, coin_count, tid, tid_v2, zone_synced,
+                       like_count, coin_count, reply_count, tags_json, tags_synced_at,
+                       tid, tid_v2, zone_synced,
                        stats_synced_at, stats_play_count,
                        stats_backoff_until_ts, online_backoff_until_ts,
                        cids_json, last_online_count,
@@ -2129,6 +2168,13 @@ class Database:
         for r in rows:
             raw_cids = r["cids_json"]
             cids = [] if (not raw_cids or raw_cids == "[]") else json.loads(raw_cids)
+            raw_tags = r["tags_json"]
+            try:
+                tags = [] if (not raw_tags or raw_tags == "[]") else json.loads(raw_tags)
+                if not isinstance(tags, list):
+                    tags = []
+            except (ValueError, TypeError):
+                tags = []
             tid_val = int(r["tid"] or 0)
             tid_v2_val = int(r["tid_v2"] or 0)
             zone = resolve_video_zone(tid_val, tid_v2_val)
@@ -2156,6 +2202,9 @@ class Database:
                     "play_count_7d_locked": bool(r["play_count_7d_locked"]),
                     "like_count": r["like_count"],
                     "coin_count": r["coin_count"],
+                    "reply_count": int(r["reply_count"] or 0),
+                    "tags": tags,
+                    "tags_synced_at": r["tags_synced_at"],
                     "tid": tid_val,
                     "tid_v2": tid_v2_val,
                     "zone_primary": zone["zone_primary"],
@@ -2181,13 +2230,108 @@ class Database:
             )
         return items
 
+    def get_earnings_videos(self, uid: str, start_ts: int, end_ts: int) -> list[dict[str, Any]]:
+        """Fetch videos published within [start_ts, end_ts] with tags and engagement stats for earnings."""
+        with self.read_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT bvid, uid, aid, title, pic, pubdate, duration,
+                       play_count, like_count, coin_count, reply_count,
+                       tags_json, tags_synced_at, stats_synced_at
+                FROM videos
+                WHERE uid = ? AND pubdate >= ? AND pubdate <= ?
+                ORDER BY play_count DESC, pubdate DESC
+                """,
+                (uid, int(start_ts), int(end_ts)),
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for r in rows:
+            raw_tags = r["tags_json"]
+            try:
+                tags = [] if (not raw_tags or raw_tags == "[]") else json.loads(raw_tags)
+                if not isinstance(tags, list):
+                    tags = []
+            except (ValueError, TypeError):
+                tags = []
+            items.append(
+                {
+                    "bvid": r["bvid"],
+                    "uid": r["uid"],
+                    "aid": int(r["aid"] or 0),
+                    "title": r["title"],
+                    "pic": r["pic"],
+                    "pubdate": int(r["pubdate"] or 0),
+                    "duration": int(r["duration"] or 0),
+                    "play_count": int(r["play_count"] or 0),
+                    "like_count": int(r["like_count"] or 0),
+                    "coin_count": int(r["coin_count"] or 0),
+                    "reply_count": int(r["reply_count"] or 0),
+                    "tags": tags,
+                    "tags_synced_at": r["tags_synced_at"],
+                    "stats_synced_at": r["stats_synced_at"],
+                }
+            )
+        return items
+
+    def get_earnings_frozen_snapshot(
+        self, uid: str, period_id: str
+    ) -> Optional[dict[str, Any]]:
+        """Return stored frozen earnings payload for a completed period, if any."""
+        with self.read_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT payload_json, frozen_at
+                FROM earnings_frozen_snapshots
+                WHERE uid = ? AND period_id = ?
+                """,
+                (uid, period_id),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["payload_json"])
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if isinstance(payload.get("period"), dict):
+            payload["period"]["frozen"] = True
+            payload["period"]["frozen_at"] = row["frozen_at"]
+        return payload
+
+    def save_earnings_frozen_snapshot(
+        self, uid: str, period_id: str, payload: dict[str, Any]
+    ) -> str:
+        """Persist a frozen earnings snapshot for an ended period."""
+        frozen_at = datetime.now(timezone.utc).astimezone().isoformat()
+        stored = dict(payload)
+        if isinstance(stored.get("period"), dict):
+            stored["period"] = {
+                **stored["period"],
+                "frozen": True,
+                "frozen_at": frozen_at,
+            }
+        raw_json = json.dumps(stored, ensure_ascii=False)
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO earnings_frozen_snapshots (uid, period_id, payload_json, frozen_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(uid, period_id) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    frozen_at = excluded.frozen_at
+                """,
+                (uid, period_id, raw_json, frozen_at),
+            )
+        return frozen_at
+
     def get_crawl_videos(self, uid: str) -> list[dict[str, Any]]:
         """Fetch minimal video scheduling/polling fields without parsing cids_json or resolving UI zone metadata."""
         with self.read_connection() as conn:
             rows = conn.execute(
                 """
-                SELECT bvid, pubdate, play_count, like_count, coin_count,
-                       tid, tid_v2, zone_synced, stats_synced_at, stats_play_count,
+                SELECT bvid, pubdate, play_count, like_count, coin_count, reply_count,
+                       tags_synced_at, tid, tid_v2, zone_synced, stats_synced_at, stats_play_count,
                        stats_backoff_until_ts, online_backoff_until_ts, cids_json,
                        last_online_count, last_checked_at, hot_until_ts, fast_until_ts,
                        zero_online_streak, play_rate_per_hour
@@ -2203,6 +2347,8 @@ class Database:
                 "play_count": r["play_count"],
                 "like_count": r["like_count"],
                 "coin_count": r["coin_count"],
+                "reply_count": int(r["reply_count"] or 0),
+                "tags_synced_at": r["tags_synced_at"],
                 "tid": int(r["tid"] or 0),
                 "tid_v2": int(r["tid_v2"] or 0),
                 "zone_synced": int(r["zone_synced"] if r["zone_synced"] is not None else 1),

@@ -15,7 +15,7 @@
   <title>B站账号实时监控</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 28 28' fill='none'%3E%3Crect width='28' height='28' fill='%2307090E'/%3E%3Crect x='2.5' y='4.5' width='23' height='19' stroke='%2300E5FF' stroke-width='2'/%3E%3Cpolyline points='5.5,16 9,16 11.2,10.5 14,20 16.8,13 19,16 22.5,16' stroke='%23FF2A7A' stroke-width='2.2' stroke-linecap='square' stroke-linejoin='miter'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="/static/tokens-layout.css?v=20261123c" />
-  <link rel="stylesheet" href="/static/styles.css?v=20261123d" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261127b" />
 </head>
 <body>
   <div class="studio-shell" id="studioShell">
@@ -715,6 +715,15 @@
 
       <div class="admin-auth-body">
         <form class="blueprint-form settings-drawer-form admin-auth-form" id="adminAuthForm" aria-labelledby="adminAuthTitle" novalidate>
+          <input
+            type="text"
+            name="username"
+            value="bilipulse-admin"
+            autocomplete="username"
+            tabindex="-1"
+            aria-hidden="true"
+            class="visually-hidden"
+          />
           <div class="form-grid">
             <div class="form-field full">
               <label for="adminAuthInput">管理员密码 <span class="req" aria-hidden="true">*</span></label>
@@ -751,6 +760,13 @@
                 </button>
               </div>
               <span id="adminAuthToggleWarning" class="visually-hidden">警告：开启后将在屏幕上显示密码明文。</span>
+            </div>
+
+            <div class="form-field full">
+              <label class="confirm-checkbox-row admin-remember-row" for="adminAuthRemember">
+                <input type="checkbox" id="adminAuthRemember" name="remember" checked />
+                <span>本设备记住登录状态（30 天自动续期）</span>
+              </label>
             </div>
           </div>
 
@@ -966,9 +982,124 @@
     </div>
   </dialog>
 
+  <!-- Native Centered Personal Creator Earnings Modal (Owner Account Only) -->
+  <dialog class="telemetry-modal earnings-modal" id="earningsModal" closedby="any" aria-labelledby="earningsModalTitle">
+    <div class="modal-shell">
+      <header class="modal-header earnings-modal-header">
+        <div class="modal-title-group">
+          <span class="section-kicker mono">PERSONAL EARNINGS · 生态政策奖励</span>
+          <div class="earnings-title-row">
+            <h2 class="modal-title" id="earningsModalTitle">个人激励收益统计</h2>
+            <span class="status-chip mono" id="earningsPeriodChip">第一期 · 11.27 — 12.15</span>
+            <span class="status-chip mono" id="earningsPeriodStatusChip">进行中</span>
+          </div>
+          <div class="earnings-tag-row">
+            <span class="earnings-tag-pill mono" id="earningsTagPill"># 崩坏：因缘精灵创作者激励计划</span>
+            <span class="muted mono" id="earningsUpdatedMeta">等待同步</span>
+          </div>
+        </div>
+
+        <div class="modal-actions earnings-modal-actions">
+          <button type="button" class="btn btn-chamfer btn-secondary btn-sm" id="btnRefreshEarnings" title="立即从 B站同步最新投稿标签与播放点赞数据">
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="square" aria-hidden="true">
+              <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+              <polyline points="21 3 21 9 15 9" />
+            </svg>
+            <span id="btnRefreshEarningsLabel">立即同步</span>
+          </button>
+          <button type="button" class="btn btn-ghost modal-close-btn" id="btnCloseEarningsModal" aria-label="关闭个人收益统计弹窗" title="关闭" autofocus>
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="square" aria-hidden="true">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <div class="earnings-modal-body" id="earningsModalBody">
+        <div class="test-result hidden" id="earningsStatusBox" role="status" aria-live="polite"></div>
+
+        <section class="earnings-hero-grid" aria-label="核心收益总览">
+          <article class="earnings-hero-card earnings-hero-est">
+            <span class="fiducial fiducial-tl" aria-hidden="true"></span>
+            <span class="fiducial fiducial-tr" aria-hidden="true"></span>
+            <div class="earnings-hero-head">
+              <span class="scope-kicker mono">按阶梯播放实时预估</span>
+              <span class="status-chip mono" id="earningsCurrentCpmChip">当前档 ¥18/千播</span>
+            </div>
+            <div class="earnings-hero-amount mono" id="earningsEstPayout">¥0.00</div>
+            <div class="earnings-cap-track" aria-label="月收入上限进度">
+              <div class="earnings-cap-bar">
+                <div class="earnings-cap-fill" id="earningsCapBarFill" style="width: 0%"></div>
+              </div>
+              <div class="earnings-cap-meta mono">
+                <span id="earningsCapPct">0%</span>
+                <span class="muted">单期上限 ¥11,100</span>
+              </div>
+            </div>
+          </article>
+
+          <article class="earnings-hero-card earnings-hero-settled">
+            <span class="fiducial fiducial-tl" aria-hidden="true"></span>
+            <span class="fiducial fiducial-tr" aria-hidden="true"></span>
+            <div class="earnings-hero-head">
+              <span class="scope-kicker mono">当前已达标可结算</span>
+              <span class="status-chip mono" id="earningsSettledChip">待达标</span>
+            </div>
+            <div class="earnings-hero-amount mono" id="earningsSettledPayout">¥0.00</div>
+            <ul class="earnings-blockers-list" id="earningsBlockersList" aria-label="达标条件说明">
+              <li class="muted">正在计算达标条件…</li>
+            </ul>
+          </article>
+        </section>
+
+        <section class="earnings-kpi-strip" aria-label="核心考核指标">
+          <div class="earnings-kpi-cell">
+            <span class="earnings-kpi-label mono">有效计入稿件</span>
+            <strong class="earnings-kpi-val mono" id="earningsQualifiedCount">0 / 8 条</strong>
+            <span class="earnings-kpi-sub muted" id="earningsQualifiedSub">单条 ≥ 3,000 播放计入</span>
+          </div>
+          <div class="earnings-kpi-cell">
+            <span class="earnings-kpi-label mono">有效总播放量</span>
+            <strong class="earnings-kpi-val mono" id="earningsTotalPlay">0</strong>
+            <span class="earnings-kpi-sub muted" id="earningsTotalPlaySub">计费上限 80 万播放</span>
+          </div>
+          <div class="earnings-kpi-cell">
+            <span class="earnings-kpi-label mono">TOP10 月均赞量</span>
+            <strong class="earnings-kpi-val mono" id="earningsAvgLikes">0</strong>
+            <span class="earnings-kpi-sub muted" id="earningsAvgLikesSub">不足 10 条按当前有效数</span>
+          </div>
+          <div class="earnings-kpi-cell">
+            <span class="earnings-kpi-label mono">参考互动率</span>
+            <strong class="earnings-kpi-val mono" id="earningsEngagement">0.00%</strong>
+            <span class="earnings-kpi-sub muted" id="earningsEngagementSub">仅参考（赞+评）/播</span>
+          </div>
+        </section>
+
+        <section class="earnings-section" aria-label="生态政策阶梯计费明细">
+          <header class="earnings-section-head">
+            <h3 class="earnings-section-title">01 生态政策奖励 · 分段阶梯</h3>
+            <span class="muted mono">不含单条爆款奖励 · 上限 ¥11,100</span>
+          </header>
+          <div class="earnings-tiers-grid" id="earningsTiersGrid"></div>
+        </section>
+
+        <section class="earnings-section" aria-label="活动期带标签稿件明细">
+          <header class="earnings-section-head">
+            <h3 class="earnings-section-title">匹配稿件明细</h3>
+            <span class="status-chip mono" id="earningsVideosCountChip">0 条稿件</span>
+          </header>
+          <div class="earnings-videos-list" id="earningsVideosList">
+            <div class="chart-empty mono">正在加载活动稿件…</div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </dialog>
+
   <!-- HUD Toast Notifications Stack -->
   <div class="toast-stack" id="toastStack" aria-live="polite"></div>
 
-  <script type="module" src="/static/app.js?v=20261127a"></script>
+  <script type="module" src="/static/app.js?v=20261127b"></script>
 </body>
 </html>

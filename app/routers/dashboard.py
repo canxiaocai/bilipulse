@@ -7,7 +7,7 @@ from typing import Any, AsyncIterator, Optional
 from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
-from app.auth import get_admin_status_payload
+from app.auth import get_admin_status_payload, refresh_admin_session_cookie_if_needed
 from app.models import AdminAuthStatus, ChartSnapshotOut, DashboardSummary, FollowerDailyChange
 
 router = APIRouter(prefix="/api", tags=["dashboard"])
@@ -283,7 +283,10 @@ async def get_dashboard(
                         cache.popitem(last=False)
             return summary
 
-    return await asyncio.to_thread(_assemble_dashboard)
+    summary = await asyncio.to_thread(_assemble_dashboard)
+    if summary.admin_auth.enabled and summary.admin_auth.authenticated:
+        await asyncio.to_thread(refresh_admin_session_cookie_if_needed, request, response, db)
+    return summary
 
 
 @router.get("/snapshots")

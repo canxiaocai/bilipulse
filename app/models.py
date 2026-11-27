@@ -10,6 +10,10 @@ class AdminAuthStatus(BaseModel):
 
 class AdminVerifyRequest(BaseModel):
     password: str = Field(default="", description="Admin password")
+    remember: bool = Field(
+        default=True,
+        description="Persist login session for the full configured TTL (default 30 days) with sliding renewal",
+    )
 
 
 class SettingsOut(BaseModel):

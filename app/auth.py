@@ -110,46 +110,92 @@ def get_or_create_session_secret(db: Database) -> str:
     return secret
 
 
-def _sign_session_payload(secret: str, exp_ts: int, nonce: str, fingerprint: str) -> str:
-    message = f"{exp_ts}.{nonce}.{fingerprint}".encode("utf-8")
+def _sign_session_payload(
+    secret: str,
+    exp_ts: int,
+    nonce: str,
+    fingerprint: str,
+    mode: Optional[str] = None,
+) -> str:
+    if mode is not None:
+        message = f"{exp_ts}.{nonce}.{mode}.{fingerprint}".encode("utf-8")
+    else:
+        message = f"{exp_ts}.{nonce}.{fingerprint}".encode("utf-8")
     return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
 
 
-def create_session_token(db: Database, ttl_seconds: Optional[int] = None) -> str:
+def create_session_token(
+    db: Database,
+    ttl_seconds: Optional[int] = None,
+    *,
+    remember: bool = True,
+) -> str:
     """Create a signed admin session token bound to the current password fingerprint."""
     info = get_admin_auth_info(db)
-    ttl = ttl_seconds if ttl_seconds is not None else get_admin_session_ttl_seconds()
+    ttl = (
+        ttl_seconds
+        if ttl_seconds is not None
+        else get_admin_session_ttl_seconds(remember=remember)
+    )
     exp_ts = int(time.time()) + max(60, int(ttl))
     nonce = secrets.token_hex(8)
+    mode = "r" if remember else "s"
     secret = get_or_create_session_secret(db)
-    sig = _sign_session_payload(secret, exp_ts, nonce, info["fingerprint"])
-    return f"{exp_ts}.{nonce}.{sig}"
+    sig = _sign_session_payload(secret, exp_ts, nonce, info["fingerprint"], mode=mode)
+    return f"{exp_ts}.{nonce}.{mode}.{sig}"
+
+
+def parse_verified_session_token(db: Database, token: str) -> Optional[dict[str, Any]]:
+    """Validate an admin session token and return its metadata (exp_ts, remaining, remember)."""
+    if not token:
+        return None
+    parts = token.split(".")
+    if len(parts) == 3:
+        exp_str, nonce, sig = parts
+        mode: Optional[str] = None
+        remember = True
+    elif len(parts) == 4:
+        exp_str, nonce, mode, sig = parts
+        if mode not in ("r", "s"):
+            return None
+        remember = mode == "r"
+    else:
+        return None
+
+    try:
+        exp_ts = int(exp_str)
+    except ValueError:
+        return None
+    now_ts = int(time.time())
+    if exp_ts <= now_ts or not nonce or not sig:
+        return None
+
+    info = get_admin_auth_info(db)
+    if not info["enabled"]:
+        return {
+            "exp_ts": exp_ts,
+            "remaining": exp_ts - now_ts,
+            "remember": remember,
+            "legacy": mode is None,
+        }
+
+    secret = db.get_setting("admin_session_secret", "").strip()
+    if not secret:
+        return None
+    expected_sig = _sign_session_payload(secret, exp_ts, nonce, info["fingerprint"], mode=mode)
+    if not hmac.compare_digest(sig, expected_sig):
+        return None
+    return {
+        "exp_ts": exp_ts,
+        "remaining": exp_ts - now_ts,
+        "remember": remember,
+        "legacy": mode is None,
+    }
 
 
 def verify_session_token(db: Database, token: str) -> bool:
     """Validate signature, expiration, and password fingerprint of an admin session token."""
-    if not token:
-        return False
-    parts = token.split(".")
-    if len(parts) != 3:
-        return False
-    exp_str, nonce, sig = parts
-    try:
-        exp_ts = int(exp_str)
-    except ValueError:
-        return False
-    if exp_ts <= int(time.time()) or not nonce or not sig:
-        return False
-
-    info = get_admin_auth_info(db)
-    if not info["enabled"]:
-        return True
-
-    secret = db.get_setting("admin_session_secret", "").strip()
-    if not secret:
-        return False
-    expected_sig = _sign_session_payload(secret, exp_ts, nonce, info["fingerprint"])
-    return hmac.compare_digest(sig, expected_sig)
+    return parse_verified_session_token(db, token) is not None
 
 
 def is_request_authenticated(request: Request) -> bool:
@@ -193,10 +239,16 @@ def require_admin(request: Request) -> None:
         )
 
 
-def set_admin_session_cookie(response: Response, db: Database, request: Request) -> None:
+def set_admin_session_cookie(
+    response: Response,
+    db: Database,
+    request: Request,
+    *,
+    remember: bool = True,
+) -> None:
     """Attach an HttpOnly signed session cookie after successful admin verification."""
-    ttl = get_admin_session_ttl_seconds()
-    token = create_session_token(db, ttl_seconds=ttl)
+    ttl = get_admin_session_ttl_seconds(remember=remember)
+    token = create_session_token(db, ttl_seconds=ttl, remember=remember)
     forwarded_proto = ""
     if get_trust_proxy():
         forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
@@ -205,11 +257,31 @@ def set_admin_session_cookie(response: Response, db: Database, request: Request)
         key=ADMIN_SESSION_COOKIE_NAME,
         value=token,
         max_age=ttl,
+        expires=ttl,
         httponly=True,
         samesite="lax",
         secure=is_https,
         path="/",
     )
+
+
+def refresh_admin_session_cookie_if_needed(
+    request: Request, response: Response, db: Database
+) -> bool:
+    """Slide-renew a valid admin session cookie when remaining lifetime drops below 75% of TTL."""
+    info = get_admin_auth_info(db)
+    if not info["enabled"]:
+        return False
+    token = request.cookies.get(ADMIN_SESSION_COOKIE_NAME, "")
+    parsed = parse_verified_session_token(db, token)
+    if parsed is None:
+        return False
+    remember = bool(parsed["remember"])
+    target_ttl = get_admin_session_ttl_seconds(remember=remember)
+    if parsed["legacy"] or parsed["remaining"] < int(target_ttl * 0.75):
+        set_admin_session_cookie(response, db, request, remember=remember)
+        return True
+    return False
 
 
 def clear_admin_session_cookie(response: Response) -> None:

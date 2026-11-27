@@ -7,6 +7,7 @@ from app.auth import (
     clear_admin_session_cookie,
     get_admin_auth_info,
     get_admin_status_payload,
+    refresh_admin_session_cookie_if_needed,
     set_admin_session_cookie,
     verify_admin_password,
 )
@@ -16,8 +17,11 @@ router = APIRouter(prefix="/api/admin", tags=["admin"])
 
 
 @router.get("/status", response_model=AdminAuthStatus)
-async def get_admin_status(request: Request) -> AdminAuthStatus:
+async def get_admin_status(request: Request, response: Response) -> AdminAuthStatus:
+    db = request.app.state.db
     payload = await asyncio.to_thread(get_admin_status_payload, request)
+    if payload["enabled"] and payload["authenticated"]:
+        await asyncio.to_thread(refresh_admin_session_cookie_if_needed, request, response, db)
     return AdminAuthStatus(**payload)
 
 
@@ -43,7 +47,7 @@ async def verify_admin(
         raise HTTPException(status_code=401, detail="管理员密码错误，请重试")
 
     limiter.reset(request)
-    set_admin_session_cookie(response, db, request)
+    set_admin_session_cookie(response, db, request, remember=body.remember)
     return {
         "ok": True,
         "enabled": True,

@@ -672,8 +672,110 @@ class BilibiliClient:
             logger.debug("Failed to refresh Bilibili V2 channelKv from %s: %s", bvid, exc)
         return 0
 
+    async def _fetch_video_detail_data(
+        self, bvid: Optional[str] = None, aid: Optional[int] = None
+    ) -> dict[str, Any]:
+        """Fetch raw data payload from /x/web-interface/view/detail (includes View + Tags)."""
+        clean_bvid = str(bvid or "").strip()
+        clean_aid = _safe_nonneg_int(aid)
+        if clean_bvid:
+            params: dict[str, Any] = {"bvid": clean_bvid}
+            label = clean_bvid
+            referer = f"https://www.bilibili.com/video/{clean_bvid}"
+        elif clean_aid > 0:
+            params = {"aid": clean_aid}
+            label = f"av{clean_aid}"
+            referer = f"https://www.bilibili.com/video/av{clean_aid}"
+        else:
+            raise ValueError("Either bvid or aid must be provided")
+
+        data = await self._request_json(
+            "https://api.bilibili.com/x/web-interface/view/detail",
+            params=params,
+            referer=referer,
+        )
+        if data.get("code") != 0:
+            raise BilibiliAPIError(
+                f"web-interface/view/detail error {data.get('code')} for {label}: {data.get('message')}",
+                code=data.get("code"),
+            )
+        return data.get("data") or {}
+
+    async def get_video_tags(self, bvid: str) -> list[str]:
+        """Fetch deduplicated tag/topic names for a video via /x/tag/archive/tags."""
+        clean_bvid = str(bvid or "").strip()
+        if not clean_bvid:
+            return []
+        data = await self._request_json(
+            "https://api.bilibili.com/x/tag/archive/tags",
+            params={"bvid": clean_bvid},
+            referer=f"https://www.bilibili.com/video/{clean_bvid}",
+        )
+        if data.get("code") != 0:
+            raise BilibiliAPIError(
+                f"tag/archive/tags error {data.get('code')} for {clean_bvid}: {data.get('message')}",
+                code=data.get("code"),
+            )
+        raw_tags = data.get("data") or []
+        tags: list[str] = []
+        seen: set[str] = set()
+        if isinstance(raw_tags, list):
+            for item in raw_tags:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("tag_name") or "").strip()
+                if name and name not in seen:
+                    seen.add(name)
+                    tags.append(name)
+        return tags
+
+    async def get_video_stat_with_tags(self, bvid: str) -> dict[str, Any]:
+        """Fetch play, like, coin, reply, partition IDs, CIDs, and tags/topics in one request."""
+        try:
+            detail = await self._fetch_video_detail_data(bvid=bvid)
+            payload = detail.get("View") or {}
+            raw_tags = detail.get("Tags") or []
+            tags: list[str] = []
+            seen: set[str] = set()
+            if isinstance(raw_tags, list):
+                for item in raw_tags:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("tag_name") or "").strip()
+                    if name and name not in seen:
+                        seen.add(name)
+                        tags.append(name)
+        except Exception:
+            stat_only = await self.get_video_stat(bvid)
+            try:
+                stat_only["tags"] = await self.get_video_tags(bvid)
+            except Exception:
+                pass
+            return stat_only
+
+        stat = payload.get("stat") or {}
+        tid = _safe_nonneg_int(payload.get("tid"))
+        tid_v2 = _safe_nonneg_int(payload.get("tid_v2"))
+        result: dict[str, Any] = {
+            "play_count": _safe_nonneg_int(stat.get("view")),
+            "like_count": _safe_nonneg_int(stat.get("like")),
+            "coin_count": _safe_nonneg_int(stat.get("coin")),
+            "reply_count": _safe_nonneg_int(stat.get("reply")),
+            "tags": tags,
+        }
+        if tid > 0:
+            result["tid"] = tid
+        if tid_v2 > 0:
+            result["tid_v2"] = tid_v2
+        cids = _extract_cids_from_pages(payload.get("pages"))
+        if cids:
+            result["cids"] = cids
+        if tid_v2 > 0 and not has_known_v2_tid(tid_v2):
+            await self.refresh_v2_zones_if_needed(bvid)
+        return result
+
     async def get_video_stat(self, bvid: str) -> dict[str, Any]:
-        """Fetch play, like, coin, partition IDs (and CIDs if present) via /x/web-interface/view."""
+        """Fetch play, like, coin, reply, partition IDs (and CIDs if present) via /x/web-interface/view."""
         payload = await self._fetch_video_view_data(bvid)
         stat = payload.get("stat") or {}
         tid = _safe_nonneg_int(payload.get("tid"))
@@ -683,6 +785,8 @@ class BilibiliClient:
             "like_count": _safe_nonneg_int(stat.get("like")),
             "coin_count": _safe_nonneg_int(stat.get("coin")),
         }
+        if "reply" in stat:
+            result["reply_count"] = _safe_nonneg_int(stat.get("reply"))
         if tid > 0:
             result["tid"] = tid
         if tid_v2 > 0:

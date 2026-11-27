@@ -26,13 +26,21 @@ def get_default_admin_password() -> str:
     return raw if raw.strip() else ""
 
 
-def get_admin_session_ttl_seconds() -> int:
-    """Return admin verification cookie lifetime in seconds (default 12 hours, min 300s)."""
+def get_admin_session_ttl_seconds(remember: bool = True) -> int:
+    """Return admin verification cookie lifetime in seconds (default 30 days, or 12h when remember=False)."""
     try:
-        hours = int(os.getenv("BILI_ADMIN_SESSION_HOURS", "12") or "12")
+        hours = int(os.getenv("BILI_ADMIN_SESSION_HOURS", "720") or "720")
     except ValueError:
-        hours = 12
-    return max(300, hours * 3600)
+        hours = 720
+    full_ttl = max(300, hours * 3600)
+    if not remember:
+        return max(300, min(full_ttl, 12 * 3600))
+    return full_ttl
+
+
+def get_earnings_owner_uid() -> str:
+    """Return the Bilibili UID allowed to access the personal earnings dashboard."""
+    return os.getenv("BILI_EARNINGS_UID", "3690980052044072").strip()
 
 
 def get_trust_proxy() -> bool:
