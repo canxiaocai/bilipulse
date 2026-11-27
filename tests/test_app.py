@@ -4625,13 +4625,14 @@ def test_chart_snapshots_endpoint_lightweight_windowing_and_downsampling(tmp_pat
         assert len(r_b.json()["snapshots"]) == 1
         assert r_b.json()["snapshots"][0]["follower_count"] == 200
 
-        # 4) Verify composite index exists and get_accounts_summary matches exact latest/delta
+        # 4) Verify covering composite index exists and get_accounts_summary matches exact latest/delta
         with db.connection() as conn:
             indexes = {
                 row["name"]
                 for row in conn.execute("PRAGMA index_list(account_snapshots)").fetchall()
             }
-        assert "idx_snapshots_uid_ts_id" in indexes
+        assert "idx_snapshots_uid_ts_cover" in indexes
+        assert "idx_snapshots_uid_ts_id" not in indexes
 
         summaries = {a["uid"]: a for a in db.get_accounts_summary()}
         assert summaries["50001"]["latest_follower_count"] == 1000 + 79 * 5
@@ -5670,7 +5671,7 @@ def test_fast_pulse_round_robin_fairness_prevents_tail_account_starvation(tmp_pa
 def test_db_profile_noop_index_cleanup_revision_headers_and_favicon(tmp_path: Path):
     db = Database(db_path=tmp_path / "hygiene.db")
 
-    # Redundant idx_snapshots_uid_ts must not exist; idx_snapshots_uid_ts_id must exist
+    # Redundant idx_snapshots_uid_ts / idx_snapshots_uid_ts_id must not exist; covering index must exist
     with db.read_connection() as conn:
         idx_names = {
             r["name"]
@@ -5679,7 +5680,8 @@ def test_db_profile_noop_index_cleanup_revision_headers_and_favicon(tmp_path: Pa
             ).fetchall()
         }
     assert "idx_snapshots_uid_ts" not in idx_names
-    assert "idx_snapshots_uid_ts_id" in idx_names
+    assert "idx_snapshots_uid_ts_id" not in idx_names
+    assert "idx_snapshots_uid_ts_cover" in idx_names
 
     # No-op profile update must not rewrite updated_at
     db.create_account("9001", enabled=True, account_name="SameName", account_face="https://a/1.jpg")
@@ -5875,6 +5877,194 @@ def test_video_history_covering_indexes_migration_and_api_cache(tmp_path: Path):
         assert len(h3) == 4
         assert h3[-1]["online_count"] == 41
         assert call_count == 2
+
+
+def test_dashboard_covering_index_seek_daily_changes_and_api_caches(tmp_path: Path):
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    bjt = timezone(timedelta(hours=8))
+    db_path = tmp_path / "dash_cover_cache.db"
+
+    # Seed a legacy DB with idx_snapshots_uid_ts_id to verify migration to idx_snapshots_uid_ts_cover
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE account_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uid TEXT NOT NULL,
+            collected_at TEXT NOT NULL,
+            collected_at_ts INTEGER NOT NULL,
+            follower_count INTEGER,
+            following_count INTEGER,
+            online_viewers_total INTEGER,
+            video_count INTEGER NOT NULL DEFAULT 0,
+            videos_succeeded INTEGER NOT NULL DEFAULT 0,
+            extra_metrics TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'success',
+            error_message TEXT,
+            duration_ms INTEGER
+        );
+        CREATE INDEX idx_snapshots_uid_ts_id
+            ON account_snapshots (uid, collected_at_ts DESC, id DESC);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(db_path=db_path)
+    uid = "3690980052044072"
+    db.create_account(uid, enabled=True, account_name="CoverTest")
+
+    now_bjt = datetime.now(timezone.utc).astimezone(bjt)
+    today_start = now_bjt.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_t = min(now_bjt, today_start + timedelta(hours=12))
+    yest_same = today_t - timedelta(days=1)
+    yest_end = today_start - timedelta(minutes=5)
+    day_before_end = today_start - timedelta(days=1, minutes=5)
+
+    for dt, followers, online in [
+        (day_before_end, 1000, 10),
+        # Duplicate timestamp on yesterday same time: lowest id (1040) must win tie-break
+        (yest_same, 1040, 12),
+        (yest_same, 1045, 13),
+        (yest_end, 1100, 15),
+        (today_t, 1150, 20),
+    ]:
+        db.insert_snapshot(
+            uid=uid,
+            follower_count=followers,
+            following_count=5,
+            online_viewers_total=online,
+            video_count=2,
+            videos_succeeded=2,
+            extra_metrics={},
+            status="success",
+            error_message=None,
+            duration_ms=25,
+            video_online_items=[],
+            collected_at=dt,
+        )
+
+    daily = db.get_follower_daily_changes(uid, now_ts=int(today_t.timestamp()))
+    assert daily["yesterday"] == 100
+    assert daily["yesterday_same_time"] == 40
+    assert daily["yesterday_same_time_at"] == yest_same.strftime("%H:%M")
+    assert daily["today"] == 50
+
+    with db.read_connection() as rconn:
+        idx_names = {
+            r["name"]
+            for r in rconn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'account_snapshots'"
+            ).fetchall()
+        }
+        assert "idx_snapshots_uid_ts_cover" in idx_names
+        assert "idx_snapshots_uid_ts_id" not in idx_names
+
+        for sql, params in [
+            (
+                """
+                SELECT collected_at, collected_at_ts, follower_count, online_viewers_total
+                FROM account_snapshots
+                WHERE uid = ? AND collected_at_ts >= ?
+                ORDER BY collected_at_ts DESC, id DESC
+                LIMIT 50000
+                """,
+                (uid, int((today_t - timedelta(hours=24)).timestamp())),
+            ),
+            (
+                """
+                SELECT id, uid, collected_at, collected_at_ts, follower_count,
+                       online_viewers_total, video_count, status
+                FROM account_snapshots
+                WHERE uid = ?
+                ORDER BY collected_at_ts DESC, id DESC
+                LIMIT 2
+                """,
+                (uid,),
+            ),
+            (
+                """
+                SELECT id, collected_at_ts, follower_count
+                FROM account_snapshots
+                WHERE uid = ? AND follower_count IS NOT NULL
+                  AND collected_at_ts >= ? AND collected_at_ts < ?
+                ORDER BY collected_at_ts DESC, id DESC
+                LIMIT 1
+                """,
+                (uid, int((today_start - timedelta(days=1)).timestamp()), int(today_start.timestamp())),
+            ),
+        ]:
+            plan = " ".join(r["detail"] for r in rconn.execute("EXPLAIN QUERY PLAN " + sql, params).fetchall())
+            assert "COVERING INDEX idx_snapshots_uid_ts_cover" in plan
+            assert "TEMP B-TREE" not in plan
+
+    # Verify /api/dashboard and /api/snapshots caches hit memory and invalidate on write
+    app = create_app(database=db, enable_scheduler=False)
+    orig_daily = db.get_follower_daily_changes
+    orig_chart = db.get_chart_snapshots
+    daily_calls = 0
+    chart_calls = 0
+
+    def counting_daily(*args, **kwargs):
+        nonlocal daily_calls
+        daily_calls += 1
+        return orig_daily(*args, **kwargs)
+
+    def counting_chart(*args, **kwargs):
+        nonlocal chart_calls
+        chart_calls += 1
+        return orig_chart(*args, **kwargs)
+
+    db.get_follower_daily_changes = counting_daily  # type: ignore[method-assign]
+    db.get_chart_snapshots = counting_chart  # type: ignore[method-assign]
+
+    with TestClient(app) as client:
+        d1 = client.get(f"/api/dashboard?hours=24&max_points=480&uid={uid}&video_limit=50")
+        assert d1.status_code == 200
+        assert daily_calls == 1
+        assert chart_calls == 1
+
+        d2 = client.get(f"/api/dashboard?hours=24&max_points=480&uid={uid}&video_limit=50")
+        assert d2.status_code == 200
+        assert daily_calls == 1
+        assert chart_calls == 1
+
+        s1 = client.get(f"/api/snapshots?hours=24&uid={uid}&max_points=480")
+        assert s1.status_code == 200
+        assert chart_calls == 2
+
+        s2 = client.get(f"/api/snapshots?hours=24&uid={uid}&max_points=480")
+        assert s2.status_code == 200
+        assert chart_calls == 2
+
+        # New snapshot invalidates both caches immediately via write_version
+        db.insert_snapshot(
+            uid=uid,
+            follower_count=1175,
+            following_count=5,
+            online_viewers_total=25,
+            video_count=2,
+            videos_succeeded=2,
+            extra_metrics={},
+            status="success",
+            error_message=None,
+            duration_ms=20,
+            video_online_items=[],
+            collected_at=today_t + timedelta(seconds=30),
+        )
+        d3 = client.get(f"/api/dashboard?hours=24&max_points=480&uid={uid}&video_limit=50")
+        assert d3.status_code == 200
+        assert d3.json()["latest"]["follower_count"] == 1175
+        assert daily_calls == 2
+        assert chart_calls == 3
+
+        s3 = client.get(f"/api/snapshots?hours=24&uid={uid}&max_points=480")
+        assert s3.status_code == 200
+        assert s3.json()["snapshots"][-1]["follower_count"] == 1175
+        assert chart_calls == 4
+
 
 
 

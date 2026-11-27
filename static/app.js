@@ -5093,7 +5093,7 @@ async function fetchDashboardPayload({
   }
 
   const data = await apiFetch(`/api/dashboard?${params.toString()}`, {
-    timeoutMs: 15000,
+    timeoutMs: 25000,
     ...(signal ? { signal } : {}),
     ...(priority ? { priority } : {}),
   });
@@ -5238,7 +5238,7 @@ async function loadOverviewSnapshots(
 
   try {
     const res = await apiFetch(`/api/snapshots?${params.toString()}`, {
-      timeoutMs: 12000,
+      timeoutMs: 20000,
       signal: controller.signal,
     });
     if (reqSeq !== state.snapshotsReqSeq) return null;

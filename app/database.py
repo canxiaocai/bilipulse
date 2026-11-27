@@ -378,8 +378,11 @@ class Database:
                     duration_ms INTEGER
                 );
 
-                CREATE INDEX IF NOT EXISTS idx_snapshots_uid_ts_id
-                    ON account_snapshots (uid, collected_at_ts DESC, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_snapshots_uid_ts_cover
+                    ON account_snapshots (
+                        uid, collected_at_ts DESC, id DESC,
+                        follower_count, online_viewers_total, collected_at, status, video_count
+                    );
 
                 CREATE TABLE IF NOT EXISTS videos (
                     bvid TEXT PRIMARY KEY,
@@ -464,8 +467,9 @@ class Database:
                 );
                 """
             )
-            # Drop redundant prefix index superseded by idx_snapshots_uid_ts_id
+            # Drop redundant prefix indexes superseded by idx_snapshots_uid_ts_cover
             conn.execute("DROP INDEX IF EXISTS idx_snapshots_uid_ts;")
+            conn.execute("DROP INDEX IF EXISTS idx_snapshots_uid_ts_id;")
 
             video_cols = {
                 row["name"]
@@ -2848,45 +2852,143 @@ class Database:
         t_yesterday = int(yesterday_start.timestamp())
         t_today = int(today_start.timestamp())
         t_tomorrow = int(tomorrow_start.timestamp())
+        tolerance_sec = 3600
 
         with self.read_connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT collected_at_ts, follower_count
-                FROM account_snapshots
-                WHERE uid = ?
-                  AND follower_count IS NOT NULL
-                  AND collected_at_ts >= ?
-                  AND collected_at_ts < ?
-                ORDER BY collected_at_ts ASC, id ASC
-                """,
-                (uid, t_day_before, t_tomorrow),
-            ).fetchall()
+            def _fetch_edge(start_ts: int, end_ts: int, *, latest: bool) -> Optional[sqlite3.Row]:
+                order = "DESC" if latest else "ASC"
+                return conn.execute(
+                    f"""
+                    SELECT id, collected_at_ts, follower_count
+                    FROM account_snapshots
+                    WHERE uid = ?
+                      AND follower_count IS NOT NULL
+                      AND collected_at_ts >= ?
+                      AND collected_at_ts < ?
+                    ORDER BY collected_at_ts {order}, id {order}
+                    LIMIT 1
+                    """,
+                    (uid, start_ts, end_ts),
+                ).fetchone()
 
-        day_before_counts: list[int] = []
-        yesterday_points: list[tuple[int, int]] = []
-        today_points: list[tuple[int, int]] = []
-        for row in rows:
-            ts = int(row["collected_at_ts"])
-            count = int(row["follower_count"])
-            if ts < t_yesterday:
-                day_before_counts.append(count)
-            elif ts < t_today:
-                yesterday_points.append((ts, count))
-            else:
-                today_points.append((ts, count))
+            day_before_last = _fetch_edge(t_day_before, t_yesterday, latest=True)
+            yesterday_last = _fetch_edge(t_yesterday, t_today, latest=True)
+            yesterday_first = (
+                _fetch_edge(t_yesterday, t_today, latest=False)
+                if (yesterday_last is not None and day_before_last is None)
+                else None
+            )
+            today_last = _fetch_edge(t_today, t_tomorrow, latest=True)
+            today_first = (
+                _fetch_edge(t_today, t_tomorrow, latest=False)
+                if (today_last is not None and yesterday_last is None)
+                else None
+            )
 
-        yesterday_counts = [c for _, c in yesterday_points]
-        today_counts = [c for _, c in today_points]
-        yesterday_same_time, yesterday_same_time_at = self._compute_yesterday_same_time_change(
-            yesterday_points, today_points, day_before_counts
-        )
+            yesterday_same_time: Optional[int] = None
+            yesterday_same_time_at = ""
+            if yesterday_last is not None and today_last is not None:
+                target_ts = int(today_last["collected_at_ts"]) - 86400
+                win_lo = max(t_yesterday, target_ts - tolerance_sec)
+                win_hi = min(t_today - 1, target_ts + tolerance_sec)
+                if win_lo <= win_hi:
+                    before_row: Optional[sqlite3.Row] = None
+                    if target_ts >= win_lo:
+                        b_max = conn.execute(
+                            """
+                            SELECT id, collected_at_ts, follower_count
+                            FROM account_snapshots
+                            WHERE uid = ?
+                              AND follower_count IS NOT NULL
+                              AND collected_at_ts >= ?
+                              AND collected_at_ts <= ?
+                            ORDER BY collected_at_ts DESC, id DESC
+                            LIMIT 1
+                            """,
+                            (uid, win_lo, min(win_hi, target_ts)),
+                        ).fetchone()
+                        if b_max is not None:
+                            before_row = (
+                                conn.execute(
+                                    """
+                                    SELECT id, collected_at_ts, follower_count
+                                    FROM account_snapshots
+                                    WHERE uid = ?
+                                      AND follower_count IS NOT NULL
+                                      AND collected_at_ts = ?
+                                    ORDER BY id ASC
+                                    LIMIT 1
+                                    """,
+                                    (uid, int(b_max["collected_at_ts"])),
+                                ).fetchone()
+                                or b_max
+                            )
+
+                    after_row: Optional[sqlite3.Row] = None
+                    if target_ts <= win_hi:
+                        after_row = conn.execute(
+                            """
+                            SELECT id, collected_at_ts, follower_count
+                            FROM account_snapshots
+                            WHERE uid = ?
+                              AND follower_count IS NOT NULL
+                              AND collected_at_ts >= ?
+                              AND collected_at_ts <= ?
+                            ORDER BY collected_at_ts ASC, id ASC
+                            LIMIT 1
+                            """,
+                            (uid, max(win_lo, target_ts), win_hi),
+                        ).fetchone()
+
+                    matched_row: Optional[sqlite3.Row] = None
+                    if before_row is not None and after_row is not None:
+                        dist_before = abs(int(before_row["collected_at_ts"]) - target_ts)
+                        dist_after = abs(int(after_row["collected_at_ts"]) - target_ts)
+                        matched_row = before_row if dist_before <= dist_after else after_row
+                    else:
+                        matched_row = before_row if before_row is not None else after_row
+
+                    if matched_row is not None:
+                        matched_ts = int(matched_row["collected_at_ts"])
+                        matched_count = int(matched_row["follower_count"])
+                        baseline: Optional[int] = None
+                        if day_before_last is not None:
+                            baseline = int(day_before_last["follower_count"])
+                        elif (
+                            yesterday_first is not None
+                            and int(matched_row["id"]) != int(yesterday_first["id"])
+                        ):
+                            baseline = int(yesterday_first["follower_count"])
+                        if baseline is not None:
+                            yesterday_same_time = matched_count - baseline
+                            yesterday_same_time_at = datetime.fromtimestamp(
+                                matched_ts, tz=timezone.utc
+                            ).astimezone(BJT_TZ).strftime("%H:%M")
+
+        yesterday_change: Optional[int] = None
+        if yesterday_last is not None:
+            y_end = int(yesterday_last["follower_count"])
+            if day_before_last is not None:
+                yesterday_change = y_end - int(day_before_last["follower_count"])
+            elif (
+                yesterday_first is not None
+                and int(yesterday_first["id"]) != int(yesterday_last["id"])
+            ):
+                yesterday_change = y_end - int(yesterday_first["follower_count"])
+
+        today_change: Optional[int] = None
+        if today_last is not None:
+            t_end = int(today_last["follower_count"])
+            if yesterday_last is not None:
+                today_change = t_end - int(yesterday_last["follower_count"])
+            elif today_first is not None and int(today_first["id"]) != int(today_last["id"]):
+                today_change = t_end - int(today_first["follower_count"])
 
         return {
-            "yesterday": self._compute_day_follower_change(yesterday_counts, day_before_counts),
+            "yesterday": yesterday_change,
             "yesterday_same_time": yesterday_same_time,
             "yesterday_same_time_at": yesterday_same_time_at,
-            "today": self._compute_day_follower_change(today_counts, yesterday_counts),
+            "today": today_change,
             "yesterday_date": yesterday_date,
             "today_date": today_date,
             "timezone": "Asia/Shanghai",

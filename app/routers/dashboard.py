@@ -13,20 +13,65 @@ from app.models import AdminAuthStatus, ChartSnapshotOut, DashboardSummary, Foll
 router = APIRouter(prefix="/api", tags=["dashboard"])
 
 SSE_HEARTBEAT_SECONDS = 20.0
+DASHBOARD_CACHE_MAX_ENTRIES = 32
+DASHBOARD_CACHE_TTL_SEC = 15.0
+SNAPSHOTS_CACHE_MAX_ENTRIES = 64
+SNAPSHOTS_WINDOW_CACHE_TTL_SEC = 15.0
+SNAPSHOTS_ALL_CACHE_TTL_SEC = 60.0
 VIDEO_HISTORY_CACHE_MAX_ENTRIES = 256
 VIDEO_HISTORY_WINDOW_CACHE_TTL_SEC = 20.0
 VIDEO_HISTORY_ALL_CACHE_TTL_SEC = 120.0
 
 
-def _get_video_history_cache(request: Request) -> tuple[OrderedDict[Any, Any], threading.Lock]:
-    cache = getattr(request.app.state, "video_history_cache", None)
-    lock = getattr(request.app.state, "video_history_cache_lock", None)
+def _get_named_cache(
+    request: Request, cache_attr: str, lock_attr: str
+) -> tuple[OrderedDict[Any, Any], threading.Lock]:
+    cache = getattr(request.app.state, cache_attr, None)
+    lock = getattr(request.app.state, lock_attr, None)
     if cache is None or lock is None:
         cache = OrderedDict()
         lock = threading.Lock()
-        request.app.state.video_history_cache = cache
-        request.app.state.video_history_cache_lock = lock
+        setattr(request.app.state, cache_attr, cache)
+        setattr(request.app.state, lock_attr, lock)
     return cache, lock
+
+
+def _get_video_history_cache(request: Request) -> tuple[OrderedDict[Any, Any], threading.Lock]:
+    return _get_named_cache(request, "video_history_cache", "video_history_cache_lock")
+
+
+def _get_dashboard_cache(request: Request) -> tuple[OrderedDict[Any, Any], threading.Lock]:
+    return _get_named_cache(request, "dashboard_cache", "dashboard_cache_lock")
+
+
+def _get_snapshots_cache(request: Request) -> tuple[OrderedDict[Any, Any], threading.Lock]:
+    return _get_named_cache(request, "snapshots_cache", "snapshots_cache_lock")
+
+
+def _dashboard_cache_stamp(request: Request) -> tuple[Any, ...]:
+    event_bus = getattr(request.app.state, "event_bus", None)
+    db = request.app.state.db
+    crawl_service = request.app.state.crawl_service
+    scheduler_mgr = request.app.state.scheduler
+    sched_running = bool(
+        getattr(scheduler_mgr, "_started", False)
+        and getattr(getattr(scheduler_mgr, "scheduler", None), "running", False)
+    )
+    next_run_iso = ""
+    if sched_running:
+        job = scheduler_mgr.scheduler.get_job("bilibili_monitor_crawl")
+        if job and job.next_run_time:
+            next_run_iso = job.next_run_time.isoformat()
+    bjt_day = int(time.time() + 28800) // 86400
+    return (
+        event_bus.revision if event_bus is not None else 0,
+        getattr(db, "write_version", 0),
+        bool(crawl_service.is_crawling),
+        crawl_service.crawling_uid or "",
+        sched_running,
+        next_run_iso,
+        bjt_day,
+    )
 
 
 def _apply_no_store_headers(request: Request, response: Response) -> None:
@@ -120,9 +165,35 @@ async def get_dashboard(
     target_uid = uid.strip() if uid is not None else None
 
     _apply_no_store_headers(request, response)
+    cache, cache_lock = _get_dashboard_cache(request)
 
     def _assemble_dashboard() -> DashboardSummary:
         with db.read_session():
+            admin_auth = AdminAuthStatus(**get_admin_status_payload(request))
+            stamp = _dashboard_cache_stamp(request)
+            cache_key = (
+                target_uid,
+                hours,
+                max_points,
+                video_limit,
+                include_accounts,
+                admin_auth.enabled,
+                admin_auth.authenticated,
+                admin_auth.source,
+            )
+            now_mono = time.monotonic()
+            with cache_lock:
+                entry = cache.get(cache_key)
+                if entry is not None:
+                    cached_stamp, cached_at, cached_summary = entry
+                    if (
+                        cached_stamp == stamp
+                        and (now_mono - cached_at) < DASHBOARD_CACHE_TTL_SEC
+                    ):
+                        cache.move_to_end(cache_key)
+                        return cached_summary
+                    cache.pop(cache_key, None)
+
             resolved_uid = db.resolve_dashboard_uid(target_uid)
             pub_settings = db.get_public_settings(uid=resolved_uid)
             active_uid = pub_settings["uid"]
@@ -131,7 +202,6 @@ async def get_dashboard(
                 if include_accounts
                 else []
             )
-            admin_auth = AdminAuthStatus(**get_admin_status_payload(request))
             pub_settings["admin_auth"] = admin_auth
 
             if not active_uid:
@@ -140,70 +210,78 @@ async def get_dashboard(
                     pub_settings=pub_settings,
                     latest_snapshot=None,
                 )
-                return DashboardSummary(
+                summary = DashboardSummary(
                     settings=pub_settings,
                     scheduler=sched_status,
                     admin_auth=admin_auth,
                     follower_daily=FollowerDailyChange(**db.get_follower_daily_changes("")),
                     accounts=accounts,
                 )
-
-            latest, prev = db.get_latest_two_snapshots(active_uid)
-            sched_status = scheduler_mgr.get_status(
-                uid=active_uid,
-                pub_settings=pub_settings,
-                latest_snapshot=latest,
-            )
-
-            follower_delta: Optional[int] = None
-            online_delta: Optional[int] = None
-            if latest and prev:
-                if (
-                    latest.get("follower_count") is not None
-                    and prev.get("follower_count") is not None
-                ):
-                    follower_delta = latest["follower_count"] - prev["follower_count"]
-                if (
-                    latest.get("online_viewers_total") is not None
-                    and prev.get("online_viewers_total") is not None
-                ):
-                    online_delta = latest["online_viewers_total"] - prev["online_viewers_total"]
-
-            follower_daily = FollowerDailyChange(**db.get_follower_daily_changes(active_uid))
-            if max_points is not None:
-                chart_snaps, snapshots_downsampled, _ = db.get_chart_snapshots(
-                    active_uid,
-                    since_hours=hours if hours > 0 else None,
-                    max_points=max_points,
-                )
-                snapshots: list[Any] = [ChartSnapshotOut(**s) for s in chart_snaps]
             else:
-                snapshots = db.get_snapshots(
-                    active_uid, since_hours=hours if hours > 0 else None, limit=2000
+                latest, prev = db.get_latest_two_snapshots(active_uid)
+                sched_status = scheduler_mgr.get_status(
+                    uid=active_uid,
+                    pub_settings=pub_settings,
+                    latest_snapshot=latest,
                 )
-                snapshots_downsampled = len(snapshots) >= 2000
 
-            videos, total_videos = db.get_dashboard_videos(
-                active_uid, top_limit=video_limit
-            )
-            total_snapshots = db.count_snapshots(active_uid)
+                follower_delta: Optional[int] = None
+                online_delta: Optional[int] = None
+                if latest and prev:
+                    if (
+                        latest.get("follower_count") is not None
+                        and prev.get("follower_count") is not None
+                    ):
+                        follower_delta = latest["follower_count"] - prev["follower_count"]
+                    if (
+                        latest.get("online_viewers_total") is not None
+                        and prev.get("online_viewers_total") is not None
+                    ):
+                        online_delta = latest["online_viewers_total"] - prev["online_viewers_total"]
 
-            return DashboardSummary(
-                settings=pub_settings,
-                scheduler=sched_status,
-                admin_auth=admin_auth,
-                latest=latest,
-                previous=prev,
-                follower_delta=follower_delta,
-                online_delta=online_delta,
-                follower_daily=follower_daily,
-                total_snapshots=total_snapshots,
-                total_videos=total_videos,
-                snapshots=snapshots,
-                snapshots_downsampled=snapshots_downsampled,
-                top_videos=videos,
-                accounts=accounts,
-            )
+                follower_daily = FollowerDailyChange(**db.get_follower_daily_changes(active_uid))
+                if max_points is not None:
+                    chart_snaps, snapshots_downsampled, _ = db.get_chart_snapshots(
+                        active_uid,
+                        since_hours=hours if hours > 0 else None,
+                        max_points=max_points,
+                    )
+                    snapshots: list[Any] = [ChartSnapshotOut(**s) for s in chart_snaps]
+                else:
+                    snapshots = db.get_snapshots(
+                        active_uid, since_hours=hours if hours > 0 else None, limit=2000
+                    )
+                    snapshots_downsampled = len(snapshots) >= 2000
+
+                videos, total_videos = db.get_dashboard_videos(
+                    active_uid, top_limit=video_limit
+                )
+                total_snapshots = db.count_snapshots(active_uid)
+
+                summary = DashboardSummary(
+                    settings=pub_settings,
+                    scheduler=sched_status,
+                    admin_auth=admin_auth,
+                    latest=latest,
+                    previous=prev,
+                    follower_delta=follower_delta,
+                    online_delta=online_delta,
+                    follower_daily=follower_daily,
+                    total_snapshots=total_snapshots,
+                    total_videos=total_videos,
+                    snapshots=snapshots,
+                    snapshots_downsampled=snapshots_downsampled,
+                    top_videos=videos,
+                    accounts=accounts,
+                )
+
+            if _dashboard_cache_stamp(request) == stamp:
+                with cache_lock:
+                    cache[cache_key] = (stamp, time.monotonic(), summary)
+                    cache.move_to_end(cache_key)
+                    while len(cache) > DASHBOARD_CACHE_MAX_ENTRIES:
+                        cache.popitem(last=False)
+            return summary
 
     return await asyncio.to_thread(_assemble_dashboard)
 
@@ -221,10 +299,32 @@ async def get_chart_snapshots(
     """Lightweight overview chart telemetry endpoint for fast time-window switching."""
     _apply_no_store_headers(request, response)
     db = request.app.state.db
+    event_bus = getattr(request.app.state, "event_bus", None)
+    cache, cache_lock = _get_snapshots_cache(request)
+
+    req_uid = uid.strip() if uid is not None else None
+    stamp = (
+        event_bus.revision if event_bus is not None else 0,
+        getattr(db, "write_version", 0),
+    )
+    cache_key = (req_uid, hours, max_points)
+    ttl_sec = (
+        SNAPSHOTS_WINDOW_CACHE_TTL_SEC if hours > 0 else SNAPSHOTS_ALL_CACHE_TTL_SEC
+    )
+    now_mono = time.monotonic()
+
+    with cache_lock:
+        entry = cache.get(cache_key)
+        if entry is not None:
+            cached_stamp, cached_at, cached_payload = entry
+            if cached_stamp == stamp and (now_mono - cached_at) < ttl_sec:
+                cache.move_to_end(cache_key)
+                return cached_payload
+            cache.pop(cache_key, None)
 
     def _load() -> dict[str, Any]:
         with db.read_session():
-            target_uid = db.resolve_dashboard_uid(uid)
+            target_uid = db.resolve_dashboard_uid(req_uid)
             if not target_uid:
                 return {
                     "uid": "",
@@ -246,7 +346,18 @@ async def get_chart_snapshots(
                 "total_in_window": total_in_window,
             }
 
-    return await asyncio.to_thread(_load)
+    payload = await asyncio.to_thread(_load)
+    end_stamp = (
+        event_bus.revision if event_bus is not None else 0,
+        getattr(db, "write_version", 0),
+    )
+    if end_stamp == stamp:
+        with cache_lock:
+            cache[cache_key] = (stamp, time.monotonic(), payload)
+            cache.move_to_end(cache_key)
+            while len(cache) > SNAPSHOTS_CACHE_MAX_ENTRIES:
+                cache.popitem(last=False)
+    return payload
 
 
 @router.get("/videos")
